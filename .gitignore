@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Runtime telemetry (per-city logs, spec §11)
+data/
+
+# Secrets — wallet keys live only in the environment (spec §9), never committed
+.env
+*.key

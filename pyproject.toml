@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dead-bracket-bot"
+version = "0.1.0"
+description = "Dead-Bracket NO capture bot (METAR-only, paper-first) for Polymarket daily high-temperature markets."
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+live = [
+    # Only needed for --live signed execution. Paper mode needs nothing here.
+    # py-clob-client is ARCHIVED and rejected by the venue ("invalid order
+    # version"); the unified SDK is the required replacement (beta, so the
+    # pre-release pin is intentional).
+    "polymarket-client>=0.1.0b5",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    # Needed to exercise the live executor's order plumbing against a fake
+    # client (no network). Same dep as the "live" extra.
+    "polymarket-client>=0.1.0b5",
+]
+
+[project.scripts]
+dead-bracket-bot = "dead_bracket.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.coverage.run]
+branch = true
+source = ["dead_bracket"]
+
+[tool.coverage.report]
+show_missing = true

@@ -1,0 +1,190 @@
+"""Risk manager: caps, kill-switch triggers, daily loss (spec §9, §12)."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+import pytest
+
+from dead_bracket.models import Fill
+from dead_bracket.risk import RiskManager
+from conftest import make_bracket, make_snapshot
+
+
+def buy(city, temp, price, size, fee=0.0):
+    return Fill(city=city, temp=temp, side="buy", price=price, size=size, fee=fee)
+
+
+def sell(city, temp, price, size):
+    return Fill(city=city, temp=temp, side="sell", price=price, size=size, fee=0.0)
+
+
+def test_per_bracket_cap_remaining(config):
+    r = RiskManager(config)
+    assert r.per_bracket_cap_remaining("paris", 22) == 500
+    r.record_buy_fill(buy("paris", 22, 0.95, 300))
+    assert r.per_bracket_cap_remaining("paris", 22) == 200
+
+
+def test_per_city_and_total_caps_in_shares(config):
+    r = RiskManager(config)
+    # per-city dollar cap 500 / cap 0.98 -> ~510 shares.
+    assert r.per_city_cap_remaining("paris") == 500.0 / config.cap
+    assert r.total_cap_remaining() == 1000.0 / config.cap
+    r.record_buy_fill(buy("paris", 22, 0.98, 100, fee=0.0))  # $98 exposure
+    assert r.per_city_cap_remaining("paris") == (500.0 - 98.0) / config.cap
+    assert r.total_cap_remaining() == (1000.0 - 98.0) / config.cap
+
+
+def test_bankroll_pct_caps_track_balance(config):
+    # User's example: 50% of a $30 balance caps a bet at $15; a $5 win grows the
+    # balance to $35 so the next bet may be up to $17.50.
+    cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000)
+    r = RiskManager(cfg, initial_balance=30.0)
+    assert r.current_balance == pytest.approx(30.0)
+    # All three caps track the same $15 budget (all-in on a single bracket).
+    assert r.total_cap_remaining() == pytest.approx(15.0 / cfg.cap)
+    assert r.per_city_cap_remaining("paris") == pytest.approx(15.0 / cfg.cap)
+    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(15.0 / cfg.cap)
+
+    r.record_sell_fill(sell("paris", 22, 1.0, 5), cost_released=0.0)  # realise +$5
+    assert r.current_balance == pytest.approx(35.0)
+    assert r.total_cap_remaining() == pytest.approx(17.5 / cfg.cap)
+    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(17.5 / cfg.cap)
+
+
+def test_bankroll_pct_shrinks_on_loss(config):
+    cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000)
+    r = RiskManager(cfg, initial_balance=30.0)
+    # A $10 realised loss (sold below cost) drops the balance to $20 -> cap $10.
+    r.record_sell_fill(sell("paris", 22, 0.0, 10), cost_released=10.0)  # -$10
+    assert r.current_balance == pytest.approx(20.0)
+    assert r.total_cap_remaining() == pytest.approx(10.0 / cfg.cap)
+
+
+def test_bankroll_pct_subtracts_open_exposure(config):
+    cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000)
+    r = RiskManager(cfg, initial_balance=100.0)  # $50 budget
+    r.record_buy_fill(buy("paris", 22, 0.50, 40))  # $20 open exposure
+    # Equity unchanged by an open buy; remaining budget = $50 - $20 = $30.
+    assert r.current_balance == pytest.approx(100.0)
+    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(30.0 / cfg.cap)
+
+
+def test_sell_frees_exposure(config):
+    r = RiskManager(config)
+    r.record_buy_fill(buy("paris", 22, 0.95, 100))
+    before = r.total_exposure
+    r.record_sell_fill(sell("paris", 22, 0.999, 100), cost_released=95.0)
+    assert r.total_exposure < before
+    assert r.bracket_shares("paris", 22) == 0
+
+
+def test_crossed_book_halts_only_that_city(config):
+    r = RiskManager(config)
+    snap = make_snapshot("paris", [make_bracket(22, asks=[(0.40, 10)], bids=[(0.60, 10)])])
+    assert r.check_book(snap) is True
+    assert r.is_city_blocked("paris") is True
+    assert r.is_city_blocked("london") is False
+    assert r.halted is False  # NOT the global kill-switch
+
+
+def test_invalid_ask_halts_city(config):
+    r = RiskManager(config)
+    snap = make_snapshot("paris", [make_bracket(22, asks=[(1.5, 10)])])
+    assert r.check_book(snap) is True
+    assert r.is_city_blocked("paris") is True
+    assert r.halted is False
+
+
+def test_stale_feed_halts_city_and_recovers(config):
+    r = RiskManager(config)
+    assert r.check_stale(city="paris", is_stale=True) is True
+    assert r.is_city_blocked("paris") is True
+    assert r.halted is False  # per-city, not global
+    # Feed returns -> the stale halt auto-recovers.
+    assert r.check_stale(city="paris", is_stale=False) is False
+    assert r.is_city_blocked("paris") is False
+
+
+def test_repeated_order_errors_halt_only_that_city(config):
+    r = RiskManager(replace(config, max_order_errors=3))
+    assert r.note_order_error("paris") is False
+    assert r.note_order_error("paris") is False
+    assert r.note_order_error("paris") is True  # third halts paris
+    assert r.is_city_blocked("paris") is True
+    assert r.is_city_blocked("london") is False
+    assert r.halted is False
+
+
+def test_order_ok_resets_city_counter(config):
+    r = RiskManager(replace(config, max_order_errors=2))
+    r.note_order_error("paris")
+    r.note_order_ok("paris")
+    assert r.note_order_error("paris") is False  # counter reset, not yet at 2
+    assert r.is_city_blocked("paris") is False
+
+
+def test_roll_day_rearms_and_is_idempotent(config):
+    r = RiskManager(config)
+    r.halt_city("paris", "crossed/invalid book", recoverable=True)
+    r.trip("daily loss breach")  # global
+    r.record_buy_fill(buy("paris", 22, 0.95, 100))
+    assert r.roll_day("2026-06-09") is True
+    assert r.halted is False and r.halt_reason is None
+    assert r.is_city_blocked("paris") is False
+    assert r.total_exposure == 0.0 and r.realized_pnl == 0.0
+    # All caps free again after the EOD rollover.
+    assert r.per_bracket_cap_remaining("paris", 22) == config.max_shares_per_bracket
+    assert r.per_city_cap_remaining("paris") == config.max_exposure_per_city / config.cap
+    assert r.roll_day("2026-06-09") is False  # idempotent for the same day
+
+
+def test_pop_global_halt_announces_once(config):
+    r = RiskManager(config)
+    r.trip("daily loss breach")
+    assert r.pop_global_halt() == "daily loss breach"
+    assert r.pop_global_halt() is None  # only once
+
+
+def test_daily_loss_breaker(config):
+    r = RiskManager(replace(config, max_daily_loss=10.0))
+    r.record_buy_fill(buy("paris", 22, 0.95, 100))  # cost 95
+    # Sell far below cost to realise a >$10 loss.
+    r.record_sell_fill(sell("paris", 22, 0.80, 100), cost_released=95.0)  # proceeds 80, loss 15
+    assert r.realized_pnl < 0
+    assert r.halted is True
+    assert "daily loss" in (r.halt_reason or "")
+
+
+def test_settlement_realises_profit(config):
+    r = RiskManager(config)
+    r.record_buy_fill(buy("paris", 22, 0.95, 100))  # cost 95
+    r.record_settlement(city="paris", temp=22, shares=100, cost_basis=95.0)
+    assert r.realized_pnl == pytest.approx(5.0)
+    assert r.bracket_shares("paris", 22) == 0
+
+
+def test_city_halt_isolated(config):
+    r = RiskManager(config)
+    r.halt_city("paris", "revision")
+    assert r.is_city_blocked("paris") is True
+    assert r.is_city_blocked("london") is False
+    assert r.halted is False  # global switch untouched
+
+
+def test_recoverable_city_halt_can_be_cleared(config):
+    r = RiskManager(config)
+    r.halt_city("paris", "crossed/invalid book", recoverable=True)
+    assert r.is_city_blocked("paris") is True
+    assert r.recover_city("paris") is True
+    assert r.is_city_blocked("paris") is False
+    assert r.recover_city("paris") is False  # nothing left to recover
+
+
+def test_non_recoverable_city_halt_is_sticky(config):
+    # A downward-revision halt must NOT auto-recover (spec §9).
+    r = RiskManager(config)
+    r.halt_city("paris", "downward revision")  # recoverable defaults False
+    assert r.recover_city("paris") is False
+    assert r.is_city_blocked("paris") is True
