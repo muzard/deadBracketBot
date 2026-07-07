@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from dead_bracket.executor import PaperExecutor, make_executor, LiveExecutor
+from dead_bracket.executor import (
+    DisabledExecutor,
+    LiveExecutor,
+    PaperExecutor,
+    make_executor,
+)
 from dead_bracket.models import Intent
 from dead_bracket.risk import RiskManager
 from conftest import make_bracket, make_snapshot
@@ -164,3 +169,26 @@ def test_make_executor_live_requires_client(config, risk):
     with pytest.raises(ValueError):
         make_executor(live_cfg, risk, client=None)
     assert isinstance(make_executor(live_cfg, risk, client=object()), LiveExecutor)
+
+
+def test_make_executor_trade_disabled_beats_live(config, risk):
+    # trade_disabled fences the city out of trading even in live mode, and never
+    # needs a signing client.
+    live_cfg = config.with_mode("live")
+    ex = make_executor(live_cfg, risk, client=None, trade_disabled=True)
+    assert isinstance(ex, DisabledExecutor)
+
+
+def test_disabled_executor_places_nothing_and_spares_risk(config, risk):
+    ex = DisabledExecutor()
+    bracket = make_bracket(22, asks=[(0.95, 100)])
+    snap = make_snapshot("paris", [make_bracket(22, bids=[(0.999, 100)])])
+
+    assert ex.execute_entry(buy_intent(22, 100), bracket) is None
+    assert ex.place_exit(buy_intent(22, 100)) is None
+    assert ex.on_book(snap) == []
+    assert ex.settle() == []
+    assert ex.positions == {}
+    # No order path touched the shared risk manager.
+    assert risk.total_exposure == 0.0
+    assert risk.realized_pnl == 0.0

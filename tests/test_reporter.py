@@ -44,6 +44,26 @@ def test_metar_reading_falls_back_to_total_without_receipt():
     assert any("delay 183s" in ln and "(+" not in ln for ln in rep.progress_lines)
 
 
+def test_metar_reading_persists_latency_split(tmp_path):
+    # The controllable "my delay" must be logged to a file (not just stderr) so
+    # the fetcher fix has a measurable before/after baseline.
+    rep = Reporter(str(tmp_path), progress=False, clock=lambda: FIXED)
+    rep.metar_reading("paris", temp=22, running_max=22,
+                      publish_sec=170.4, my_sec=12.6, total_sec=183.0)
+    path = tmp_path / "paris" / "2026-06-08" / "latency.jsonl"
+    rows = [json.loads(ln) for ln in path.read_text().splitlines() if ln]
+    assert len(rows) == 1
+    assert rows[0]["my_sec"] == 12.6 and rows[0]["publish_sec"] == 170.4
+    assert rows[0]["temp"] == 22 and rows[0]["running_max"] == 22
+
+
+def test_metar_reading_no_latency_row_without_timing(tmp_path):
+    # No receipt and no total -> nothing to measure -> no row (avoid noise).
+    rep = Reporter(str(tmp_path), progress=False, clock=lambda: FIXED)
+    rep.metar_reading("paris", temp=22, running_max=22)
+    assert not (tmp_path / "paris" / "2026-06-08" / "latency.jsonl").exists()
+
+
 def test_buy_sell_line_format_matches_spec():
     rep = StubReporter()
     rep.buy(Fill(city="london", temp=18, side="buy", price=0.95, size=50, fee=0))

@@ -10,7 +10,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
-from typing import Iterable
+from typing import Iterable, Optional
+
+
+def _as_bool(raw: str) -> bool:
+    """Env-var boolean: '1'/'true'/'yes'/'on' (any case) are True."""
+
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -31,10 +37,22 @@ class CityConfig:
     metar_icao: str
     tz: str  # IANA timezone name, e.g. "Europe/Paris" — daily-high reset boundary
     market_terms: tuple[str, ...]
-    # Whether this market's resolution counts off-cycle SPECIs. Most do (default
-    # True); Moscow resolves on the routine METAR cycle only, so it must exclude
-    # SPECIs (a SPECI spike there could mark a still-live bracket dead).
+    # Whether off-cycle SPECIs may set the running max that TRIGGERS trades. Most
+    # markets resolve on a source that counts SPECIs (default True). The
+    # weather.gov-resolving cities (Moscow/UUWW, Istanbul/LTFM, Tel Aviv/LLBG —
+    # the WUNDERGROUND_EXEMPT set) resolve on the routine cycle only, so a SPECI
+    # spike there could mark a still-live bracket dead -> a losing buy. For them
+    # set this False: SPECIs are still fetched and LOGGED (data collection is
+    # unaffected), they just never fold into the trade-triggering running max.
     include_speci: bool = True
+    # When set, this market resolves off a Hong Kong Observatory automatic weather
+    # station rather than the ICAO's NOAA METAR — e.g. Wunderground resolves
+    # "Shenzhen" off HKO Lau Fau Shan (WMO 45035), a Deep-Bay coastal site that
+    # runs 1-2C cooler at peak than the ZGSZ airport METAR. Reading HKO's official
+    # open data directly matches that resolution source AND front-runs WU's publish
+    # lag. Only USED when the run enables HKO sources (``--hko``); otherwise the
+    # NOAA METAR is read as normal, so default behaviour is unchanged.
+    resolution_hko_place: Optional[str] = None
 
 
 # Paris -> LFPB, London -> EGLC (spec §10), plus additional European cities.
@@ -43,11 +61,15 @@ class CityConfig:
 DEFAULT_CITIES: tuple[CityConfig, ...] = (
     CityConfig(id="paris", metar_icao="LFPB", tz="Europe/Paris", market_terms=("paris",)),
     CityConfig(id="london", metar_icao="EGLC", tz="Europe/London", market_terms=("london",)),
-    CityConfig(id="moscow", metar_icao="UUWW", tz="Europe/Moscow", market_terms=("moscow",)),
+    # weather.gov-resolving (WUNDERGROUND_EXEMPT) cities resolve on the routine
+    # cycle only -> SPECIs are collected but must not trigger trades.
+    CityConfig(id="moscow", metar_icao="UUWW", tz="Europe/Moscow", market_terms=("moscow",),
+               include_speci=False),
     CityConfig(id="milan", metar_icao="LIMC", tz="Europe/Rome", market_terms=("milan",)),
     CityConfig(id="madrid", metar_icao="LEMD", tz="Europe/Madrid", market_terms=("madrid",)),
     CityConfig(id="ankara", metar_icao="LTAC", tz="Europe/Istanbul", market_terms=("ankara",)),
-    CityConfig(id="istanbul", metar_icao="LTFM", tz="Europe/Istanbul", market_terms=("istanbul",)),
+    CityConfig(id="istanbul", metar_icao="LTFM", tz="Europe/Istanbul", market_terms=("istanbul",),
+               include_speci=False),  # weather.gov, routine-only (see moscow)
     CityConfig(id="helsinki", metar_icao="EFHK", tz="Europe/Helsinki", market_terms=("helsinki",)),
     CityConfig(id="amsterdam", metar_icao="EHAM", tz="Europe/Amsterdam", market_terms=("amsterdam",)),
     CityConfig(id="warsaw", metar_icao="EPWA", tz="Europe/Warsaw", market_terms=("warsaw",)),
@@ -73,13 +95,17 @@ DEFAULT_CITIES: tuple[CityConfig, ...] = (
     CityConfig(id="wellington", metar_icao="NZWN", tz="Pacific/Auckland", market_terms=("wellington",)),
     CityConfig(id="kuala_lumpur", metar_icao="WMKK", tz="Asia/Kuala_Lumpur", market_terms=("kuala",)),
     CityConfig(id="lucknow", metar_icao="VILK", tz="Asia/Kolkata", market_terms=("lucknow",)),
-    CityConfig(id="shenzhen", metar_icao="ZGSZ", tz="Asia/Shanghai", market_terms=("shenzhen",)),
+    # WU resolves Shenzhen off HKO Lau Fau Shan (WMO 45035), not the ZGSZ airport
+    # METAR — only read via HKO when the run passes --hko (else NOAA as normal).
+    CityConfig(id="shenzhen", metar_icao="ZGSZ", tz="Asia/Shanghai", market_terms=("shenzhen",),
+               resolution_hko_place="Lau Fau Shan"),
     CityConfig(id="manila", metar_icao="RPLL", tz="Asia/Manila", market_terms=("manila",)),
     CityConfig(id="wuhan", metar_icao="ZHHH", tz="Asia/Shanghai", market_terms=("wuhan",)),
     CityConfig(id="karachi", metar_icao="OPKC", tz="Asia/Karachi", market_terms=("karachi",)),
     CityConfig(id="jeddah", metar_icao="OEJN", tz="Asia/Riyadh", market_terms=("jeddah",)),
     CityConfig(id="cape_town", metar_icao="FACT", tz="Africa/Johannesburg", market_terms=("cape town",)),
-    CityConfig(id="tel_aviv", metar_icao="LLBG", tz="Asia/Jerusalem", market_terms=("tel aviv",)),
+    CityConfig(id="tel_aviv", metar_icao="LLBG", tz="Asia/Jerusalem", market_terms=("tel aviv",),
+               include_speci=False),  # weather.gov, routine-only (see moscow)
     CityConfig(id="panama_city", metar_icao="MPMG", tz="America/Panama", market_terms=("panama",)),
     CityConfig(id="sao_paulo", metar_icao="SBGR", tz="America/Sao_Paulo", market_terms=("paulo",)),
     CityConfig(id="toronto", metar_icao="CYYZ", tz="America/Toronto", market_terms=("toronto",)),
@@ -109,7 +135,11 @@ class Config:
     # instead: e.g. bankroll_pct=50 with a $30 balance caps a bet at $15, and as
     # wins grow the balance the cap grows with it. 0 keeps the static caps.
     bankroll_pct: float = 0.0
-    max_frac_of_depth: float = 0.5
+    # Anti-sweep cap: the most of a bracket's displayed depth (<= CAP) a single
+    # take may lift. 1.0 = take the whole displayed book; lower leaves a buffer
+    # so we never sweep the entire offer at once. Thin markets (Shenzhen) are
+    # bankroll-limited, not liquidity-limited, so 1.0 deploys the available edge.
+    max_frac_of_depth: float = 1.0
     max_daily_loss: float = 50.0
 
     stale_feed_min: int = 45
@@ -164,6 +194,21 @@ class Config:
     price_sample_band: int = 2
     # Periodic per-city status line cadence on stderr (seconds).
     status_every_sec: float = 300.0
+    # --- Shenzhen / Lau Fau Shan calibration collectors (lfs_calibration.py).
+    # Data collection + prediction shadow ONLY (no strategy/order-path effect);
+    # they run for cities with ``resolution_hko_place`` set, i.e. Shenzhen, and
+    # are off by default (enable with --calibrate or LFS_CALIBRATION=1).
+    lfs_calibration: bool = False
+    hko_1min_poll_sec: float = 60.0   # HKO latest-1-min CSV poll cadence
+    twc_poll_sec: float = 60.0        # TWC timeseries row-version poll cadence
+    twc_api_key: str = ""             # TWC_API_KEY (the public wunderground.com
+                                      # frontend key works); empty -> HKO-only
+    twc_location: str = "ZGSZ:9:CN"   # TWC location id resolving to obs 45035
+    twc_daily_hkt: str = "00:30,09:00"  # daily-table capture times (HKT):
+                                      # first full table + revision-window guard
+    # Best-guess K2 rule the prediction shadow runs (half_up | half_even |
+    # floor). Its measured hit rate is direct evidence for/against the rule.
+    lfs_predict_rounding: str = "half_up"
     # Daily rollover: re-arm risk and settle positions at this tz's midnight so
     # the bot runs unattended across days. daily_rearm=False disables it.
     rollover_tz: str = "UTC"
@@ -182,6 +227,8 @@ class Config:
             raise ValueError("max_frac_of_depth must be in (0, 1]")
         if not (0.0 <= self.bankroll_pct <= 100.0):
             raise ValueError("bankroll_pct must be in [0, 100]")
+        if self.lfs_predict_rounding not in ("half_up", "half_even", "floor"):
+            raise ValueError("lfs_predict_rounding must be half_up, half_even or floor")
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -223,6 +270,13 @@ class Config:
             "price_sample_sec": float,
             "price_sample_band": int,
             "status_every_sec": float,
+            "lfs_calibration": _as_bool,
+            "hko_1min_poll_sec": float,
+            "twc_poll_sec": float,
+            "twc_api_key": str,
+            "twc_location": str,
+            "twc_daily_hkt": str,
+            "lfs_predict_rounding": str,
             "rollover_tz": str,
         }
         for name, cast in casters.items():

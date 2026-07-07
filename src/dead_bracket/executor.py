@@ -393,9 +393,43 @@ class LiveExecutor:
         return results
 
 
-def make_executor(config: Config, risk: RiskManager, *, client: object = None) -> Executor:
-    """Factory: paper by default, live only when explicitly configured."""
+class DisabledExecutor:
+    """Data-collection-only executor: places no orders and holds no positions.
 
+    Used to fence a single city out of trading (``--no-trade``) while the rest of
+    the process trades live/paper. The worker still polls METAR, discovers the
+    market, samples prices, and logs dead-snapshots/opportunities — none of that
+    touches the executor — so full telemetry keeps flowing for the fenced city.
+    Every order path is a no-op and it never calls into the shared ``RiskManager``,
+    so it cannot consume the total-exposure cap or move realized PnL (i.e. it
+    can't skew bankroll-pct sizing for the cities that *are* trading).
+    """
+
+    positions: dict[tuple[str, int], Position] = {}
+
+    def execute_entry(self, intent: Intent, bracket: Bracket) -> Optional[Fill]:
+        return None
+
+    def place_exit(self, intent: Intent) -> None:
+        return None
+
+    def on_book(self, snapshot: MarketSnapshot) -> list[Fill]:
+        return []
+
+    def settle(self) -> list[Settlement]:
+        return []
+
+
+def make_executor(config: Config, risk: RiskManager, *, client: object = None,
+                  trade_disabled: bool = False) -> Executor:
+    """Factory: paper by default, live only when explicitly configured.
+
+    ``trade_disabled`` fences the city out of trading entirely (data collection
+    only), regardless of paper/live mode.
+    """
+
+    if trade_disabled:
+        return DisabledExecutor()
     if config.mode == "live":
         return LiveExecutor(config, risk, client)
     return PaperExecutor(config, risk)

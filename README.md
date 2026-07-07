@@ -48,6 +48,8 @@ src/dead_bracket/
   reporter.py    # strict console policy + telemetry files (§8, §11)
   worker.py      # CityWorker: one city's cycle, restart-safe (§5)
   supervisor.py  # runs cities concurrently, isolated (§5)
+  lfs_calibration.py  # Shenzhen/Lau Fau Shan calibration collectors + WU-prediction shadow
+  tools/lfs_calibrate.py  # offline K1/K2/K3/ε analysis -> calibration report
   main.py        # CLI entry point
 tests/           # pytest suite; ≥90% on strategy/risk/execution (§12)
 ```
@@ -73,6 +75,12 @@ POLY_PRIVATE_KEY=... python -m dead_bracket.main --live --bankroll 100
 
 # Paper, percentage sizing — supply the starting balance explicitly:
 python -m dead_bracket.main --bankroll 50 --balance 30 --cities london
+
+# Shenzhen calibration run (data collection + prediction shadow, no orders):
+TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate
+
+# Offline analysis of the collected calibration data (run any time):
+python -m dead_bracket.tools.lfs_calibrate --data-dir data --city shenzhen
 ```
 
 All behaviour is config (spec §10). Scalar knobs can be overridden by an
@@ -131,13 +139,64 @@ series taken only inside each publication hot window (`price_sample_sec`, defaul
 whether the market reprices a soon-to-be-dead bracket toward $1 *before* our METAR
 lands, and how late our feed is. Set `PRICE_SAMPLE_SEC=0` to turn the sampler off.
 
+## Shenzhen (Lau Fau Shan) calibration & the WU-prediction shadow
+
+Shenzhen resolves on WU's table for **HKO AWS 45035 (Lau Fau Shan)** — not a
+METAR: TWC resamples HKO sub-hourly data into hourly rows (see
+[data/wu_lfs_discrepancy_2026-07-03.md](data/wu_lfs_discrepancy_2026-07-03.md)).
+Three unknowns gate re-enabling the city
+([shenzhen_calibration_requirements.md](shenzhen_calibration_requirements.md)):
+**K1** TWC's sample grid + ingestion latency, **K2** the 0.1 °C → integer
+rounding rule, **K3** whether the daily High counts all ingested row versions
+or only each hour's final value. `--calibrate` (or `LFS_CALIBRATION=1`) starts
+three collectors + a prediction shadow for every city with an HKO resolution
+station (i.e. Shenzhen). Pure data collection: Shenzhen stays `no_trade`, and
+nothing touches strategy/risk/orders. Files land in `data/shenzhen/` (not
+per-day):
+
+- `hko_1min.jsonl` — HKO's "latest 1-minute" regional CSV, Lau Fau Shan row
+  only, deduped on the observation minute. (**Measured 2026-07-07:** despite
+  the name, observations step in ~10-min increments, published ~7–9 min after
+  the observation minute — the analysis derives the grid from the data.)
+- `twc_rows.jsonl` — every distinct **row version** from TWC's timeseries
+  (pressure/rh are the change detectors when temp is flat). The
+  api.weather.com cache is `s-maxage=300` and 400s on unknown params, so the
+  fetch cache-busts by **rotating `hours=2..7`** (each value is its own cache
+  entry; a repeat only comes around after the TTL). `transaction_id` repeats
+  are counted as `stale_responses`.
+- `twc_daily.jsonl` — the previous HKT day's final table, captured at 00:30
+  and 09:00 HKT (`TWC_DAILY_HKT`), rows + any `max_temp` summary fields.
+- `predictions.jsonl` / `prediction_eval.jsonl` — the **prediction shadow**:
+  our best-guess of what WU will publish (row value + daily High) from the
+  1-min feed under the configured rounding rule (`LFS_PREDICT_ROUNDING`,
+  default `half_up`), then one eval row per actual WU publication scoring
+  predicted vs printed. The hit rate is direct evidence for/against the
+  K1/K2/K3 assumptions before any capital touches them.
+- `collector_health.jsonl` — cumulative poll/failure counters (the <1%-missed
+  acceptance criterion).
+
+The TWC endpoints need `TWC_API_KEY` (the public wunderground.com frontend key
+works); without it only the HKO collector runs. Collector status goes to
+stderr/`events.jsonl` — stdout stays the pure trade stream.
+
+`python -m dead_bracket.tools.lfs_calibrate` writes
+`data/shenzhen/calibration_report_<date>.md`: K1 join (documented logic +
+latency percentiles + sampled-minute histogram), K2 rule inference with x.5
+enumeration, K3 per-day comparison of WU High vs max(final rows) / max(all
+versions) / max(1-min rounded), the ε spike-never-sampled rate
+(numerator/denominator, not estimated), the prediction scorecard, the
+acceptance checklist, and a Tier-1 (δ, m) recommendation — or "insufficient
+data" with the open gates named. **Re-enabling Shenzhen stays a human
+decision.**
+
 ## Safety (spec §9)
 
 - Trades a bracket only when `temp < running_max` from the **resolution METAR**.
 - **Downward-revision guard:** a `COR` that lowers the max never un-deads an
   acted bracket but halts new entries for that city.
 - **Caps:** per-bracket shares **and dollars** (`MAX_EXPOSURE_PER_BRACKET`),
-  per-city / total dollar exposure, `MAX_FRAC_OF_DEPTH` (never sweep the book),
+  per-city / total dollar exposure, `MAX_FRAC_OF_DEPTH` (max share of displayed
+  depth ≤CAP one take lifts; default **1.0** = take the whole book, lower leaves a buffer),
   `MAX_DAILY_LOSS` → kill-switch. `--bankroll` is a **percent of current balance**
   (`bankroll_pct`): total = per-city = per-bracket = that % of `balance +
   realized_pnl` (all-in on conviction), so bets grow as the bot wins. `--bankroll
@@ -191,7 +250,7 @@ strategy/risk/execution modules.
 
 ## Status
 
-Phase 1 (paper) is implemented and green (180 tests). Phase 2 (live) is wired:
+Phase 1 (paper) is implemented and green (272 tests). Phase 2 (live) is wired:
 `LiveExecutor` places IOC-emulated buys + `post_only` GTC sells via the unified
 **`polymarket-client`** SDK (`SecureClient`) and reconciles fills. (The archived
 `py-clob-client` no longer works — the venue rejects its orders with "invalid

@@ -114,6 +114,17 @@ class Reporter:
         else:
             lat = ""
         self.progress(f"METAR   {city:<9} {temp}C   high {hi}{lat}")
+        # Persist the latency split so the CONTROLLABLE "my delay" (source receipt
+        # -> we logged it: our poll cadence + shared-fetcher lock wait + parse) is
+        # measurable over time, not just glimpsed on stderr. This is the number the
+        # fetcher-parallelisation fix should shrink; logging it now gives a clean
+        # before/after baseline. One row per *changed* reading (already throttled
+        # by the caller's dedup), so it cannot run away with disk.
+        if total_sec is not None or my_sec is not None:
+            self.log(city, "latency", temp=temp, running_max=running_max,
+                     publish_sec=None if publish_sec is None else round(publish_sec, 1),
+                     my_sec=None if my_sec is None else round(my_sec, 1),
+                     total_sec=None if total_sec is None else round(total_sec, 1))
 
     def notice(self, city: str, message: str) -> None:
         """Surface a market/feed problem (also logged as an event by the caller)."""

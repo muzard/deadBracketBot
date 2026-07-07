@@ -17,7 +17,23 @@ from zoneinfo import ZoneInfo
 
 from .config import Config, select_cities
 from .executor import PaperExecutor, make_executor
-from .feeds_http import GammaMarketProvider, SharedMetarFetcher, make_metar_fetch, make_tgftp_fetch
+from .feeds_http import (
+    GammaMarketProvider,
+    HkoStationFetcher,
+    SharedMetarFetcher,
+    make_hko_1min_fetch,
+    make_metar_fetch,
+    make_tgftp_fetch,
+    make_twc_historical_fetch,
+    make_twc_timeseries_fetch,
+)
+from .lfs_calibration import (
+    Hko1MinCollector,
+    LfsCalibrationWorker,
+    TwcDailyCollector,
+    TwcRowCollector,
+    WuPredictor,
+)
 from .market import MarketFeed
 from .metar import MetarFeed
 from .reporter import Reporter
@@ -45,6 +61,22 @@ def build_parser() -> argparse.ArgumentParser:
                         "in live mode it overrides the wallet balance fetched at startup.")
     p.add_argument("--cities", default=None,
                    help="comma-separated city ids, or 'all' (default: all configured)")
+    p.add_argument("--no-trade", default=None,
+                   help="comma-separated city ids to fence out of trading: they still "
+                        "poll METAR, discover markets, and log prices/dead/opportunities, "
+                        "but place NO orders (live or paper). Use to observe a city safely.")
+    p.add_argument("--hko", action="store_true",
+                   help="read the HKO station directly for cities that resolve off one "
+                        "(e.g. Shenzhen -> Lau Fau Shan/WMO 45035) instead of the NOAA "
+                        "METAR. Logs to metar_hko.jsonl. Off by default. Pair with "
+                        "--no-trade to shadow-validate a city before trading off HKO.")
+    p.add_argument("--calibrate", action="store_true",
+                   help="start the LFS calibration collectors for cities that resolve "
+                        "off an HKO station (Shenzhen): HKO 1-min CSV + TWC row-version "
+                        "+ daily-table capture + the WU-prediction shadow. Data "
+                        "collection only — no strategy or order-path effect. Files land "
+                        "in data/<city>/. Also enabled by LFS_CALIBRATION=1; TWC capture "
+                        "needs TWC_API_KEY (else HKO-only).")
     p.add_argument("--data-dir", default=None, help="override DATA_DIR")
     p.add_argument("--check", action="store_true",
                    help="preflight: verify wallet credentials, balance, and allowances, then exit without trading")
@@ -152,8 +184,10 @@ def resolve_initial_balance(config: Config, balance_arg: Optional[float],
 
 
 def build_supervisor(config: Config, reporter: Reporter, risk: RiskManager,
-                     city_ids, *, live_client=None) -> Supervisor:
+                     city_ids, *, live_client=None, no_trade_cities=(),
+                     use_hko=False) -> Supervisor:
     selected = select_cities(config, city_ids)
+    no_trade = set(no_trade_cities)
     # One batched METAR request for ALL stations, instead of N per cycle —
     # gentler on the API and far fewer independent timeout points.
     shared_metar = SharedMetarFetcher(
@@ -169,14 +203,32 @@ def build_supervisor(config: Config, reporter: Reporter, risk: RiskManager,
     )
     workers: list[CityWorker] = []
     for city_cfg in selected:
-        metar = MetarFeed(
-            city_cfg.metar_icao,
-            fetch_fn=shared_metar.raw_for,
-            receipt_fn=shared_metar.receipt_for,  # AWC receipt time -> publish/my split
-            log_path=os.path.join(config.data_dir, city_cfg.id, "metar.jsonl"),
-            tz=ZoneInfo(city_cfg.tz),
-            include_speci=city_cfg.include_speci,
-        )
+        # A city that resolves off an HKO station reads it directly when --hko is
+        # set (else the NOAA METAR as normal, so default behaviour is unchanged).
+        # HKO readings land in a SEPARATE log so they never mix with the NOAA
+        # history — the running max seeds only from the source in use.
+        hko_place = city_cfg.resolution_hko_place if use_hko else None
+        if hko_place:
+            hko = HkoStationFetcher(station=hko_place, icao=city_cfg.metar_icao,
+                                    session=_new_session(), ttl=config.metar_poll_sec)
+            metar = MetarFeed(
+                city_cfg.metar_icao,
+                fetch_fn=hko.raw_for,
+                log_path=os.path.join(config.data_dir, city_cfg.id, "metar_hko.jsonl"),
+                tz=ZoneInfo(city_cfg.tz),
+                include_speci=city_cfg.include_speci,
+            )
+            reporter.event(city_cfg.id, "hko_source", station=hko_place)
+            reporter.notice(city_cfg.id, f"resolution source: HKO {hko_place} (not {city_cfg.metar_icao} METAR)")
+        else:
+            metar = MetarFeed(
+                city_cfg.metar_icao,
+                fetch_fn=shared_metar.raw_for,
+                receipt_fn=shared_metar.receipt_for,  # AWC receipt time -> publish/my split
+                log_path=os.path.join(config.data_dir, city_cfg.id, "metar.jsonl"),
+                tz=ZoneInfo(city_cfg.tz),
+                include_speci=city_cfg.include_speci,
+            )
         def _on_event(slug, cid=city_cfg.id):
             reporter.event(cid, "discovery", slug=slug)
             reporter.notice(cid, f"discovered event {slug}")
@@ -191,7 +243,12 @@ def build_supervisor(config: Config, reporter: Reporter, risk: RiskManager,
             book_band_above=max(config.book_band_above, config.price_sample_band),
         )
         market = MarketFeed(city_cfg.id, snapshot_fn=provider.snapshot)
-        executor = make_executor(config, risk, client=live_client)
+        trade_disabled = city_cfg.id in no_trade
+        if trade_disabled:
+            reporter.event(city_cfg.id, "trade_disabled")
+            reporter.notice(city_cfg.id, "trading DISABLED (data collection only; no orders)")
+        executor = make_executor(config, risk, client=live_client,
+                                 trade_disabled=trade_disabled)
         strategy = Strategy(city_cfg.id, config, risk)
         workers.append(CityWorker(
             city_cfg, config, metar=metar, market=market, executor=executor,
@@ -199,6 +256,65 @@ def build_supervisor(config: Config, reporter: Reporter, risk: RiskManager,
         ))
     return Supervisor(workers, risk=risk, reporter=reporter,
                       rollover_tz=config.rollover_tz, daily_rearm=config.daily_rearm)
+
+
+def build_calibration_workers(config: Config, reporter: Reporter,
+                              city_ids) -> list[LfsCalibrationWorker]:
+    """Wire the LFS calibration collectors + WU-prediction shadow.
+
+    One worker per selected city that resolves off an HKO station (Shenzhen).
+    Pure construction — no network happens until the worker thread polls.
+    Without a TWC API key only the HKO 1-min collector runs (the K1/K2/K3
+    joins then have no right-hand side, so the key is strongly recommended).
+    """
+
+    workers: list[LfsCalibrationWorker] = []
+    for city_cfg in select_cities(config, city_ids):
+        if not city_cfg.resolution_hko_place:
+            continue
+        city_dir = os.path.join(config.data_dir, city_cfg.id)
+        hko_path = os.path.join(city_dir, "hko_1min.jsonl")
+        hko = Hko1MinCollector(
+            fetch=make_hko_1min_fetch(session=_new_session()),
+            station=city_cfg.resolution_hko_place, path=hko_path)
+        predictor = WuPredictor(
+            pred_path=os.path.join(city_dir, "predictions.jsonl"),
+            eval_path=os.path.join(city_dir, "prediction_eval.jsonl"),
+            rounding=config.lfs_predict_rounding,
+            seed_hko_path=hko_path)
+        twc_rows = twc_daily = None
+        if config.twc_api_key:
+            sess = _new_session()
+            twc_rows = TwcRowCollector(
+                fetch=make_twc_timeseries_fetch(api_key=config.twc_api_key,
+                                                location=config.twc_location,
+                                                session=sess),
+                path=os.path.join(city_dir, "twc_rows.jsonl"))
+            twc_daily = TwcDailyCollector(
+                fetch=make_twc_historical_fetch(api_key=config.twc_api_key,
+                                                location=config.twc_location,
+                                                session=sess),
+                path=os.path.join(city_dir, "twc_daily.jsonl"),
+                capture_hkt=tuple(s for s in config.twc_daily_hkt.split(",") if s.strip()))
+        else:
+            reporter.notice(city_cfg.id,
+                            "calibration: TWC_API_KEY missing — HKO 1-min only "
+                            "(no TWC row/daily capture, K1/K2/K3 cannot close)")
+        workers.append(LfsCalibrationWorker(
+            city=city_cfg.id, reporter=reporter, hko=hko, twc_rows=twc_rows,
+            twc_daily=twc_daily, predictor=predictor,
+            health_path=os.path.join(city_dir, "collector_health.jsonl"),
+            hko_poll_sec=config.hko_1min_poll_sec,
+            twc_poll_sec=config.twc_poll_sec))
+        reporter.event(city_cfg.id, "calibration_start",
+                       station=city_cfg.resolution_hko_place,
+                       twc=bool(config.twc_api_key),
+                       rounding=config.lfs_predict_rounding)
+        reporter.notice(city_cfg.id,
+                        f"calibration collectors ON (HKO 1-min"
+                        f"{' + TWC rows + daily' if config.twc_api_key else ''}"
+                        f", predict={config.lfs_predict_rounding}) -> {city_dir}/")
+    return workers
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -238,15 +354,31 @@ def main(argv: Optional[list[str]] = None) -> int:
         city_ids = [c.id for c in config.cities]
     else:
         city_ids = [c.strip() for c in args.cities.split(",") if c.strip()]
-    supervisor = build_supervisor(config, reporter, risk, city_ids, live_client=live_client)
+    no_trade_cities = ([c.strip() for c in args.no_trade.split(",") if c.strip()]
+                       if args.no_trade else [])
+    supervisor = build_supervisor(config, reporter, risk, city_ids,
+                                  live_client=live_client, no_trade_cities=no_trade_cities,
+                                  use_hko=args.hko)
+    # LFS calibration collectors (Shenzhen): --calibrate or LFS_CALIBRATION=1.
+    calibrate = bool(args.calibrate) or config.lfs_calibration
+    cal_workers = (build_calibration_workers(config, reporter, city_ids)
+                   if calibrate else [])
 
-    reporter.event("_global", "startup", mode=config.mode, cities=list(city_ids))
+    reporter.event("_global", "startup", mode=config.mode, cities=list(city_ids),
+                   no_trade=list(no_trade_cities), hko=bool(args.hko),
+                   calibrate=[w.city for w in cal_workers])
     reporter.progress(f"START   mode={config.mode}  cities={','.join(city_ids)}  "
-                      f"(stdout=trades only; this stream=progress, --quiet to silence)")
+                      + (f"no-trade={','.join(no_trade_cities)}  " if no_trade_cities else "")
+                      + "(stdout=trades only; this stream=progress, --quiet to silence)")
+    for w in cal_workers:
+        w.start()
     try:
         supervisor.run_forever()
     except KeyboardInterrupt:
         supervisor.stop()
+    finally:
+        for w in cal_workers:
+            w.stop()
     return 0
 
 

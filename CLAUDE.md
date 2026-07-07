@@ -25,7 +25,9 @@ rest a 99.9¢ maker sell to recycle capital; else hold to $1.
 python -m dead_bracket.main                # paper, ALL 10 cities (the default)
 python -m dead_bracket.main --check        # live preflight: creds/balance, no orders
 python -m dead_bracket.main --live --bankroll 40   # 40% of wallet balance; needs POLY_PRIVATE_KEY + POLY_FUNDER
-python -m pytest                           # 180 tests; NO live network in tests
+TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate  # + Shenzhen calibration collectors
+python -m dead_bracket.tools.lfs_calibrate # offline K1/K2/K3/ε report from collected data
+python -m pytest                           # 272 tests; NO live network in tests
 ```
 Coverage gate (CI): ≥90% line on strategy/risk/executor/worker. Keep it green.
 
@@ -48,6 +50,12 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/worker. Keep it green.
 ## Non-negotiable invariants (each has tests + a memory note — don't regress)
 - **METAR-only.** No Météo-France / 6-minute feed anywhere. Decimal temps are
   rejected (non-resolution). Don't import/extend `weatherTrader/multipleCityPoller.py`.
+  ONE scoped exception (`shenzhen_calibration_requirements.md`): the HKO 1-min CSV
+  + TWC endpoints in `lfs_calibration.py` are the Shenzhen resolution source's own
+  upstream/output, collected under `--calibrate` for calibration + the
+  WU-prediction shadow ONLY — they never reach a `MetarFeed`, a running max, or
+  the order path, and Shenzhen stays `no_trade` until the calibration report's
+  acceptance gates pass (a human decision).
 - **Discovery only ever tracks today's local-date HIGHEST event.** Never
   tomorrow's, never a `lowest-temperature` market. Idle if today's isn't open.
   Next-day rollover is **per-city at each city's own local midnight** (timezones
@@ -61,8 +69,11 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/worker. Keep it green.
   **LTFM (Istanbul)** and **LLBG (Tel Aviv)** are in `WUNDERGROUND_EXEMPT_ICAOS` —
   they waive ONLY the `wunderground` half (they resolve off a non-WU source — Tel
   Aviv off NOAA's `weather.gov` timeseries for the station) but **still must name
-  their station ICAO** (the station is never waived). (SPECIs are included for all
-  cities now.)
+  their station ICAO** (the station is never waived). These three resolve on
+  `weather.gov`'s **routine** cycle, so they carry `include_speci=False`: SPECIs
+  are still fetched and **logged** (data collection is unaffected) but never fold
+  into the trade-triggering running max — a SPECI spike must not mark a still-live
+  bracket dead. Every other city counts SPECIs (`include_speci=True`).
 - **stdout = pure trade stream** (`BOUGHT`/`SOLD` + one `HALT` for the global
   daily-loss kill only). Everything else → stderr / per-day `data/<city>/<date>/`.
 - **Halts are per-city** (order errors, stale feed, crossed book, downward

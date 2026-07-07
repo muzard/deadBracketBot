@@ -16,7 +16,7 @@ def test_defaults_match_spec():
     assert c.max_shares_per_bracket == 500
     assert c.max_exposure_per_city == 500.0
     assert c.max_total_exposure == 1000.0
-    assert c.max_frac_of_depth == 0.5
+    assert c.max_frac_of_depth == 1.0
     assert c.max_daily_loss == 50.0
     assert c.stale_feed_min == 45
     ids = [city.id for city in c.cities]
@@ -39,6 +39,18 @@ def test_defaults_match_spec():
     from zoneinfo import ZoneInfo
     for city in c.cities:
         assert ZoneInfo(city.tz) is not None
+
+
+def test_weather_gov_cities_exclude_speci_from_trigger():
+    # The weather.gov-resolving (Wunderground-exempt) cities resolve on the
+    # routine cycle only, so SPECIs must not fold into the trade-triggering
+    # running max. Every other city keeps SPECIs (default True).
+    from dead_bracket.feeds_http import WUNDERGROUND_EXEMPT_ICAOS
+    routine_only = {"moscow", "istanbul", "tel_aviv"}
+    for city in Config().cities:
+        expected = city.metar_icao not in WUNDERGROUND_EXEMPT_ICAOS
+        assert city.include_speci is expected, city.id
+        assert (city.id in routine_only) is (not city.include_speci)
 
 
 def test_invalid_mode_rejected():

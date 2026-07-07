@@ -49,7 +49,10 @@
       "Bash(mkdir -p /Users/arttu/Projects/hustle/fahrenheitBracketBot/wu_resolution /Users/arttu/Projects/hustle/fahrenheitBracketBot/tests && echo created)",
       "Bash(python3 -m pytest -q)",
       "Bash(../deadBracketBot/.venv/bin/python -m pytest -q)",
-      "Bash(curl -s --max-time 30 \"https://gamma-api.polymarket.com/events?slug=highest-temperature-in-nyc-on-june-29-2026\")"
+      "Bash(curl -s --max-time 30 \"https://gamma-api.polymarket.com/events?slug=highest-temperature-in-nyc-on-june-29-2026\")",
+      "WebFetch(domain:data.weather.gov.hk)",
+      "WebFetch(domain:www.hko.gov.hk)",
+      "Bash(python3)"
     ]
   }
 }

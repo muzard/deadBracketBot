@@ -341,6 +341,253 @@ def make_metar_fetch(
 
 _METAR_TIME = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\b")
 
+# HKO official open data ("regional weather" real-time report). Free, no API key,
+# whole-degC, updated in real time — and it is UPSTREAM of what The Weather
+# Company / Wunderground ingest for their HK-region stations, so reading it
+# directly matches WU's resolution source and front-runs WU's publish lag.
+HKO_RHRREAD_URL = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php"
+
+
+def parse_hko_rhrread(payload, place: str):
+    """Extract ``(temp_c, obs_time)`` for one named HKO station from an rhrread
+    response, or ``None`` if absent/malformed.
+
+    Temperature is whole-degC at the source (matches the integer-bracket
+    resolution); a stray float is rounded defensively. ``obs_time`` is the feed's
+    ``recordTime`` (tz-aware). Pure/deterministic — no network, unit-testable.
+    """
+
+    try:
+        block = payload["temperature"]
+        obs_time = datetime.fromisoformat(block["recordTime"])
+        for row in block["data"]:
+            if row.get("place") == place and row.get("unit") == "C":
+                return int(round(float(row["value"]))), obs_time
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def synth_hko_metar(icao: str, temp_c: int, obs_time: datetime, place: str) -> str:
+    """Render an HKO reading as a minimal, parseable METAR line so it drives an
+    existing ``MetarFeed`` with no downstream changes (running max, dedup, log,
+    staleness, day rollover all unchanged).
+
+    Only temperature matters for the dead-NO edge; the source has no dewpoint,
+    so the dewpoint slot carries an explicit ``XX`` placeholder (an earlier
+    version mirrored the temp — ``26/26`` — which sent audits chasing a
+    phantom dewpoint). A trailing ``RMK SRC=HKO:<place>`` keeps the logged raw
+    honest (clearly not a spoofed ZGSZ airport METAR) while leaving ``icao`` =
+    the market station so the feed's station-isolation guard still passes.
+    """
+
+    z = obs_time.astimezone(timezone.utc).strftime("%d%H%MZ")
+    tt = f"M{abs(temp_c):02d}" if temp_c < 0 else f"{temp_c:02d}"
+    return f"{icao} {z} {tt}/XX RMK SRC=HKO:{place}"
+
+
+class HkoStationFetcher:
+    """MetarFeed-compatible fetch for a market that resolves off an HKO station.
+
+    Reads ONE station's temperature from HKO's rhrread open data and returns it as
+    a synthesized METAR line (:func:`synth_hko_metar`). ttl-throttled and
+    fail-soft in the same shape as :class:`SharedMetarFetcher`: a transient failure
+    keeps serving the last-good reading for up to ``max_age`` seconds; a prolonged
+    outage returns ``None`` so the feed's stale-halt still trips. Thread-safe. The
+    ``session`` is injected so tests exercise it with canned JSON (no live network).
+    """
+
+    def __init__(self, *, station: str, icao: str, session,
+                 user_agent: str = _DEFAULT_UA, timeout: float = 15.0,
+                 ttl: float = 240.0, max_age: float = 1200.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._station = station
+        self._icao = icao
+        self._session = session
+        self._ua = user_agent
+        self._timeout = timeout
+        self._ttl = ttl
+        self._max_age = max_age
+        self._clock = clock
+        self._raw: Optional[str] = None
+        self._last_success: Optional[float] = None
+        self._last_attempt: Optional[float] = None
+        self._lock = threading.Lock()
+
+    def raw_for(self, icao: Optional[str] = None, max_age: Optional[float] = None) -> Optional[str]:
+        interval = max_age if max_age is not None else self._ttl
+        with self._lock:
+            now = self._clock()
+            if self._last_attempt is None or (now - self._last_attempt) >= interval:
+                self._last_attempt = now
+                self._refresh(now)
+            if self._last_success is None or (now - self._last_success) > self._max_age:
+                return None  # no recent success -> let the feed go stale
+            return self._raw
+
+    def _refresh(self, now: float) -> None:  # pragma: no cover - network
+        if self._session is None:
+            return
+        try:
+            resp = self._session.get(
+                HKO_RHRREAD_URL,
+                params={"dataType": "rhrread", "lang": "en"},
+                headers={"User-Agent": self._ua},
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            parsed = parse_hko_rhrread(resp.json(), self._station)
+        except Exception:
+            return  # keep last-good; raw_for ages it out via max_age
+        if parsed is None:
+            return
+        temp_c, obs_time = parsed
+        self._raw = synth_hko_metar(self._icao, temp_c, obs_time, self._station)
+        self._last_success = now
+
+
+# --------------------------------------------------------------------------
+# Shenzhen / Lau Fau Shan calibration sources (see lfs_calibration.py). These
+# are DATA-COLLECTION feeds only: nothing here reaches a MetarFeed or the
+# strategy. The 1-min CSV is HKO's own upstream of the market's resolution
+# source (the one permitted non-METAR feed, per the calibration requirements);
+# the api.weather.com endpoints are the resolution source itself (what WU
+# renders). Fetchers return None on any failure — the collectors count it and
+# skip the tick, so an outage never crashes the calibration worker.
+# --------------------------------------------------------------------------
+HKO_1MIN_URL = ("https://data.weather.gov.hk/weatherAPI/hko_data/"
+                "regional-weather/latest_1min_temperature.csv")
+TWC_TIMESERIES_URL = ("https://api.weather.com/v1/location/{location}/"
+                      "observations/timeseries.json")
+TWC_HISTORICAL_URL = ("https://api.weather.com/v1/location/{location}/"
+                      "observations/historical.json")
+
+
+def _cache_bust() -> str:
+    return str(int(time.time() * 1000))
+
+
+def make_hko_1min_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
+                        timeout: float = 15.0) -> Callable[[], Optional[str]]:
+    """Fetch callable for the HKO latest-1-minute regional temperature CSV.
+
+    Returns the CSV text or None. Served as ``application/octet-stream`` with a
+    possible BOM, so it is decoded from bytes as utf-8-sig rather than trusting
+    the content-type. Cache-busted per request (the file sits behind a cache;
+    a stale snapshot would just re-serve the last observation minute).
+    """
+
+    sess = session or (requests.Session() if requests else None)
+
+    def fetch() -> Optional[str]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        try:
+            resp = sess.get(HKO_1MIN_URL, params={"_": _cache_bust()},
+                            headers={"User-Agent": user_agent,
+                                     "Cache-Control": "no-cache"},
+                            timeout=timeout)
+        except Exception:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            return resp.content.decode("utf-8-sig", errors="replace")
+        except Exception:
+            return None
+
+    return fetch
+
+
+# api.weather.com REJECTS unknown query params with a 400 (verified live
+# 2026-07-07), so the usual "_=<millis>" cache-bust cannot be used, and its
+# cache ignores Cache-Control/Pragma request headers (s-maxage=300 — the SAME
+# transaction_id is re-served for up to 5 minutes). The cache key does include
+# the query string, though, so rotating the ``hours`` parameter through
+# distinct values gives every poll its own cache entry; with >= 6 values at a
+# 60 s cadence each entry has expired before its value comes around again ->
+# origin-fresh data every poll. Larger ``hours`` merely returns more history
+# rows, which the row-version collector dedupes for free.
+TWC_HOURS_ROTATION = (2, 3, 4, 5, 6, 7)
+
+
+def make_twc_timeseries_fetch(*, api_key: str, location: str = "ZGSZ:9:CN",
+                              hours_rotation: tuple[int, ...] = TWC_HOURS_ROTATION,
+                              session=None, user_agent: str = _DEFAULT_UA,
+                              timeout: float = 15.0) -> Callable[[], Optional[dict]]:
+    """Fetch callable for TWC's observation timeseries (the WU row source).
+
+    Returns the parsed JSON payload or None. Cache-busted by rotating the
+    ``hours`` parameter (see ``TWC_HOURS_ROTATION`` above) so 60 s polling sees
+    fresh row versions, not the 5-minute CDN copy; the collector additionally
+    watches ``metadata.transaction_id`` to detect a stale cache slipping
+    through anyway.
+    """
+
+    sess = session or (requests.Session() if requests else None)
+    state = {"i": 0}
+
+    def fetch() -> Optional[dict]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        hours = hours_rotation[state["i"] % len(hours_rotation)]
+        state["i"] += 1
+        try:
+            resp = sess.get(TWC_TIMESERIES_URL.format(location=location),
+                            params={"apiKey": api_key, "units": "m",
+                                    "hours": hours},
+                            headers={"User-Agent": user_agent},
+                            timeout=timeout)
+        except Exception:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    return fetch
+
+
+def make_twc_historical_fetch(*, api_key: str, location: str = "ZGSZ:9:CN",
+                              session=None, user_agent: str = _DEFAULT_UA,
+                              timeout: float = 20.0) -> Callable[[str], Optional[dict]]:
+    """Fetch callable for TWC's historical daily table (the K3 capture).
+
+    Takes the target day as ``yyyyMMdd`` (start=end, i.e. one HKT day of final
+    rows + any max_temp/min_temp summary fields) and returns the parsed JSON
+    payload or None.
+    """
+
+    sess = session or (requests.Session() if requests else None)
+
+    def fetch(day_yyyymmdd: str) -> Optional[dict]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        try:
+            # No cache-bust param (api.weather.com 400s on unknown params);
+            # the per-day startDate/endDate already vary the cache key, and
+            # the two capture slots are hours apart (>> the 5-min cache TTL).
+            resp = sess.get(TWC_HISTORICAL_URL.format(location=location),
+                            params={"apiKey": api_key, "units": "m",
+                                    "startDate": day_yyyymmdd,
+                                    "endDate": day_yyyymmdd},
+                            headers={"User-Agent": user_agent},
+                            timeout=timeout)
+        except Exception:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    return fetch
+
 
 def make_tgftp_fetch(*, user_agent: str = _DEFAULT_UA, timeout: float = 5.0,
                      session=None) -> Callable[[str], Optional[str]]:
@@ -403,10 +650,11 @@ def latest_json_by_icao(records, exclude_speci_icaos=()) -> dict[str, tuple]:
     recent ``obsTime``. ``receiptTime`` is when AWC ingested the report (used to
     split publish delay from receipt delay); ``rawOb`` is the raw METAR we parse.
 
-    For an ICAO listed in ``exclude_speci_icaos`` (a market that resolves on the
-    routine cycle only, e.g. Moscow), off-cycle SPECI records are skipped — via
-    the ``metarType`` field / ``SPECI`` prefix — so its newest *routine* METAR
-    wins. Other stations keep SPECIs.
+    ``exclude_speci_icaos`` drops off-cycle SPECI records for the listed ICAOs
+    (via the ``metarType`` field / ``SPECI`` prefix) so their newest *routine*
+    METAR wins. Production no longer uses this (routine-only cities now surface
+    SPECIs so the feed can log-but-not-fold them); it is kept for callers/tests
+    that want the pure routine picker.
     """
 
     exclude = set(exclude_speci_icaos)
@@ -476,7 +724,10 @@ class SharedMetarFetcher:
         self._ttl = ttl
         self._max_age = max_age
         self._retries = retries
-        # ICAOs whose market resolves on the routine cycle only -> exclude SPECIs.
+        # ICAOs whose market resolves on the routine cycle only. SPECIs still
+        # arrive (and get logged) via the metarType-marked JSON batch; this set
+        # only disables the *unmarked* tgftp fast path for them, so an off-cycle
+        # SPECI can never slip in looking like a routine METAR and set the max.
         self._exclude_speci = set(exclude_speci_icaos)
         self._station_fetch = station_fetch
         self._hot_origin_min = hot_origin_min_sec
@@ -512,9 +763,10 @@ class SharedMetarFetcher:
                 self._last_attempt = now
                 self._refresh(now, bust=hot)
             # Per-station fast path at the full hot cadence (tiny tgftp file).
-            # Skipped for SPECI-excluded icaos: tgftp lines are unmarked, so we
-            # can't tell a routine METAR from a SPECI there — rely on the
-            # metarType-filtered JSON instead.
+            # Skipped for routine-only icaos: tgftp lines are unmarked, so we
+            # can't tell a routine METAR from a SPECI there and an off-cycle SPECI
+            # would fold into the max looking routine. Their SPECIs still arrive
+            # (marked) via the JSON batch, where the feed logs-but-doesn't-fold.
             if hot and self._station_fetch is not None and icao not in self._exclude_speci:
                 last = self._station_last.get(icao)
                 if last is None or (now - last) >= interval:
@@ -602,7 +854,11 @@ class SharedMetarFetcher:
                 )
                 resp.raise_for_status()
                 got = False
-                for ic, rec in latest_json_by_icao(resp.json(), self._exclude_speci).items():
+                # Surface SPECIs from the JSON too (they carry the SPECI keyword,
+                # so the FEED can tell them apart and log-but-not-fold them on
+                # routine-only cities). We do NOT drop them here — only the
+                # unmarked tgftp fast path stays disabled for those stations.
+                for ic, rec in latest_json_by_icao(resp.json()).items():
                     raw, obs, receipt = rec
                     # Never let a (cache-stale) batch overwrite a newer reading.
                     self._store(ic, raw, obs, receipt, now)

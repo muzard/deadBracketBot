@@ -26,7 +26,11 @@ from zoneinfo import ZoneInfo
 _TIME_RE = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\b")
 # Temp/dewpoint group, e.g. "23/10", "M03/M05", "07/M01". Temp is whole degC,
 # "M" prefix means negative. The resolving METAR is ALWAYS whole integers.
-_TEMP_RE = re.compile(r"\b(M?\d{2})/(M?\d{2})\b")
+# "XX" is accepted in the dewpoint slot: the synthesized HKO raw (see
+# feeds_http.synth_hko_metar) has no dewpoint and writes "26/XX" so audits
+# don't mistake a mirrored temp for a real dewpoint. Real METARs never carry
+# "XX" there, so the alternation cannot change how genuine reports parse.
+_TEMP_RE = re.compile(r"\b(M?\d{2})/(M?\d{2}|XX)\b")
 # Intra-Celsius (decimal) temperature, e.g. "21.3" or "M03.4". The market does
 # NOT resolve on the decimal/6-minute feed; a decimal reading is therefore a
 # non-resolution source and must never set the running max (it could mark a
@@ -364,12 +368,22 @@ class MetarFeed:
             return None
         # SPECIs are off-cycle special reports; the market resolves on the routine
         # METAR cycle, so a SPECI must not set the running max (a SPECI spike
-        # could otherwise mark a still-live bracket dead -> a losing buy).
+        # could otherwise mark a still-live bracket dead -> a losing buy). It is
+        # still COLLECTED (deduped + logged) so the data is retained for analysis;
+        # it just never folds into the tracker, and never refreshes the trade-
+        # freshness clock (staleness tracks the routine cadence, the resolution
+        # source). See ``include_speci`` in config.
         if obs.is_speci and not self._include_speci:
             with self._lock:
-                self.speci_rejected += 1
                 self._tracker.roll(now)
-            return None
+                norm = self._norm_raw(raw)
+                if norm in self._seen_raw:
+                    return obs
+                self._seen_raw.add(norm)
+                self.speci_rejected += 1  # counts SPECIs collected-but-not-folded
+                self._last_obs_key = (obs.obs_time, obs.temp_c, obs.is_correction)
+            self._append_log(obs)
+            return obs
         with self._lock:
             self._last_update_wall = now
             self._tracker.roll(now)
@@ -412,18 +426,24 @@ class MetarFeed:
                     continue
                 try:
                     rec = json.loads(line)
+                    raw = rec.get("raw", "")
                     obs = MetarObservation(
                         icao=self.icao,
                         obs_time=datetime.fromisoformat(rec["obs_time"]),
                         temp_c=int(rec["temp_c"]),
                         is_correction=bool(rec.get("is_correction", False)),
-                        raw=rec.get("raw", ""),
+                        raw=raw,
+                        is_speci=raw.strip().startswith("SPECI"),
                     )
                 except (json.JSONDecodeError, KeyError, ValueError):
                     continue
                 # Pass ``now`` so only the current local day's observations seed
                 # the running max — a restart never carries yesterday's high in.
-                self._tracker.update(obs, now=now)
+                # A logged SPECI on a routine-only city is collected but must NOT
+                # fold into the running max (mirrors poll_once), else a restart
+                # would resurrect a SPECI spike as a trade trigger.
+                if not (obs.is_speci and not self._include_speci):
+                    self._tracker.update(obs, now=now)
                 if obs.raw:
                     self._seen_raw.add(self._norm_raw(obs.raw))
                 # Remember the last logged observation so a restarted worker does

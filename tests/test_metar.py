@@ -205,12 +205,41 @@ def test_parse_flags_speci():
 def test_feed_excludes_speci_from_running_max():
     # A SPECI spike (24) must NOT lift the running max above the routine high
     # (22) — the market resolves on the routine cycle. This is the critical
-    # guard against buying a still-live bracket's NO.
+    # guard against buying a still-live bracket's NO. The SPECI is still returned
+    # (it is collected), it just does not fold into the max.
     feed = MetarFeed("LFPB", fetch_fn=lambda _i: "SPECI LFPB 081145Z 24/11 Q1015",
                      include_speci=False, clock=lambda: NOW)
-    assert feed.poll_once() is None
-    assert feed.running_max is None
+    obs = feed.poll_once()
+    assert obs is not None and obs.is_speci and obs.temp_c == 24
+    assert feed.running_max is None       # not folded -> no trade trigger
     assert feed.speci_rejected == 1
+
+
+def test_feed_collects_speci_to_log_even_when_not_folding(tmp_path):
+    # "Don't trigger, but keep collecting": a non-folded SPECI must still be
+    # written to the metar log so the data is retained for analysis.
+    log = tmp_path / "metar.jsonl"
+    feed = MetarFeed("LFPB", fetch_fn=lambda _i: "SPECI LFPB 081145Z 24/11 Q1015",
+                     include_speci=False, log_path=str(log), clock=lambda: NOW)
+    feed.poll_once()
+    assert feed.running_max is None
+    body = log.read_text()
+    assert body.strip() and '"temp_c": 24' in body and "SPECI LFPB 081145Z" in body
+
+
+def test_seed_from_log_does_not_resurrect_speci_as_trigger(tmp_path):
+    # A restart reseeds the running max from the log. A logged SPECI on a
+    # routine-only city must NOT fold in on reseed (else it would resurrect the
+    # spike as a trade trigger); the routine value must still seed.
+    log = tmp_path / "metar.jsonl"
+    log.write_text(
+        '{"obs_time": "2026-05-08T11:30:00+00:00", "temp_c": 22, '
+        '"is_correction": false, "raw": "METAR LFPB 081130Z 22/11 Q1015"}\n'
+        '{"obs_time": "2026-05-08T11:45:00+00:00", "temp_c": 24, '
+        '"is_correction": false, "raw": "SPECI LFPB 081145Z 24/11 Q1015"}\n')
+    feed = MetarFeed("LFPB", fetch_fn=lambda _i: None,
+                     include_speci=False, log_path=str(log), clock=lambda: NOW)
+    assert feed.running_max == 22  # routine seeded; SPECI spike (24) ignored
 
 
 def test_feed_can_include_speci_when_configured():

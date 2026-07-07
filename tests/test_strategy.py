@@ -92,12 +92,15 @@ def test_size_respects_depth_at_or_below_cap(config, risk):
     # 60 @ 0.95 (<=cap) and 100 @ 0.99 (>cap, excluded). avail = 60.
     snap = make_snapshot("paris", [make_bracket(22, asks=[(0.95, 60), (0.99, 100)])])
     intents = strat.evaluate(snap, running_max=24)
-    # MAX_FRAC_OF_DEPTH=0.5 -> int(0.5*60)=30.
-    assert intents[0].size == 30
+    # avail = 60 (the 0.99 level is above CAP); default frac 1.0 takes it all.
+    assert intents[0].size == 60
 
 
 def test_size_respects_max_frac_of_depth(config, risk):
-    strat = make_strategy(config, risk)
+    # Pin the anti-sweep fraction so this still exercises the knob itself
+    # (the default is now 1.0 = take the whole book).
+    cfg = replace(config, max_frac_of_depth=0.5)
+    strat = Strategy("paris", cfg, risk)
     snap = make_snapshot("paris", [make_bracket(22, asks=[(0.95, 200)])])
     # avail=200; frac cap int(0.5*200)=100; per-bracket=500; budget large -> 100.
     assert strat.evaluate(snap, running_max=24)[0].size == 100
@@ -124,14 +127,15 @@ def test_size_respects_per_bracket_cap(config, risk):
 
 def test_size_respects_total_cap_across_brackets(config, risk):
     strat = make_strategy(config, risk)
-    # total cap 1000 / cap 0.98 ~= 1020 shares; depth lets each want 250 (frac).
+    # With frac 1.0 each bracket would take its full 500 of depth, but the shared
+    # per-city ($500) / total ($1000) caps bind first: the provisional per-pass
+    # deduction stops the four brackets from over-committing the budget.
     brackets = [make_bracket(t, asks=[(0.95, 500)]) for t in (20, 21, 22, 23)]
     snap = make_snapshot("paris", brackets)
     intents = strat.evaluate(snap, running_max=24)
     total = sum(i.size for i in intents)
-    assert total <= 1000 / config.cap + 1
-    # Provisional deduction stops over-commit within the single tick.
-    assert total <= sum(int(0.5 * 500) for _ in brackets)
+    # Bound by the per-city cap ($500 / 0.98 CAP ~= 510 shares).
+    assert total <= config.max_exposure_per_city / config.cap + 1
 
 
 def test_bankroll_blocked_volume_reported(config):
@@ -141,11 +145,11 @@ def test_bankroll_blocked_volume_reported(config):
     cfg = replace(config, max_exposure_per_city=10.0, max_total_exposure=10.0)
     risk = RiskManager(cfg)  # caps must match the strategy's config
     strat = Strategy("paris", cfg, risk)
-    # depth 400 @ 0.95 -> willing = min(400, 500, int(0.5*400)=200) = 200 shares.
+    # depth 400 @ 0.95 -> willing = min(400, 500, int(1.0*400)=400) = 400 shares.
     snap = make_snapshot("paris", [make_bracket(22, asks=[(0.95, 400)])])
     intents = strat.evaluate(snap, running_max=24)
     took = intents[0].size if intents else 0
-    blocked_shares = 200 - took
+    blocked_shares = 400 - took
     assert strat.last_blocked_value == pytest.approx(blocked_shares * 0.95)
     assert strat.last_blocked_value > 0  # bankroll was the binding constraint
 
@@ -159,7 +163,10 @@ def test_no_bankroll_block_when_depth_limited(config, risk):
 
 
 def test_zero_size_skipped(config, risk):
-    strat = make_strategy(config, risk)
+    # Pin frac so a 1-share book floors the willing size to 0 (int(0.5*1)=0),
+    # exercising the willing<=0 skip branch independent of the default.
+    cfg = replace(config, max_frac_of_depth=0.5)
+    strat = Strategy("paris", cfg, risk)
     snap = make_snapshot("paris", [make_bracket(22, asks=[(0.95, 1)])])  # int(0.5*1)=0
     assert strat.evaluate(snap, running_max=24) == []
 
@@ -197,7 +204,9 @@ def test_make_exit_intent_clamps_to_market_max_on_coarse_tick(config, risk):
 
 
 def test_entry_respects_min_order_size(config, risk):
-    strat = make_strategy(config, risk)
+    # Pin frac=0.5 so the depths below give the intended sub/over-minimum sizes.
+    cfg = replace(config, max_frac_of_depth=0.5)
+    strat = Strategy("paris", cfg, risk)
     # depth 6 -> want floor(0.5*6)=3, below min 5 -> skipped.
     small = make_snapshot("paris", [make_bracket(22, asks=[(0.95, 6)], min_order_size=5)])
     assert strat.evaluate(small, running_max=24) == []

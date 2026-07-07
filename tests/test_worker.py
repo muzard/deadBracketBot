@@ -23,7 +23,7 @@ def test_exit_placed_on_open_and_retried_if_lost(config, risk):
     # Open a position: the resting 99.9c sell is placed immediately on the fill.
     worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
     pos = ex.positions[("paris", 22)]
-    assert pos.shares == 50 and pos.resting_sell == 50  # fully covered on open
+    assert pos.shares == 100 and pos.resting_sell == 100  # fully covered on open
 
     # Simulate the resting sell being lost (e.g. an exit placement that failed).
     pos.resting_sell = 0.0
@@ -54,8 +54,9 @@ def test_opportunity_logged_even_when_not_acted(config, risk, tmp_path):
         metar_raw="LFPB 031530Z 24/10 Q1018",
     )
     metar.poll_once()
-    # Depth of 1 -> int(0.5*1)=0 -> not acted, but ask < CAP so it's an opportunity.
-    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 1)])]))
+    # Depth 1 but a venue minimum of 5 -> want 1 < 5, not acted, yet ask < CAP so
+    # it's still logged as an opportunity (size/caps).
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 1)], min_order_size=5)]))
     # Per-day folder: glob across whatever date the file landed in.
     opp_files = list((tmp_path / "paris").glob("*/opportunities.jsonl"))
     assert opp_files, "expected an opportunities log"
@@ -423,10 +424,10 @@ def test_status_line_shows_open_volume(config, risk):
     # Take a position; the status now reflects deployed capital + shares.
     worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
     n, shares, cost = worker.open_volume()
-    assert n == 1 and shares == 50 and cost == pytest.approx(47.5)
+    assert n == 1 and shares == 100 and cost == pytest.approx(95.0)
     worker.emit_status()
     line1 = rep.progress_lines[-1]
-    assert "open $48/" in line1 and "(50sh, 1pos)" in line1
+    assert "open $95/" in line1 and "(100sh, 1pos)" in line1
 
 
 def test_status_line_shows_bankroll_blocked_volume(config, risk):
