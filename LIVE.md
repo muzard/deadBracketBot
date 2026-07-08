@@ -133,6 +133,28 @@ rather than guessing, so it can't over-credit a position — but confirm it isn'
 Once a real entry, its resting exit (filled or held to $1 settlement), and the
 accounting all reconcile, raise the caps via the env vars above and add cities.
 
+## 7. Forecast path go/no-go (`--forecast-live`)
+
+The forecast path (probabilistic NO-buys off sub-hourly feeds, `--forecast`)
+never places live orders on its own: in live mode it only logs signals. Flip
+`--forecast-live` ONLY after all of these hold, from a multi-day paper soak:
+
+1. `python -m dead_bracket.tools.forecast_calibrate` reports, per city you
+   intend to enable: sensor **|bias| ≤ 0.3 °C and σ ≤ 0.3 °C** (then copy the
+   measured σ into that city's `sensor_sigma` in `config.py`), **Brier ≤ 0.02**,
+   and ≥ 100 signals with the realized hold rate inside the binomial CI of p̂.
+2. Paper PnL is positive **after fees**.
+3. You have decided the Kelly fraction (`KELLY_FRACTION`, default 0.25 — the
+   0.5 ceiling is enforced in config) and checked the same-ob / cross-city caps.
+4. You understand the kill switch: any settled loss on a forecast bet pauses
+   the whole forecast path (sticky across rollovers; restart to clear) and is a
+   post-mortem, not a resume.
+
+Start with the calibrated keyless cities (helsinki/tokyo/singapore) or paris
+once `MF_API_KEY` exists; amsterdam requires a `KNMI_API_KEY` plus a one-time
+live verification of the KNMI parser (it was written against the documented
+EDR format only).
+
 ## What I (the assistant) will not do
 
 I implemented and configured the signed-execution code, but I do not fund

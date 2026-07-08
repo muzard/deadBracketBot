@@ -2,8 +2,8 @@
 
 Goal: collect the data needed to re-enable Shenzhen trading. The market resolves on WU's
 table for HKO AWS station 45035 (Lau Fau Shan), which is NOT a METAR feed — TWC resamples
-HKO sub-hourly data into hourly rows (see `data/wu_lfs_discrepancy_2026-07-03.md`,
-`data/lfs_1min_edge_plan_2026-07-03.md`, `data/wu_metar_fidelity_2026-07-04.md`).
+HKO sub-hourly data into hourly rows (see `docs/wu_lfs_discrepancy_2026-07-03.md`,
+`docs/lfs_1min_edge_plan_2026-07-03.md`, `docs/wu_metar_fidelity_2026-07-04.md`).
 Three unknowns gate trading; this work measures them:
 
 - **K1** — TWC's sample grid (which HKO minutes end up in a row) + ingestion latency.

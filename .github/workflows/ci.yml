@@ -25,11 +25,13 @@ jobs:
             --cov=dead_bracket \
             --cov-report=term-missing \
             --cov-fail-under=85
-      - name: Enforce >=90% on strategy/risk/execution
+      - name: Enforce >=90% on strategy/risk/execution/forecast
         run: |
           python -m pytest \
             --cov=dead_bracket.strategy \
             --cov=dead_bracket.risk \
             --cov=dead_bracket.executor \
+            --cov=dead_bracket.forecast \
+            --cov=dead_bracket.forecast_feeds \
             --cov-report=term-missing \
             --cov-fail-under=90

@@ -1,10 +1,23 @@
-# CLAUDE.md — Dead-Bracket NO Capture bot
+# CLAUDE.md — Dead-Bracket NO Capture bot (+ forecast path)
 
 Standalone Python bot for Polymarket daily **"highest temperature in <city>"**
-markets. Each integer-°C bracket is a YES/NO pair settling to $1. Once the
-resolution-grade airport METAR's running max passes a bracket, that bracket can
-never be the high, so its NO is certain → buy the NO if offered <98¢ (IOC), then
-rest a 99.9¢ maker sell to recycle capital; else hold to $1.
+markets. Each integer-°C bracket is a YES/NO pair settling to $1. Two entry
+paths, one order pipeline:
+
+1. **Dead path (certainty).** Once the resolution-grade METAR's running max
+   passes a bracket, that bracket can never be the high, so its NO is certain
+   → buy the NO if offered <98¢ (IOC), then rest a 99.9¢ maker sell to recycle
+   capital; else hold to $1.
+2. **Forecast path (probabilistic, 2026-07-08 — a deliberate mandate widening,
+   NO-side only).** Sub-hourly national-met feeds (same/co-located sensors as
+   the resolver METAR) predict the next METAR print 6–30+ min early. The
+   fitted trust-decay model (`forecast.py::p_trust`) turns a reading with
+   margin `m` at lead `τ` into a win probability p̂; entries are fractional-
+   Kelly-sized (`kelly_fraction`, default 0.25, HARD CEILING 0.5) and require
+   `p̂ − ask − fee ≥ forecast_min_edge` (default 3¢) with the limit price at
+   `p̂ − fee − edge`. These bets CAN lose (settlement pays $0 if the bracket
+   wins the day) → any settled loss pauses the whole forecast path (sticky).
+   YES-side / day-max betting remains a **non-goal**.
 
 ## Read these first
 - **[FINDINGS.md](FINDINGS.md)** — the dead-NO edge is **real in thin markets**
@@ -13,23 +26,31 @@ rest a 99.9¢ maker sell to recycle capital; else hold to $1.
   confirms) — so don't expect it everywhere, and it's a small, concentrated sample.
   In the thin markets we're **bankroll-limited, not liquidity-limited** (Shenzhen:
   ~11× the depth we took sat unlifted at/below CAP, all blocked by `size/caps`).
-  Still don't "fix" the bot to chase forward/YES-side mispricings — that's
-  directional and a spec non-goal.
+- **[docs/](docs/)** — the forecast path's research: `trust_decay_formula_…md`
+  (the p̂ model + fitted PAR table), `subhourly_feed_openings_…md` (the Tier-1
+  feeds), `feed_integration_strategy_…md` (phases/gates/kill switches),
+  `early_reading_reliability_…md` (Kelly + ε), plus the Shenzhen/LFS audits.
 - **[README.md](README.md)** — architecture, console policy, how to run.
-- **[LIVE.md](LIVE.md)** — live runbook (wallet creds, caps, validation).
+- **[LIVE.md](LIVE.md)** — live runbook (wallet creds, caps, validation,
+  forecast go/no-go).
 - The original spec is `dead_bracket_no_strategy_spec.md` (in ~/Downloads).
 
 ## How to run / test
 ```bash
 . .venv/bin/activate                       # use the project venv (macOS: python3)
-python -m dead_bracket.main                # paper, ALL 10 cities (the default)
+python -m dead_bracket.main                # paper, ALL cities (the default)
 python -m dead_bracket.main --check        # live preflight: creds/balance, no orders
 python -m dead_bracket.main --live --bankroll 40   # 40% of wallet balance; needs POLY_PRIVATE_KEY + POLY_FUNDER
+python -m dead_bracket.main --forecast --balance 100   # + forecast path, paper (Kelly needs a balance)
+python -m dead_bracket.main --live --bankroll 40 --forecast                 # live dead path; forecast SIGNALS ONLY
+python -m dead_bracket.main --live --bankroll 40 --forecast --forecast-live # forecast live orders (human go/no-go!)
 TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate  # + Shenzhen calibration collectors
-python -m dead_bracket.tools.lfs_calibrate # offline K1/K2/K3/ε report from collected data
-python -m pytest                           # 272 tests; NO live network in tests
+python -m dead_bracket.tools.lfs_calibrate      # offline K1/K2/K3/ε report
+python -m dead_bracket.tools.forecast_calibrate # offline sensor-σ/Brier/hold-rate report (the go/no-go input)
+python -m pytest                           # 335 tests; NO live network in tests
 ```
-Coverage gate (CI): ≥90% line on strategy/risk/executor/worker. Keep it green.
+Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feeds
+(+ keep worker there too). Keep it green.
 
 ## Architecture (one process, one thread per city, shared risk + reporter)
 `Supervisor → CityWorker(metar, market, strategy, executor, risk, reporter)`.
@@ -43,19 +64,39 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/worker. Keep it green.
   max — `book_band_below`/`book_band_above`, default 1/2 — plus held positions, so
   ~33 cities don't trip the CLOB rate limit. A failed batch raises
   `TransientBookError` → the tick is skipped, NOT reported as market-unavailable).
-- `strategy.py` — pure: entry sizing + the 99.9¢ exit. `risk.py` — caps + halts.
+- `strategy.py` — pure: entry sizing + the 99.9¢ exit. `risk.py` — caps + halts
+  (+ the forecast exposure cap and the sticky forecast pause).
 - `executor.py` — `PaperExecutor` (default sim) / `LiveExecutor`. `worker.py` —
   the per-city cycle. `reporter.py` — stdout=trades, stderr=progress, per-day logs.
+- **Forecast path**: `forecast.py` (pure — `p_trust` model, Kelly sizing,
+  `ForecastStrategy`, `FeedMetarGuard`), `forecast_feeds.py` (`FeedCollector` →
+  `data/<city>/feed.jsonl` + a thread-safe latest-reading holder;
+  `FeedPollerWorker` daemon thread per city), fetchers/parsers in
+  `feeds_http.py` (`build_feed_fetcher`). Tier-1 feeds: paris=Météo-France 6-min
+  (`MF_API_KEY`), amsterdam=KNMI 10-min (`KNMI_API_KEY`, parser unverified until
+  a key exists), helsinki=FMI, tokyo=JMA AMeDAS, singapore=NEA (keyless).
+  Missing key → one startup notice, city stays METAR-only.
+  `tools/forecast_calibrate.py` = the offline gate report.
 
 ## Non-negotiable invariants (each has tests + a memory note — don't regress)
-- **METAR-only.** No Météo-France / 6-minute feed anywhere. Decimal temps are
-  rejected (non-resolution). Don't import/extend `weatherTrader/multipleCityPoller.py`.
-  ONE scoped exception (`shenzhen_calibration_requirements.md`): the HKO 1-min CSV
-  + TWC endpoints in `lfs_calibration.py` are the Shenzhen resolution source's own
-  upstream/output, collected under `--calibrate` for calibration + the
-  WU-prediction shadow ONLY — they never reach a `MetarFeed`, a running max, or
-  the order path, and Shenzhen stays `no_trade` until the calibration report's
-  acceptance gates pass (a human decision).
+- **METAR/resolver-only for RESOLUTION TRUTH.** Only the resolution-grade METAR
+  running max may mark a bracket dead; decimal temps are rejected from
+  `MetarFeed` (non-resolution). The sub-hourly national feeds (forecast path)
+  and the HKO/TWC calibration collectors are **signal/data-collection only**:
+  they must NEVER reach a `MetarFeed`, a running max, the dead-bracket logic,
+  or discovery. A forecast entry may only ever *anticipate* what the resolver
+  would confirm (NO-side below a predicted print) — never contradict it, and
+  never bet YES/day-max (spec non-goal). Don't import/extend
+  `weatherTrader/multipleCityPoller.py`. Shenzhen stays `no_trade` until the
+  LFS calibration acceptance gates pass (a human decision, see
+  `shenzhen_calibration_requirements.md`).
+- **Forecast live orders are human-gated.** `--forecast` alone trades only in
+  paper; in live mode it logs signals. Real forecast orders require the
+  explicit `--forecast-live` flag, to be flipped only after the paper soak +
+  `tools/forecast_calibrate.py` gates (sensor |bias|≤0.3 & σ≤0.3, Brier≤0.02,
+  ≥100 signals with hold rate in CI, positive EV after fees). A settled
+  forecast loss pauses the path process-wide and stays paused across rollovers
+  (restart to clear — it's a model/mapping bug until proven otherwise).
 - **Discovery only ever tracks today's local-date HIGHEST event.** Never
   tomorrow's, never a `lowest-temperature` market. Idle if today's isn't open.
   Next-day rollover is **per-city at each city's own local midnight** (timezones
@@ -90,6 +131,13 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/worker. Keep it green.
   realized_pnl`, so bet sizes grow as the bot wins (all-in on a single dead
   bracket). Live reads the wallet balance at startup; paper needs `--balance`.
   With `--bankroll 0` the static dollar caps (`MAX_EXPOSURE_*`) apply instead.
+- Forecast sizing/caps (all config): `kelly_fraction` (≤0.5 enforced),
+  `forecast_min_edge`, `forecast_min_margin_c` (≥0.4 °C — METAR rounds),
+  `forecast_p_cap` 0.99, the 17–21h local evening cutoff, same-ob cap 25% of
+  balance (all brackets from one reading = ONE bet), cross-city forecast cap
+  40% of balance, stale-feed cutoff, and the ±1 °C×2 feed-vs-METAR divergence
+  guard. Forecast Kelly needs a balance even when the dead path runs static
+  caps (`--forecast` without `--balance` in paper is refused).
 - Keep the network layer in `feeds_http.py`; strategy/risk/executor stay pure and
   unit-testable (inject feeds/clients via fixtures).
 - The assistant implements/configures live trading but does **not** place orders

@@ -29,8 +29,37 @@ the running max **resets at the city's local midnight**, and a reading from one
 station can never fold into another city (hard ICAO isolation). All station/tz
 pairs are confirmed against the live markets — see [LIVE.md](LIVE.md).
 
-> METAR-only. There is no Météo-France / 6-minute feed anywhere; the only weather
-> input is the resolution METAR.
+> METAR/resolver-only **for resolution truth**: only the resolution METAR's
+> running max can mark a bracket dead. The **forecast path** (below) adds
+> sub-hourly national feeds as *signal-only* inputs — they accelerate NO-side
+> entries probabilistically and never touch the running max or discovery.
+
+## Forecast path (probabilistic NO-side, off by default)
+
+`--forecast` enables a second entry path built on the research in
+[docs/](docs/): national met services publish sub-hourly readings (6-min
+Météo-France, 10-min KNMI/FMI/JMA, 1-min NEA) from the same or co-located
+sensors that produce the resolver METARs — a 10–30+ min information lead. The
+fitted trust-decay model ([docs/trust_decay_formula_2026-07-02.md](docs/trust_decay_formula_2026-07-02.md))
+turns a reading with margin `m` at lead `τ` into a win probability p̂ for
+buying NO on brackets below the predicted print:
+
+- **Entry**: only when `p̂ − ask − fee(ask) ≥ forecast_min_edge` (3¢ default);
+  the IOC limit is `p̂ − fee − edge` — a hard margin between forecast and price.
+- **Sizing**: fractional Kelly (`kelly_fraction`, default **quarter**, hard
+  ceiling **half**) of the current balance, capped per feed ob (25% — all
+  brackets from one reading are ONE bet), across cities (40%), per bracket/
+  city/total as usual.
+- **Guards**: ≥0.4 °C margin (METAR rounds), p̂ ≤ 0.99, no entries 17–21h
+  local (evening drift kills the edge), stale-feed cutoff, feed-vs-METAR
+  divergence trip, and a **sticky global pause on any settled forecast loss**.
+- **Rollout**: paper-trades from day one; in live mode signals are logged but
+  orders need the explicit `--forecast-live` go/no-go, informed by
+  `python -m dead_bracket.tools.forecast_calibrate`.
+
+Feed cities: paris (Météo-France, needs `MF_API_KEY`), amsterdam (KNMI, needs
+`KNMI_API_KEY`), helsinki (FMI), tokyo (JMA AMeDAS), singapore (NEA). A missing
+key just leaves that city METAR-only (one startup notice).
 
 ## Layout
 
@@ -43,13 +72,16 @@ src/dead_bracket/
   market.py      # market feed interface (injected snapshot_fn) (§6)
   feeds_http.py  # the ONLY network code: aviationweather + Gamma + batched CLOB books
   strategy.py    # entry (§3) and exit (§4) — pure logic
-  risk.py        # caps (incl. per-bracket $), kill-switch, daily-loss, per-city halts (§9)
+  forecast.py    # forecast path: p_trust model, Kelly sizing, ForecastStrategy, divergence guard
+  forecast_feeds.py  # FeedCollector (feed.jsonl + latest-reading holder) + FeedPollerWorker threads
+  risk.py        # caps (incl. per-bracket $ + forecast caps), kill-switch, daily-loss, per-city halts (§9)
   executor.py    # PaperExecutor (default) + LiveExecutor (polymarket-client SDK) (§7)
   reporter.py    # strict console policy + telemetry files (§8, §11)
   worker.py      # CityWorker: one city's cycle, restart-safe (§5)
   supervisor.py  # runs cities concurrently, isolated (§5)
   lfs_calibration.py  # Shenzhen/Lau Fau Shan calibration collectors + WU-prediction shadow
   tools/lfs_calibrate.py  # offline K1/K2/K3/ε analysis -> calibration report
+  tools/forecast_calibrate.py  # offline forecast report: sensor σ, Brier, hold rate, paper PnL
   main.py        # CLI entry point
 tests/           # pytest suite; ≥90% on strategy/risk/execution (§12)
 ```
@@ -76,11 +108,18 @@ POLY_PRIVATE_KEY=... python -m dead_bracket.main --live --bankroll 100
 # Paper, percentage sizing — supply the starting balance explicitly:
 python -m dead_bracket.main --bankroll 50 --balance 30 --cities london
 
+# Forecast path, paper (Kelly sizing needs an explicit balance):
+python -m dead_bracket.main --forecast --balance 100 --cities paris,helsinki,tokyo,singapore
+
+# Forecast live orders — HUMAN go/no-go, only after the calibration gates pass:
+POLY_PRIVATE_KEY=... python -m dead_bracket.main --live --bankroll 40 --forecast --forecast-live
+
 # Shenzhen calibration run (data collection + prediction shadow, no orders):
 TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate
 
 # Offline analysis of the collected calibration data (run any time):
 python -m dead_bracket.tools.lfs_calibrate --data-dir data --city shenzhen
+python -m dead_bracket.tools.forecast_calibrate --data-dir data
 ```
 
 All behaviour is config (spec §10). Scalar knobs can be overridden by an
@@ -143,7 +182,7 @@ lands, and how late our feed is. Set `PRICE_SAMPLE_SEC=0` to turn the sampler of
 
 Shenzhen resolves on WU's table for **HKO AWS 45035 (Lau Fau Shan)** — not a
 METAR: TWC resamples HKO sub-hourly data into hourly rows (see
-[data/wu_lfs_discrepancy_2026-07-03.md](data/wu_lfs_discrepancy_2026-07-03.md)).
+[docs/wu_lfs_discrepancy_2026-07-03.md](docs/wu_lfs_discrepancy_2026-07-03.md)).
 Three unknowns gate re-enabling the city
 ([shenzhen_calibration_requirements.md](shenzhen_calibration_requirements.md)):
 **K1** TWC's sample grid + ingestion latency, **K2** the 0.1 °C → integer

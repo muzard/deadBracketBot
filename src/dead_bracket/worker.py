@@ -23,6 +23,7 @@ from .config import CityConfig, Config
 from .executor import Executor
 from .feeds_http import TransientBookError
 from .fees import net as net_fn
+from .forecast import FeedReading, ForecastStrategy
 from .market import MarketFeed
 from .metar import MetarFeed
 from .models import MarketSnapshot
@@ -48,7 +49,10 @@ class CityWorker:
         strategy: Strategy,
         risk: RiskManager,
         reporter: Reporter,
+        forecast: Optional[ForecastStrategy] = None,
+        feed_reader=None,  # Callable[[], Optional[FeedReading]] from FeedCollector.latest
         monotonic=time.monotonic,
+        wall_clock=None,  # () -> aware UTC datetime; injectable for tests
     ) -> None:
         self.city = city_cfg.id
         self._city_cfg = city_cfg
@@ -59,6 +63,13 @@ class CityWorker:
         self._strategy = strategy
         self._risk = risk
         self._reporter = reporter
+        # Forecast path (optional): probabilistic entries from a sub-hourly
+        # feed reading. Both stay None unless the run passes --forecast and
+        # this city has an active feed.
+        self._forecast = forecast
+        self._feed_reader = feed_reader
+        self._feed_stale_notified = False
+        self._wall = wall_clock or (lambda: datetime.now(timezone.utc))
         self._stop = threading.Event()
         # Tolerant crossed-book tracking (paper mode, spec §9).
         self._crossed_streak = 0
@@ -136,6 +147,17 @@ class CityWorker:
                                      obs_time=obs.obs_time.isoformat(),
                                      is_correction=obs.is_correction,
                                      running_max=rmax)
+                if self._forecast is not None:
+                    # Feed-vs-METAR sensor-identity guard: pair this ob with
+                    # the nearest feed reading; divergence disables the feed.
+                    was_tripped = self._forecast.guard.tripped
+                    self._forecast.note_metar(obs.obs_time, obs.temp_c)
+                    if self._forecast.guard.tripped and not was_tripped:
+                        self._reporter.event(self.city, "feed_divergence_trip",
+                                             pair=self._forecast.guard.last_pair)
+                        self._reporter.notice(
+                            self.city, "forecast feed disabled for today: "
+                            "feed-vs-METAR divergence")
                 # Latency split: publish delay (obs -> source receipt) plus our
                 # own delay (source receipt -> now). When the receipt time is
                 # unknown only the total is shown.
@@ -260,6 +282,13 @@ class CityWorker:
         acted = {i.temp for i in intents}
         blocked_this_tick = self._strategy.last_blocked_value
 
+        # 3½. Forecast path (optional): probabilistic entries from the freshest
+        #     sub-hourly feed reading. Runs AFTER the dead path so a bracket the
+        #     certainty path just took is never double-bought; shares the same
+        #     halt gate above. In live mode it is signal-logging only unless
+        #     forecast_live is explicitly enabled (the human go/no-go).
+        intents = intents + self._evaluate_forecast(snapshot, rmax, frozenset(acted))
+
         # 4. Opportunity telemetry: every dead-NO ask < CAP (spec §11), plus a
         #    one-row-per-bracket-per-day snapshot of the NO book the instant a
         #    bracket goes dead (the minimal price dataset for the no-edge problem).
@@ -308,6 +337,40 @@ class CityWorker:
         #    cover any shares not yet backed by a resting sell — e.g. a place_exit
         #    that failed on a prior tick — retrying until it rests.
         self._ensure_exits(snapshot)
+
+    def _evaluate_forecast(self, snapshot: MarketSnapshot, rmax: Optional[int],
+                           skip_temps: frozenset[int]) -> list:
+        """Run the forecast engine for this tick; log its signals; gate live.
+
+        Returns the Intents to execute (empty when the path is disabled, the
+        feed is stale/absent, or live mode without the forecast_live enable).
+        """
+
+        if self._forecast is None or self._feed_reader is None:
+            return []
+        reading: Optional[FeedReading] = self._feed_reader()
+        now_utc = self._wall()
+        intents = self._forecast.evaluate(snapshot, rmax, reading, now_utc,
+                                          skip_temps=skip_temps)
+        # Stale-feed transition notices (signals off; METAR path unaffected).
+        if reading is not None:
+            if self._forecast.stale and not self._feed_stale_notified:
+                self._feed_stale_notified = True
+                self._reporter.event(self.city, "feed_stale",
+                                     obs_time=reading.obs_time.isoformat())
+                self._reporter.notice(self.city, "forecast feed stale: signals off")
+            elif not self._forecast.stale and self._feed_stale_notified:
+                self._feed_stale_notified = False
+                self._reporter.event(self.city, "feed_fresh")
+                self._reporter.notice(self.city, "forecast feed fresh again")
+        live_gated = self._cfg.mode == "live" and not self._cfg.forecast_live
+        for row in self._forecast.last_signals:
+            self._reporter.signal(self.city, live_gated=live_gated, **row)
+        if live_gated and intents:
+            # Signals are recorded (the shadow measurement) but no live orders
+            # without the explicit --forecast-live go decision.
+            return []
+        return intents
 
     def _place_exit_for(self, temp: int, size: float, bracket) -> None:
         """Place a GTC maker sell of ``size`` shares for one bracket."""
@@ -458,15 +521,33 @@ class CityWorker:
         """Settle yesterday's positions and log the daily rollover for this city.
 
         Called at the trading-day boundary so the bot runs unattended: open
-        dead-NO positions from the resolved day are settled (held to $1 in paper)
-        and reported. The shared risk re-arm is done once by the supervisor.
+        dead-NO positions from the resolved day are settled and reported. The
+        day's final running max marks the WINNING bracket, whose NO pays $0 —
+        only reachable by a forecast entry whose predicted kill never confirmed
+        (dead-path positions always sit below the final max). Such a loss
+        pauses the forecast path globally (config.forecast_pause_on_loss): at
+        p-hat >= 0.97 it is a model/mapping bug until a human clears it. The
+        shared risk re-arm is done once by the supervisor.
         """
 
-        settlements = self._executor.settle()
+        final_max = self._metar.running_max
+        settlements = self._executor.settle(final_max)
         total_pnl = 0.0
         for s in settlements:
-            self._reporter.settlement(s.city, temp=s.temp, shares=s.shares, pnl=s.pnl)
+            self._reporter.settlement(s.city, temp=s.temp, shares=s.shares, pnl=s.pnl,
+                                      won=s.won)
             total_pnl += s.pnl
+            if not s.won and self._cfg.forecast_pause_on_loss:
+                if self._risk.pause_forecast(
+                        f"settled loss: {s.city} {s.temp}C was the daily high"):
+                    self._reporter.event(self.city, "forecast_paused",
+                                         temp=s.temp, final_max=final_max,
+                                         pnl=s.pnl)
+                    self._reporter.notice(
+                        self.city, "FORECAST PAUSED: settled loss on "
+                        f"{s.temp}C (final max {final_max}) — restart to clear")
+        if self._forecast is not None:
+            self._forecast.roll_day()
         self._reporter.event(self.city, "day_rollover", settled=len(settlements), pnl=total_pnl)
         self._reporter.notice(self.city, f"new day: settled {len(settlements)} position(s), pnl {total_pnl:+.2f}")
 

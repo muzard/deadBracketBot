@@ -52,7 +52,8 @@
       "Bash(curl -s --max-time 30 \"https://gamma-api.polymarket.com/events?slug=highest-temperature-in-nyc-on-june-29-2026\")",
       "WebFetch(domain:data.weather.gov.hk)",
       "WebFetch(domain:www.hko.gov.hk)",
-      "Bash(python3)"
+      "Bash(python3)",
+      "Bash(jq 'select\\(.event==\"discovery\"\\)' -r)"
     ]
   }
 }

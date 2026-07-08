@@ -177,8 +177,20 @@ class Reporter:
         self.log(city, "prices", temp=temp, running_max=running_max, ask=r(ask),
                  bid=r(bid), obs_age_sec=None if obs_age_sec is None else round(obs_age_sec, 1))
 
-    def settlement(self, city: str, *, temp: int, shares: float, pnl: float) -> None:
-        self.log(city, "settlement", temp=temp, shares=shares, pnl=pnl)
+    def settlement(self, city: str, *, temp: int, shares: float, pnl: float,
+                   won: bool = True) -> None:
+        self.log(city, "settlement", temp=temp, shares=shares, pnl=pnl, won=won)
+
+    def signal(self, city: str, **fields) -> None:
+        """One forecast-engine decision row (-> signals.jsonl).
+
+        Every (feed ob, bracket) candidate the engine evaluated: p-hat, margin,
+        tau, ask, limit, Kelly fraction, and whether it was taken (skips are
+        logged once per candidate; takes always). This file is the calibration
+        dataset — realized hold rate vs p-hat comes straight from it.
+        """
+
+        self.log(city, "signals", **fields)
 
     def position(self, city: str, *, temp: int, shares: float, avg_cost: float,
                  resting_sell: float) -> None:

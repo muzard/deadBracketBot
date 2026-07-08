@@ -21,12 +21,15 @@ from .feeds_http import (
     GammaMarketProvider,
     HkoStationFetcher,
     SharedMetarFetcher,
+    build_feed_fetcher,
     make_hko_1min_fetch,
     make_metar_fetch,
     make_tgftp_fetch,
     make_twc_historical_fetch,
     make_twc_timeseries_fetch,
 )
+from .forecast import ForecastStrategy
+from .forecast_feeds import FeedCollector, FeedPollerWorker
 from .lfs_calibration import (
     Hko1MinCollector,
     LfsCalibrationWorker,
@@ -77,6 +80,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "collection only — no strategy or order-path effect. Files land "
                         "in data/<city>/. Also enabled by LFS_CALIBRATION=1; TWC capture "
                         "needs TWC_API_KEY (else HKO-only).")
+    p.add_argument("--forecast", action="store_true",
+                   help="enable the forecast path: sub-hourly national feed pollers "
+                        "(Météo-France/KNMI/FMI/JMA/NEA, signal-only) + the trust-decay "
+                        "signal engine with fractional-Kelly sizing. Trades in PAPER "
+                        "mode; in live mode it is signal-LOGGING only unless "
+                        "--forecast-live is also given. Needs --balance (or --bankroll "
+                        "in live) for Kelly sizing. Also enabled by FORECAST=1.")
+    p.add_argument("--forecast-live", action="store_true",
+                   help="allow REAL orders from forecast signals (requires --live and "
+                        "--forecast). This is the human go/no-go: only flip it after "
+                        "the paper soak + tools/forecast_calibrate.py gates pass.")
     p.add_argument("--data-dir", default=None, help="override DATA_DIR")
     p.add_argument("--check", action="store_true",
                    help="preflight: verify wallet credentials, balance, and allowances, then exit without trading")
@@ -183,9 +197,59 @@ def resolve_initial_balance(config: Config, balance_arg: Optional[float],
     return 0.0
 
 
+def build_forecast_workers(config: Config, reporter: Reporter, city_ids
+                           ) -> tuple[list[FeedPollerWorker], dict[str, FeedCollector]]:
+    """Wire the sub-hourly feed pollers for the forecast path.
+
+    One collector + daemon poller per selected city with a ``feed_source``
+    whose auth (if any) is satisfied. A city whose key is missing gets one
+    startup notice and stays METAR-only. Pure construction — no network until
+    the worker thread polls. Returns (pollers, city_id -> collector) so the
+    supervisor can hand each CityWorker its collector's ``latest``.
+    """
+
+    workers: list[FeedPollerWorker] = []
+    collectors: dict[str, FeedCollector] = {}
+    if not config.forecast:
+        return workers, collectors
+    for city_cfg in select_cities(config, city_ids):
+        if not city_cfg.feed_source:
+            continue
+        fetch = build_feed_fetcher(city_cfg, config, session=_new_session())
+        if fetch is None:
+            key_env = {"meteofrance": "MF_API_KEY", "knmi": "KNMI_API_KEY"}.get(
+                city_cfg.feed_source, "?")
+            reporter.event(city_cfg.id, "feed_skipped", src=city_cfg.feed_source,
+                           missing_key=key_env)
+            reporter.notice(city_cfg.id,
+                            f"forecast: {city_cfg.feed_source} feed OFF — set {key_env} "
+                            "to enable (city stays METAR-only)")
+            continue
+        collector = FeedCollector(
+            city=city_cfg.id, src=city_cfg.feed_source,
+            station=city_cfg.feed_station_id or "",
+            path=os.path.join(config.data_dir, city_cfg.id, "feed.jsonl"),
+            fetch=fetch)
+        collectors[city_cfg.id] = collector
+        # Poll at most every 60 s regardless of cadence: publication latency is
+        # the product, and dedup makes early polls free (JMA's big map file is
+        # additionally guarded by its latest_time stamp check).
+        poll_sec = float(min(city_cfg.feed_cadence_sec, 60))
+        workers.append(FeedPollerWorker(city=city_cfg.id, collector=collector,
+                                        reporter=reporter, poll_sec=poll_sec))
+        reporter.event(city_cfg.id, "feed_start", src=city_cfg.feed_source,
+                       station=city_cfg.feed_station_id,
+                       cadence_sec=city_cfg.feed_cadence_sec, poll_sec=poll_sec)
+        reporter.notice(city_cfg.id,
+                        f"forecast feed ON: {city_cfg.feed_source} station "
+                        f"{city_cfg.feed_station_id} (cadence {city_cfg.feed_cadence_sec}s) "
+                        f"-> feed.jsonl + signals.jsonl")
+    return workers, collectors
+
+
 def build_supervisor(config: Config, reporter: Reporter, risk: RiskManager,
                      city_ids, *, live_client=None, no_trade_cities=(),
-                     use_hko=False) -> Supervisor:
+                     use_hko=False, feed_collectors=None) -> Supervisor:
     selected = select_cities(config, city_ids)
     no_trade = set(no_trade_cities)
     # One batched METAR request for ALL stations, instead of N per cycle —
@@ -250,9 +314,17 @@ def build_supervisor(config: Config, reporter: Reporter, risk: RiskManager,
         executor = make_executor(config, risk, client=live_client,
                                  trade_disabled=trade_disabled)
         strategy = Strategy(city_cfg.id, config, risk)
+        # Forecast path: only cities with an ACTIVE feed collector get the
+        # probabilistic engine; everyone else runs exactly as before.
+        collector = (feed_collectors or {}).get(city_cfg.id)
+        forecast = feed_reader = None
+        if collector is not None:
+            forecast = ForecastStrategy(city_cfg.id, config, city_cfg, risk)
+            feed_reader = collector.latest
         workers.append(CityWorker(
             city_cfg, config, metar=metar, market=market, executor=executor,
             strategy=strategy, risk=risk, reporter=reporter,
+            forecast=forecast, feed_reader=feed_reader,
         ))
     return Supervisor(workers, risk=risk, reporter=reporter,
                       rollover_tz=config.rollover_tz, daily_rearm=config.daily_rearm)
@@ -319,12 +391,22 @@ def build_calibration_workers(config: Config, reporter: Reporter,
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.forecast_live and not (args.live and args.forecast):
+        print("HALT: --forecast-live requires both --live and --forecast", file=sys.stderr)
+        return 2
     config = Config.from_env()
     if args.live:
         config = config.with_mode("live")
-    if args.data_dir:
+    if args.data_dir or args.forecast or args.forecast_live:
         from dataclasses import replace
-        config = replace(config, data_dir=args.data_dir)
+        overrides = {}
+        if args.data_dir:
+            overrides["data_dir"] = args.data_dir
+        if args.forecast:
+            overrides["forecast"] = True
+        if args.forecast_live:
+            overrides["forecast_live"] = True
+        config = replace(config, **overrides)
 
     # Preflight credential/balance/allowance check — reads only, never trades.
     if args.check:
@@ -342,9 +424,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if config.bankroll_pct > 0 and config.mode != "live" and args.balance is None:
         print("HALT: percentage sizing in paper mode requires --balance", file=sys.stderr)
         return 2
+    # The forecast path sizes with fractional Kelly on the CURRENT BALANCE, so
+    # it needs one even when the dead path runs on static caps (bankroll 0).
+    if config.forecast and config.mode != "live" and args.balance is None:
+        print("HALT: --forecast needs --balance for Kelly sizing in paper mode",
+              file=sys.stderr)
+        return 2
 
     initial_balance = (resolve_initial_balance(config, args.balance, live_client)
-                       if config.bankroll_pct > 0 else 0.0)
+                       if (config.bankroll_pct > 0 or config.forecast) else 0.0)
 
     city_tz = {c.id: c.tz for c in config.cities}
     reporter = Reporter(config.data_dir, city_tz=city_tz, progress=not args.quiet)
@@ -356,9 +444,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         city_ids = [c.strip() for c in args.cities.split(",") if c.strip()]
     no_trade_cities = ([c.strip() for c in args.no_trade.split(",") if c.strip()]
                        if args.no_trade else [])
+    # Forecast feed pollers first, so the supervisor can inject each city's
+    # collector into its worker.
+    feed_workers, feed_collectors = build_forecast_workers(config, reporter, city_ids)
     supervisor = build_supervisor(config, reporter, risk, city_ids,
                                   live_client=live_client, no_trade_cities=no_trade_cities,
-                                  use_hko=args.hko)
+                                  use_hko=args.hko, feed_collectors=feed_collectors)
     # LFS calibration collectors (Shenzhen): --calibrate or LFS_CALIBRATION=1.
     calibrate = bool(args.calibrate) or config.lfs_calibration
     cal_workers = (build_calibration_workers(config, reporter, city_ids)
@@ -366,10 +457,20 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     reporter.event("_global", "startup", mode=config.mode, cities=list(city_ids),
                    no_trade=list(no_trade_cities), hko=bool(args.hko),
-                   calibrate=[w.city for w in cal_workers])
+                   calibrate=[w.city for w in cal_workers],
+                   forecast=sorted(feed_collectors), forecast_live=config.forecast_live)
+    if config.forecast:
+        gate = ("LIVE ORDERS ENABLED" if config.forecast_live
+                else ("live mode: signal-logging only (no --forecast-live)"
+                      if config.mode == "live" else "paper trading"))
+        reporter.progress(f"FORECAST  cities={','.join(sorted(feed_collectors)) or '(none)'}  "
+                          f"kelly={config.kelly_fraction}  min_edge={config.forecast_min_edge}  "
+                          f"[{gate}]")
     reporter.progress(f"START   mode={config.mode}  cities={','.join(city_ids)}  "
                       + (f"no-trade={','.join(no_trade_cities)}  " if no_trade_cities else "")
                       + "(stdout=trades only; this stream=progress, --quiet to silence)")
+    for w in feed_workers:
+        w.start()
     for w in cal_workers:
         w.start()
     try:
@@ -377,6 +478,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         supervisor.stop()
     finally:
+        for w in feed_workers:
+            w.stop()
         for w in cal_workers:
             w.stop()
     return 0

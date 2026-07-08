@@ -35,6 +35,13 @@ class RiskManager:
         self._total_exposure: float = 0.0
         self._realized_pnl: float = 0.0
 
+        # Forecast-path bookkeeping (probabilistic entries, reason "fcast ...").
+        # Exposure is tracked per bracket so sells/settlements release the right
+        # share of it; the sum is capped at forecast_daily_cap_pct of balance.
+        self._forecast_exposure: dict[tuple[str, int], float] = {}
+        self._forecast_paused: bool = False  # sticky: NOT cleared by roll_day
+        self._forecast_pause_reason: Optional[str] = None
+
         self._halted: bool = False  # GLOBAL kill-switch (daily-loss only)
         self._halt_reason: Optional[str] = None
         self._halt_announced: bool = False
@@ -117,6 +124,63 @@ class RiskManager:
         with self._lock:
             return self._city_halted.get(city)
 
+    # -- forecast path (probabilistic entries, reason prefix "fcast") -------
+    @property
+    def forecast_paused(self) -> bool:
+        with self._lock:
+            return self._forecast_paused
+
+    @property
+    def forecast_pause_reason(self) -> Optional[str]:
+        with self._lock:
+            return self._forecast_pause_reason
+
+    @property
+    def forecast_exposure(self) -> float:
+        """Total open $ exposure from forecast entries, across all cities."""
+
+        with self._lock:
+            return sum(self._forecast_exposure.values())
+
+    def pause_forecast(self, reason: str) -> bool:
+        """Stop ALL new forecast entries (sticky across rollovers — a settled
+        loss at p-hat >= 0.97 is a model/mapping bug until a human clears it by
+        restarting). The dead-bracket path is unaffected. Returns newly paused."""
+
+        with self._lock:
+            if self._forecast_paused:
+                return False
+            self._forecast_paused = True
+            self._forecast_pause_reason = reason
+            return True
+
+    def forecast_cap_remaining(self) -> float:
+        """Remaining $ the forecast path may deploy across ALL cities — the
+        cross-city correlation cap (one synoptic pattern drives many cities):
+        forecast_daily_cap_pct of the current balance, minus open forecast
+        exposure."""
+
+        with self._lock:
+            cap = self._cfg.forecast_daily_cap_pct / 100.0 * (
+                self._initial_balance + self._realized_pnl)
+            return max(0.0, cap - sum(self._forecast_exposure.values()))
+
+    def _release_forecast(self, key: tuple[str, int], cost_released: float) -> None:
+        """Release forecast exposure pro-rata when shares leave a bracket that
+        holds a mix of forecast and dead-path cost. Caller must hold the lock,
+        and must call this BEFORE reducing the bracket exposure."""
+
+        fc = self._forecast_exposure.get(key, 0.0)
+        if fc <= 0.0:
+            return
+        total = self._bracket_exposure.get(key, 0.0)
+        frac = 1.0 if total <= 0 else min(1.0, fc / total)
+        remaining = fc - cost_released * frac
+        if remaining <= 1e-9:
+            self._forecast_exposure.pop(key, None)
+        else:
+            self._forecast_exposure[key] = remaining
+
     # -- remaining caps (in shares) ---------------------------------------
     def per_bracket_cap_remaining(self, city: str, temp: int) -> float:
         """Remaining shares for a bracket: the lesser of the share cap and the
@@ -157,6 +221,8 @@ class RiskManager:
             self._bracket_exposure[key] = self._bracket_exposure.get(key, 0.0) + cost
             self._city_exposure[fill.city] = self._city_exposure.get(fill.city, 0.0) + cost
             self._total_exposure += cost
+            if fill.reason.startswith("fcast"):
+                self._forecast_exposure[key] = self._forecast_exposure.get(key, 0.0) + cost
 
     def record_sell_fill(self, fill: Fill, *, cost_released: float) -> None:
         """A maker exit filled: free exposure, reduce shares, realise PnL.
@@ -169,6 +235,7 @@ class RiskManager:
             return
         with self._lock:
             key = (fill.city, fill.temp)
+            self._release_forecast(key, cost_released)
             self._bracket_shares[key] = max(0.0, self._bracket_shares.get(key, 0.0) - fill.size)
             self._bracket_exposure[key] = max(0.0, self._bracket_exposure.get(key, 0.0) - cost_released)
             self._city_exposure[fill.city] = max(0.0, self._city_exposure.get(fill.city, 0.0) - cost_released)
@@ -176,18 +243,25 @@ class RiskManager:
             self._realized_pnl += (fill.notional - cost_released)
         self._check_daily_loss()
 
-    def record_settlement(self, *, city: str, temp: int, shares: float, cost_basis: float) -> None:
-        """NO settled at $1: free exposure and realise PnL (1.0 * shares - cost)."""
+    def record_settlement(self, *, city: str, temp: int, shares: float, cost_basis: float,
+                          payout: float = 1.0) -> None:
+        """A NO settled: free exposure and realise PnL (payout*shares - cost).
+
+        ``payout`` is the per-share redemption: $1 for every bracket that was
+        NOT the day's high (all dead-path positions), $0 when the bracket WON
+        the day — only possible for forecast entries, whose predicted kill
+        never confirmed."""
 
         if shares <= 0:
             return
         with self._lock:
             key = (city, temp)
+            self._release_forecast(key, cost_basis)
             self._bracket_shares[key] = max(0.0, self._bracket_shares.get(key, 0.0) - shares)
             self._bracket_exposure[key] = max(0.0, self._bracket_exposure.get(key, 0.0) - cost_basis)
             self._city_exposure[city] = max(0.0, self._city_exposure.get(city, 0.0) - cost_basis)
             self._total_exposure = max(0.0, self._total_exposure - cost_basis)
-            self._realized_pnl += (1.0 * shares - cost_basis)
+            self._realized_pnl += (payout * shares - cost_basis)
         self._check_daily_loss()
 
     # -- kill-switch / halts ----------------------------------------------
@@ -297,6 +371,7 @@ class RiskManager:
             self._bracket_shares.clear()
             self._bracket_exposure.clear()
             self._city_exposure.clear()
+            self._forecast_exposure.clear()  # pause stays sticky (human decision)
             self._total_exposure = 0.0
             self._realized_pnl = 0.0
             return True

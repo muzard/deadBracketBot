@@ -25,8 +25,11 @@ class CityConfig:
 
     Cities are pure config (spec §5): an id, the resolution-grade METAR station,
     the IANA timezone the daily high is measured in (the running max resets at
-    local midnight), and the terms used to discover the daily event on Gamma. No
-    Meteo-France / 6-minute fields exist anywhere.
+    local midnight), and the terms used to discover the daily event on Gamma.
+
+    The optional ``feed_*`` fields describe a national-met-service sub-hourly
+    feed for the *forecast* signal path (forecast.py) — signal-only data that
+    never reaches a MetarFeed, a running max, or dead-bracket logic.
 
     NOTE: ``metar_icao`` must match the station the *market actually resolves on*.
     The stations below have been confirmed against the markets; if a market's
@@ -53,13 +56,37 @@ class CityConfig:
     # lag. Only USED when the run enables HKO sources (``--hko``); otherwise the
     # NOAA METAR is read as normal, so default behaviour is unchanged.
     resolution_hko_place: Optional[str] = None
+    # --- forecast feed (signal-only; used only when the run passes --forecast).
+    # Which sub-hourly source serves this city ("meteofrance" | "knmi" | "fmi" |
+    # "jma" | "nea"), the source-native station id at/next to the METAR sensor,
+    # and the publication cadence. Sources requiring an API key activate only
+    # when the key is present (MF_API_KEY / KNMI_API_KEY).
+    feed_source: Optional[str] = None
+    feed_station_id: Optional[str] = None
+    feed_cadence_sec: int = 600
+    # UTC minutes-of-hour at which this station's routine METARs sample (drives
+    # tau, the model's lead time to the next print). E.g. LFPB :00/:30 but
+    # EHAM :25/:55 — the ":50 ob" IS the hourly for those stations.
+    metar_minutes: tuple[int, ...] = (0, 30)
+    # Calibrated feed-vs-METAR sensor noise (degC). None -> the inflated
+    # config default until tools/forecast_calibrate.py measures it.
+    sensor_sigma: Optional[float] = None
 
 
 # Paris -> LFPB, London -> EGLC (spec §10), plus additional European cities.
 # All (icao, tz) pairs are confirmed against the live markets; all of it is
 # config and trivially overridable if a market's resolution source changes.
 DEFAULT_CITIES: tuple[CityConfig, ...] = (
-    CityConfig(id="paris", metar_icao="LFPB", tz="Europe/Paris", market_terms=("paris",)),
+    # Forecast feeds (feed_* fields): Tier-1 sub-hourly sources verified
+    # 2026-07-08 (docs/subhourly_feed_openings_2026-07-02.md + live probes).
+    # Station ids: MF 95088001 = "LE BOURGET AEROPORT" (RADOME, is_minutely,
+    # coords match LFPB); KNMI 06240 = Schiphol (UNVERIFIED until a
+    # KNMI_API_KEY is available); FMI fmisid 100968 = Helsinki-Vantaa;
+    # JMA AMeDAS 44166 = Haneda; NEA S24 sits at the Changi climate station
+    # coordinates (sensor identity provisional until calibration accepts it).
+    CityConfig(id="paris", metar_icao="LFPB", tz="Europe/Paris", market_terms=("paris",),
+               feed_source="meteofrance", feed_station_id="95088001",
+               feed_cadence_sec=360, metar_minutes=(0, 30)),
     CityConfig(id="london", metar_icao="EGLC", tz="Europe/London", market_terms=("london",)),
     # weather.gov-resolving (WUNDERGROUND_EXEMPT) cities resolve on the routine
     # cycle only -> SPECIs are collected but must not trigger trades.
@@ -70,8 +97,12 @@ DEFAULT_CITIES: tuple[CityConfig, ...] = (
     CityConfig(id="ankara", metar_icao="LTAC", tz="Europe/Istanbul", market_terms=("ankara",)),
     CityConfig(id="istanbul", metar_icao="LTFM", tz="Europe/Istanbul", market_terms=("istanbul",),
                include_speci=False),  # weather.gov, routine-only (see moscow)
-    CityConfig(id="helsinki", metar_icao="EFHK", tz="Europe/Helsinki", market_terms=("helsinki",)),
-    CityConfig(id="amsterdam", metar_icao="EHAM", tz="Europe/Amsterdam", market_terms=("amsterdam",)),
+    CityConfig(id="helsinki", metar_icao="EFHK", tz="Europe/Helsinki", market_terms=("helsinki",),
+               feed_source="fmi", feed_station_id="100968",
+               feed_cadence_sec=600, metar_minutes=(20, 50)),
+    CityConfig(id="amsterdam", metar_icao="EHAM", tz="Europe/Amsterdam", market_terms=("amsterdam",),
+               feed_source="knmi", feed_station_id="06240",
+               feed_cadence_sec=600, metar_minutes=(25, 55)),
     CityConfig(id="warsaw", metar_icao="EPWA", tz="Europe/Warsaw", market_terms=("warsaw",)),
     CityConfig(id="munich", metar_icao="EDDM", tz="Europe/Berlin", market_terms=("munich",)),
     # Additional cities (Asia / Mideast / Africa / Americas). Each (icao, tz) pair
@@ -82,13 +113,17 @@ DEFAULT_CITIES: tuple[CityConfig, ...] = (
     # market_terms are tokens that appear in the hyphenated ASCII slug/title; for
     # accented names (são paulo) the term avoids the accent so it still matches.
     CityConfig(id="seoul", metar_icao="RKSI", tz="Asia/Seoul", market_terms=("seoul",)),
-    CityConfig(id="tokyo", metar_icao="RJTT", tz="Asia/Tokyo", market_terms=("tokyo",)),
+    CityConfig(id="tokyo", metar_icao="RJTT", tz="Asia/Tokyo", market_terms=("tokyo",),
+               feed_source="jma", feed_station_id="44166",
+               feed_cadence_sec=600, metar_minutes=(0, 30)),
     CityConfig(id="shanghai", metar_icao="ZSPD", tz="Asia/Shanghai", market_terms=("shanghai",)),
     CityConfig(id="beijing", metar_icao="ZBAA", tz="Asia/Shanghai", market_terms=("beijing",)),
     CityConfig(id="taipei", metar_icao="RCSS", tz="Asia/Taipei", market_terms=("taipei",)),
     CityConfig(id="guangzhou", metar_icao="ZGGG", tz="Asia/Shanghai", market_terms=("guangzhou",)),
     CityConfig(id="busan", metar_icao="RKPK", tz="Asia/Seoul", market_terms=("busan",)),
-    CityConfig(id="singapore", metar_icao="WSSS", tz="Asia/Singapore", market_terms=("singapore",)),
+    CityConfig(id="singapore", metar_icao="WSSS", tz="Asia/Singapore", market_terms=("singapore",),
+               feed_source="nea", feed_station_id="S24",
+               feed_cadence_sec=60, metar_minutes=(0, 30)),
     CityConfig(id="chongqing", metar_icao="ZUCK", tz="Asia/Shanghai", market_terms=("chongqing",)),
     CityConfig(id="qingdao", metar_icao="ZSQD", tz="Asia/Shanghai", market_terms=("qingdao",)),
     CityConfig(id="chengdu", metar_icao="ZUUU", tz="Asia/Shanghai", market_terms=("chengdu",)),
@@ -209,6 +244,50 @@ class Config:
     # Best-guess K2 rule the prediction shadow runs (half_up | half_even |
     # floor). Its measured hit rate is direct evidence for/against the rule.
     lfs_predict_rounding: str = "half_up"
+    # --- Forecast path (forecast.py): sub-hourly feed -> probabilistic NO-buys.
+    # Off by default; --forecast (or FORECAST=1) enables the feed pollers +
+    # signal engine. In PAPER mode forecast entries trade (simulated) from day
+    # one; in LIVE mode they are logged-only unless forecast_live is ALSO set
+    # (--forecast-live) — the go/no-go is a human decision informed by
+    # tools/forecast_calibrate.py.
+    forecast: bool = False
+    forecast_live: bool = False
+    # Fractional Kelly on the model's p-hat. Default quarter-Kelly (p is
+    # estimated and the loss tail is fat); hard ceiling half-Kelly.
+    kelly_fraction: float = 0.25
+    # Required edge after fees: only buy when p - ask - fee(ask) >= this, and
+    # never bid above p - fee - this (the margin between forecast and limit).
+    forecast_min_edge: float = 0.03
+    # Minimum tenths margin (reading - target integer) to count as a signal —
+    # METAR rounds to whole degC, so sub-0.4 margins are coin flips.
+    forecast_min_margin_c: float = 0.4
+    forecast_p_cap: float = 0.99  # never trust the model above this (unconfirmed obs)
+    forecast_resolver_factor: float = 0.995  # P(resolver ingests/keeps the ob)
+    # Local-hour window with NO forecast entries: evening drift (-1 degC/h)
+    # makes feed spikes the weakest signal exactly when asks look juiciest.
+    forecast_evening_start: int = 17
+    forecast_evening_end: int = 21
+    # All brackets triggered by ONE feed ob share a failure mode = one bet:
+    # cap their combined stake at this % of the current balance.
+    forecast_same_ob_cap_pct: float = 25.0
+    # Cross-city correlation cap: total open forecast exposure across all
+    # cities (shared synoptic pattern) at this % of the current balance.
+    forecast_daily_cap_pct: float = 40.0
+    # A reading older than this multiple of the feed cadence is stale -> no
+    # signals (the METAR/dead path continues unaffected).
+    forecast_stale_factor: float = 2.0
+    # Sensor-identity guard: this degC divergence on this many consecutive
+    # feed-vs-METAR pairs disables the feed for the day.
+    forecast_divergence_c: float = 1.0
+    forecast_divergence_n: int = 2
+    # Any settled LOSS on a forecast bet pauses the forecast path globally
+    # (at p-hat >= 0.97 a loss is a model/mapping bug until proven otherwise).
+    forecast_pause_on_loss: bool = True
+    # Feed-vs-METAR sensor noise (degC) used until calibration measures a
+    # per-city value (CityConfig.sensor_sigma). Deliberately inflated.
+    forecast_sensor_sigma_default: float = 0.3
+    mf_api_key: str = ""    # MF_API_KEY — Météo-France portail-api (paris)
+    knmi_api_key: str = ""  # KNMI_API_KEY — KNMI Data Platform (amsterdam)
     # Daily rollover: re-arm risk and settle positions at this tz's midnight so
     # the bot runs unattended across days. daily_rearm=False disables it.
     rollover_tz: str = "UTC"
@@ -229,6 +308,16 @@ class Config:
             raise ValueError("bankroll_pct must be in [0, 100]")
         if self.lfs_predict_rounding not in ("half_up", "half_even", "floor"):
             raise ValueError("lfs_predict_rounding must be half_up, half_even or floor")
+        if not (0.0 < self.kelly_fraction <= 0.5):
+            raise ValueError("kelly_fraction must be in (0, 0.5] — half-Kelly is the ceiling")
+        if not (0.0 <= self.forecast_min_edge < 1.0):
+            raise ValueError("forecast_min_edge must be in [0, 1)")
+        if not (0.0 < self.forecast_p_cap <= 1.0):
+            raise ValueError("forecast_p_cap must be in (0, 1]")
+        if not (0 <= self.forecast_evening_start <= self.forecast_evening_end <= 24):
+            raise ValueError("forecast evening window must satisfy 0 <= start <= end <= 24")
+        if self.forecast_live and self.mode != "live":
+            raise ValueError("forecast_live requires live mode")
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -277,6 +366,24 @@ class Config:
             "twc_location": str,
             "twc_daily_hkt": str,
             "lfs_predict_rounding": str,
+            "forecast": _as_bool,
+            "forecast_live": _as_bool,
+            "kelly_fraction": float,
+            "forecast_min_edge": float,
+            "forecast_min_margin_c": float,
+            "forecast_p_cap": float,
+            "forecast_resolver_factor": float,
+            "forecast_evening_start": int,
+            "forecast_evening_end": int,
+            "forecast_same_ob_cap_pct": float,
+            "forecast_daily_cap_pct": float,
+            "forecast_stale_factor": float,
+            "forecast_divergence_c": float,
+            "forecast_divergence_n": int,
+            "forecast_pause_on_loss": _as_bool,
+            "forecast_sensor_sigma_default": float,
+            "mf_api_key": str,
+            "knmi_api_key": str,
             "rollover_tz": str,
         }
         for name, cast in casters.items():

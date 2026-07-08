@@ -13,8 +13,11 @@ it expires, so the bot never keeps hammering a closed event's tokens (the cause
 of the CLOB 404 storm). Per-token book failures are tolerated — a single
 bracket's missing book skips that bracket instead of failing the whole snapshot.
 
-There is no Meteo-France / 6-minute feed here or anywhere — the only weather
-input is the resolution METAR.
+The only weather input that can mark a bracket dead is the resolution METAR.
+The sub-hourly national feeds at the bottom of this module (Météo-France /
+KNMI / FMI / JMA / NEA, added for the forecast path) are SIGNAL-ONLY: they
+feed forecast.py's probabilistic entries and never reach a MetarFeed, a
+running max, or the dead-bracket logic.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import json
 import re
 import threading
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -1101,3 +1104,341 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
             brackets=tuple(sorted(brackets, key=lambda b: b.temp)),
             event_slug=ev.get("slug"),
         )
+
+
+# --------------------------------------------------------------------------
+# Forecast-path sub-hourly feeds (forecast.py / forecast_feeds.py). SIGNAL
+# ONLY: these readings drive probabilistic entries, never a MetarFeed or a
+# running max. One fetch factory + one PURE parser per national source, so the
+# parsers are unit-testable against canned payloads (tests/fixtures/). All
+# fetchers return None on any failure — the collector counts it and skips the
+# tick, mirroring the calibration-collector convention above.
+# --------------------------------------------------------------------------
+FMI_WFS_URL = "https://opendata.fmi.fi/wfs"
+JMA_LATEST_TIME_URL = "https://www.jma.go.jp/bosai/amedas/data/latest_time.txt"
+JMA_MAP_URL = "https://www.jma.go.jp/bosai/amedas/data/map/{stamp}.json"
+NEA_AIR_TEMP_URL = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature"
+MF_INFRAHORAIRE_URL = ("https://public-api.meteofrance.fr/public/DPObs/v1/"
+                       "station/infrahoraire-6m")
+KNMI_EDR_URL = ("https://api.dataplatform.knmi.nl/edr/v1/collections/"
+                "observations/locations/{location}")
+
+# (obs_time UTC, temp degC in tenths) — the parsers' common output row.
+FeedObs = tuple[datetime, float]
+
+
+def _parse_iso_utc(raw: str) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp (Z or offset) to an aware UTC datetime."""
+
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def parse_fmi_wfs(xml_text: str) -> list[FeedObs]:
+    """FMI open-data WFS 'simple' response (10-min t2m rows, tenths, UTC)."""
+
+    import xml.etree.ElementTree as ET
+
+    ns = {"BsWfs": "http://xml.fmi.fi/schema/wfs/2.0"}
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    out: list[FeedObs] = []
+    for el in root.iter("{http://xml.fmi.fi/schema/wfs/2.0}BsWfsElement"):
+        name = el.findtext("BsWfs:ParameterName", default="", namespaces=ns)
+        if name != "t2m":
+            continue
+        t_raw = el.findtext("BsWfs:Time", default="", namespaces=ns)
+        v_raw = el.findtext("BsWfs:ParameterValue", default="", namespaces=ns)
+        dt = _parse_iso_utc(t_raw)
+        try:
+            val = float(v_raw)
+        except (TypeError, ValueError):
+            continue
+        if dt is None or val != val:  # NaN guard
+            continue
+        out.append((dt, val))
+    return out
+
+
+def parse_jma_amedas(payload: dict, station: str, obs_time: datetime) -> list[FeedObs]:
+    """One JMA AMeDAS map/{ts}.json snapshot: the station's temp if QC-clean.
+
+    The map file carries every AMeDAS station for a single timestamp;
+    ``temp`` is ``[value_degC, qc_flag]`` and only qc 0 is a clean ob.
+    """
+
+    entry = payload.get(station)
+    if not isinstance(entry, dict):
+        return []
+    temp = entry.get("temp")
+    if (not isinstance(temp, (list, tuple)) or len(temp) < 2
+            or temp[0] is None or temp[1] != 0):
+        return []
+    try:
+        return [(obs_time.astimezone(timezone.utc), float(temp[0]))]
+    except (TypeError, ValueError):
+        return []
+
+
+def parse_nea_air_temp(payload: dict, station: str) -> list[FeedObs]:
+    """NEA data.gov.sg v2 real-time air-temperature payload (1-min cadence)."""
+
+    data = payload.get("data") or {}
+    out: list[FeedObs] = []
+    for block in data.get("readings") or []:
+        dt = _parse_iso_utc(str(block.get("timestamp", "")))
+        if dt is None:
+            continue
+        for row in block.get("data") or []:
+            if row.get("stationId") != station:
+                continue
+            try:
+                out.append((dt, float(row["value"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def parse_mf_obs(payload: list, station: str) -> list[FeedObs]:
+    """Météo-France DPObs infrahoraire-6m rows for one station (t in KELVIN)."""
+
+    out: list[FeedObs] = []
+    for row in payload if isinstance(payload, list) else []:
+        if not isinstance(row, dict) or str(row.get("geo_id_insee")) != station:
+            continue
+        dt = _parse_iso_utc(str(row.get("validity_time", "")))
+        t_k = row.get("t")
+        if dt is None or t_k is None:
+            continue
+        try:
+            out.append((dt, round(float(t_k) - 273.15, 1)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def parse_knmi_edr(payload: dict, parameter: str = "ta") -> list[FeedObs]:
+    """KNMI EDR CoverageJSON PointSeries: the ``ta`` (air temp degC) range.
+
+    UNVERIFIED against a live payload until a KNMI_API_KEY is available — the
+    shape follows the EDR/CoverageJSON spec and the KNMI Data Platform docs.
+    """
+
+    domain = payload.get("domain") or {}
+    times = ((domain.get("axes") or {}).get("t") or {}).get("values") or []
+    rng = (payload.get("ranges") or {}).get(parameter) or {}
+    values = rng.get("values") or []
+    out: list[FeedObs] = []
+    for t_raw, val in zip(times, values):
+        dt = _parse_iso_utc(str(t_raw))
+        if dt is None or val is None:
+            continue
+        try:
+            out.append((dt, float(val)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def make_fmi_fetch(*, station_id: str, session=None, user_agent: str = _DEFAULT_UA,
+                   timeout: float = 15.0, window_min: int = 40) -> Callable[[], Optional[str]]:
+    """Fetch callable for FMI's 10-min observations (no key needed)."""
+
+    sess = session or (requests.Session() if requests else None)
+
+    def fetch() -> Optional[str]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        start = (datetime.now(timezone.utc) - timedelta(minutes=window_min))
+        try:
+            resp = sess.get(FMI_WFS_URL, params={
+                "service": "WFS", "version": "2.0.0", "request": "getFeature",
+                "storedquery_id": "fmi::observations::weather::simple",
+                "fmisid": station_id, "parameters": "t2m",
+                "starttime": start.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                headers={"User-Agent": user_agent}, timeout=timeout)
+        except Exception:
+            return None
+        return resp.text if resp.status_code == 200 else None
+
+    return fetch
+
+
+def make_jma_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
+                   timeout: float = 15.0
+                   ) -> Callable[[], Optional[tuple[datetime, Optional[dict]]]]:
+    """Fetch callable for JMA AMeDAS (no key): latest_time.txt -> map JSON.
+
+    Returns ``(obs_time_utc, map_payload)`` or None on failure. The map file
+    (~1-2 MB, every AMeDAS station) is only downloaded when latest_time.txt
+    ADVANCES; an unchanged stamp returns ``(obs_time, None)`` so a 60 s poll
+    cadence costs one tiny text request, not gigabytes/day. The filename is
+    stamped in JST exactly as latest_time.txt names it.
+    """
+
+    sess = session or (requests.Session() if requests else None)
+    state: dict[str, Optional[str]] = {"stamp": None}
+
+    def fetch() -> Optional[tuple[datetime, Optional[dict]]]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        try:
+            r1 = sess.get(JMA_LATEST_TIME_URL, headers={"User-Agent": user_agent},
+                          timeout=timeout)
+            if r1.status_code != 200:
+                return None
+            latest = _parse_iso_utc(r1.text)
+            if latest is None:
+                return None
+            # The filename uses the timestamp's own (JST) wall clock.
+            local = datetime.fromisoformat(r1.text.strip())
+            stamp = local.strftime("%Y%m%d%H%M%S")
+            if stamp == state["stamp"]:
+                return (latest, None)  # nothing new published yet
+            r2 = sess.get(JMA_MAP_URL.format(stamp=stamp),
+                          headers={"User-Agent": user_agent}, timeout=timeout)
+            if r2.status_code != 200:
+                return None
+            payload = r2.json()
+            if not isinstance(payload, dict):
+                return None
+            state["stamp"] = stamp
+        except Exception:
+            return None
+        return (latest, payload)
+
+    return fetch
+
+
+def make_nea_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
+                   timeout: float = 15.0) -> Callable[[], Optional[dict]]:
+    """Fetch callable for NEA/data.gov.sg v2 air temperature (no key)."""
+
+    sess = session or (requests.Session() if requests else None)
+
+    def fetch() -> Optional[dict]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        try:
+            resp = sess.get(NEA_AIR_TEMP_URL, headers={"User-Agent": user_agent},
+                            timeout=timeout)
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    return fetch
+
+
+def make_meteofrance_fetch(*, api_key: str, station_id: str, session=None,
+                           user_agent: str = _DEFAULT_UA,
+                           timeout: float = 15.0) -> Callable[[], Optional[list]]:
+    """Fetch callable for Météo-France's 6-min station observations (apikey)."""
+
+    sess = session or (requests.Session() if requests else None)
+
+    def fetch() -> Optional[list]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        try:
+            resp = sess.get(MF_INFRAHORAIRE_URL,
+                            params={"id_station": station_id, "format": "json"},
+                            headers={"User-Agent": user_agent, "apikey": api_key},
+                            timeout=timeout)
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+        except Exception:
+            return None
+        return payload if isinstance(payload, list) else None
+
+    return fetch
+
+
+def make_knmi_fetch(*, api_key: str, station_id: str, parameter: str = "ta",
+                    session=None, user_agent: str = _DEFAULT_UA,
+                    timeout: float = 15.0) -> Callable[[], Optional[dict]]:
+    """Fetch callable for KNMI EDR 10-min observations (Authorization key).
+
+    ``station_id`` may be the bare synop number ("06240"); it is expanded to
+    the WIGOS location id the EDR collection uses. UNVERIFIED live until a
+    KNMI_API_KEY is available.
+    """
+
+    sess = session or (requests.Session() if requests else None)
+    location = station_id if "-" in station_id else f"0-20000-0-{station_id.lstrip('0') or '0'}"
+
+    def fetch() -> Optional[dict]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        start = datetime.now(timezone.utc) - timedelta(minutes=60)
+        try:
+            resp = sess.get(KNMI_EDR_URL.format(location=location),
+                            params={"parameter-name": parameter,
+                                    "datetime": start.strftime("%Y-%m-%dT%H:%M:%SZ") + "/.."},
+                            headers={"User-Agent": user_agent, "Authorization": api_key},
+                            timeout=timeout)
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    return fetch
+
+
+def build_feed_fetcher(city_cfg, config, *, session=None
+                       ) -> Optional[Callable[[], Optional[list[FeedObs]]]]:
+    """Compose fetch + parse for a city's forecast feed.
+
+    Returns a callable yielding ``list[(obs_time_utc, temp_c)]`` (None on
+    fetch failure), or None when the city has no feed / its API key is
+    missing — the caller logs that once and the city stays METAR-only.
+    """
+
+    src = city_cfg.feed_source
+    station = city_cfg.feed_station_id or ""
+    if not src or not station:
+        return None
+    if src == "fmi":
+        fetch = make_fmi_fetch(station_id=station, session=session)
+        return lambda: (lambda t: None if t is None else parse_fmi_wfs(t))(fetch())
+    if src == "jma":
+        fetch = make_jma_fetch(session=session)
+
+        def run_jma() -> Optional[list[FeedObs]]:
+            got = fetch()
+            if got is None:
+                return None
+            obs_time, payload = got
+            if payload is None:
+                return []  # stamp unchanged: fetched fine, nothing new
+            return parse_jma_amedas(payload, station, obs_time)
+
+        return run_jma
+    if src == "nea":
+        fetch = make_nea_fetch(session=session)
+        return lambda: (lambda p: None if p is None else parse_nea_air_temp(p, station))(fetch())
+    if src == "meteofrance":
+        if not config.mf_api_key:
+            return None
+        fetch = make_meteofrance_fetch(api_key=config.mf_api_key, station_id=station,
+                                       session=session)
+        return lambda: (lambda p: None if p is None else parse_mf_obs(p, station))(fetch())
+    if src == "knmi":
+        if not config.knmi_api_key:
+            return None
+        fetch = make_knmi_fetch(api_key=config.knmi_api_key, station_id=station,
+                                session=session)
+        return lambda: (lambda p: None if p is None else parse_knmi_edr(p))(fetch())
+    return None

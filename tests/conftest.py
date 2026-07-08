@@ -87,8 +87,12 @@ def build_worker(
     tz: str = "Europe/Paris",
     metar_raw: Optional[str] = None,
     snapshot_fn=None,
+    city_cfg: Optional[CityConfig] = None,
+    forecast=None,
+    feed_reader=None,
+    wall_clock=None,
 ) -> tuple[CityWorker, PaperExecutor, MetarFeed]:
-    city_cfg = CityConfig(id=city, metar_icao=icao, tz=tz, market_terms=(city,))
+    city_cfg = city_cfg or CityConfig(id=city, metar_icao=icao, tz=tz, market_terms=(city,))
     metar = MetarFeed(icao, fetch_fn=lambda _i: metar_raw, log_path=None)
     market = MarketFeed(city, snapshot_fn=snapshot_fn or (lambda **_kw: None))
     executor = PaperExecutor(config, risk)
@@ -96,5 +100,6 @@ def build_worker(
     worker = CityWorker(
         city_cfg, config, metar=metar, market=market, executor=executor,
         strategy=strategy, risk=risk, reporter=reporter,
+        forecast=forecast, feed_reader=feed_reader, wall_clock=wall_clock,
     )
     return worker, executor, metar

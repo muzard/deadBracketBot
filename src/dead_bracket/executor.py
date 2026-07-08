@@ -30,13 +30,14 @@ class Settlement:
     temp: int
     shares: float
     pnl: float
+    won: bool = True  # False iff this bracket WAS the day's high (NO paid $0)
 
 
 class Executor(Protocol):
     def execute_entry(self, intent: Intent, bracket: Bracket) -> Optional[Fill]: ...
     def place_exit(self, intent: Intent) -> None: ...
     def on_book(self, snapshot: MarketSnapshot) -> list[Fill]: ...
-    def settle(self) -> list[Settlement]: ...
+    def settle(self, final_max: Optional[int] = None) -> list[Settlement]: ...
 
 
 class PaperExecutor:
@@ -167,8 +168,15 @@ class PaperExecutor:
         return fills
 
     # -- settlement --------------------------------------------------------
-    def settle(self) -> list[Settlement]:
-        """Settle all remaining open shares at $1 (spec §4, held to resolution)."""
+    def settle(self, final_max: Optional[int] = None) -> list[Settlement]:
+        """Settle all remaining open shares (spec §4, held to resolution).
+
+        ``final_max`` is the day's final running max (the winning bracket): a
+        held NO redeems at $1 for every bracket EXCEPT that one, whose NO pays
+        $0. Dead-path positions always sit below the final max, so only a
+        forecast entry (predicted kill that never confirmed) can hit the $0
+        leg. ``final_max=None`` (no METAR data all day) falls back to $1.
+        """
 
         results: list[Settlement] = []
         for (city, temp), pos in self._positions.items():
@@ -176,12 +184,15 @@ class PaperExecutor:
                 continue
             shares = pos.shares
             cost = pos.cost_basis
-            pnl = 1.0 * shares - cost
-            self._risk.record_settlement(city=city, temp=temp, shares=shares, cost_basis=cost)
+            won = final_max is None or temp != final_max
+            payout = 1.0 if won else 0.0
+            pnl = payout * shares - cost
+            self._risk.record_settlement(city=city, temp=temp, shares=shares,
+                                         cost_basis=cost, payout=payout)
             pos.shares = 0.0
             pos.cost_basis = 0.0
             pos.resting_sell = 0.0
-            results.append(Settlement(city=city, temp=temp, shares=shares, pnl=pnl))
+            results.append(Settlement(city=city, temp=temp, shares=shares, pnl=pnl, won=won))
         return results
 
 
@@ -371,21 +382,27 @@ class LiveExecutor:
         except (TypeError, ValueError):
             return 0.0
 
-    def settle(self) -> list[Settlement]:
+    def settle(self, final_max: Optional[int] = None) -> list[Settlement]:
         """Day's end: the resolved market's positions redeem on-chain to USDC.
 
         Realised PnL is the venue/chain's job (not synthesised here), but the
         executor's local position + resting-order state MUST be cleared so the
         new day starts flat — otherwise yesterday's redeemed positions would
         linger (mis-reporting open volume and prompting stray exit re-posts).
-        The shared risk caps are reset by RiskManager.roll_day().
+        ``final_max`` marks the winning bracket so the reported (informational)
+        PnL and ``won`` flag are honest for forecast positions; the actual
+        redemption amount is decided on-chain either way. The shared risk caps
+        are reset by RiskManager.roll_day().
         """
 
         results: list[Settlement] = []
         for (city, temp), pos in self._positions.items():
             if pos.shares > 0:
+                won = final_max is None or temp != final_max
+                payout = 1.0 if won else 0.0
                 results.append(Settlement(city=city, temp=temp, shares=pos.shares,
-                                          pnl=1.0 * pos.shares - pos.cost_basis))
+                                          pnl=payout * pos.shares - pos.cost_basis,
+                                          won=won))
             pos.shares = 0.0
             pos.cost_basis = 0.0
             pos.resting_sell = 0.0
@@ -416,7 +433,7 @@ class DisabledExecutor:
     def on_book(self, snapshot: MarketSnapshot) -> list[Fill]:
         return []
 
-    def settle(self) -> list[Settlement]:
+    def settle(self, final_max: Optional[int] = None) -> list[Settlement]:
         return []
 
 
