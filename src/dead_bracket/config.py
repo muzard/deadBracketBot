@@ -176,6 +176,23 @@ class Config:
     # bankroll-limited, not liquidity-limited, so 1.0 deploys the available edge.
     max_frac_of_depth: float = 1.0
     max_daily_loss: float = 50.0
+    # Capital recycling policy. A dead NO is certain to pay $1, so resting a
+    # 99.9c maker sell only pays off when the 0.1c given up frees capital for a
+    # NEW <=CAP opportunity worth more. When True (default), the bot HOLDS every
+    # dead NO to $1 and posts a recycle sell only when a would-be buy this tick
+    # was blocked purely by the bankroll caps (strategy.last_blocked_value > 0),
+    # sized to cover just that shortfall; when the block clears the unfilled
+    # recycle sells are cancelled (revert to hold). False restores the old
+    # always-rest-after-every-buy behaviour.
+    recycle_on_opportunity: bool = True
+    # Live wallet-balance polling cadence (seconds). The balance tracker reads
+    # the real USDC balance fast while a buy is being attempted, and cools the
+    # cadence (doubling up to slow) once ``balance_poll_cool_after`` consecutive
+    # reads are unchanged — no point hammering the API when nothing settles.
+    # Paper mode uses exact synthetic accounting and never polls.
+    balance_poll_fast_sec: float = 2.0
+    balance_poll_slow_sec: float = 60.0
+    balance_poll_cool_after: int = 3
 
     stale_feed_min: int = 45
     max_order_errors: int = 3  # consecutive order errors before per-city pause
@@ -344,6 +361,10 @@ class Config:
             "bankroll_pct": float,
             "max_frac_of_depth": float,
             "max_daily_loss": float,
+            "recycle_on_opportunity": _as_bool,
+            "balance_poll_fast_sec": float,
+            "balance_poll_slow_sec": float,
+            "balance_poll_cool_after": int,
             "stale_feed_min": int,
             "max_order_errors": int,
             "order_error_recover_ticks": int,

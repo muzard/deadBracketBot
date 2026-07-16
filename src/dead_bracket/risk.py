@@ -14,7 +14,7 @@ NO buy can be), guaranteeing the dollar limit is never exceeded.
 from __future__ import annotations
 
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 from .config import Config
 from .models import Fill, MarketSnapshot
@@ -28,6 +28,12 @@ class RiskManager:
         # (config.bankroll_pct > 0). Current balance = this + realised PnL, so
         # the exposure caps grow as the bot wins and shrink as it loses.
         self._initial_balance = initial_balance
+        # Optional ground-truth equity source (live mode): when set, the
+        # percentage-sizing base is this callable's value (real wallet cash +
+        # open exposure) instead of the synthetic initial_balance + realised PnL,
+        # so the caps self-correct against the actual wallet. See
+        # set_equity_source / _balance_base.
+        self._equity_source: Optional[Callable[[], float]] = None
 
         self._bracket_shares: dict[tuple[str, int], float] = {}
         self._bracket_exposure: dict[tuple[str, int], float] = {}  # $ per bracket
@@ -71,13 +77,38 @@ class RiskManager:
         with self._lock:
             return self._total_exposure
 
-    @property
-    def current_balance(self) -> float:
-        """Current account equity = starting balance + realised PnL. This is the
-        base for percentage sizing (config.bankroll_pct)."""
+    def set_equity_source(self, source: Optional[Callable[[], float]]) -> None:
+        """Install (or clear) the ground-truth equity source for percentage
+        sizing. Live mode wires ``wallet_cash + total_exposure`` here so the caps
+        track real capital; paper leaves it None and uses the synthetic base."""
 
         with self._lock:
-            return self._initial_balance + self._realized_pnl
+            self._equity_source = source
+
+    def _balance_base(self) -> float:
+        """The equity used as the percentage-sizing base. Prefers the injected
+        ground-truth source (real wallet cash + open exposure, live) and falls
+        back to the synthetic ``initial_balance + realised PnL`` (paper). Caller
+        must hold the lock; the source itself is read outside no extra lock —
+        the RLock is re-entrant so a source reading ``total_exposure`` is safe."""
+
+        if self._equity_source is not None:
+            try:
+                return max(0.0, float(self._equity_source()))
+            except Exception:
+                # A transient balance-read failure must not zero the caps; fall
+                # back to the synthetic base rather than halting sizing.
+                pass
+        return self._initial_balance + self._realized_pnl
+
+    @property
+    def current_balance(self) -> float:
+        """Current account equity, the base for percentage sizing
+        (config.bankroll_pct): the ground-truth wallet equity in live mode, else
+        starting balance + realised PnL."""
+
+        with self._lock:
+            return self._balance_base()
 
     def _cap_dollars(self, static_cap: float) -> float:
         """The active dollar exposure cap. In percentage-sizing mode it's
@@ -86,8 +117,7 @@ class RiskManager:
         Caller must hold the lock."""
 
         if self._cfg.bankroll_pct > 0:
-            balance = self._initial_balance + self._realized_pnl
-            return max(0.0, self._cfg.bankroll_pct / 100.0 * balance)
+            return max(0.0, self._cfg.bankroll_pct / 100.0 * self._balance_base())
         return static_cap
 
     def city_exposure(self, city: str) -> float:
@@ -142,6 +172,14 @@ class RiskManager:
         with self._lock:
             return sum(self._forecast_exposure.values())
 
+    def forecast_exposure_for(self, city: str, temp: int) -> float:
+        """Open $ forecast exposure on one bracket (0 if it's a pure dead-path
+        position). Lets the worker keep forecast entries on their immediate
+        de-risk exit while opportunity-gating only the dead-path positions."""
+
+        with self._lock:
+            return self._forecast_exposure.get((city, temp), 0.0)
+
     def pause_forecast(self, reason: str) -> bool:
         """Stop ALL new forecast entries (sticky across rollovers — a settled
         loss at p-hat >= 0.97 is a model/mapping bug until a human clears it by
@@ -161,8 +199,7 @@ class RiskManager:
         exposure."""
 
         with self._lock:
-            cap = self._cfg.forecast_daily_cap_pct / 100.0 * (
-                self._initial_balance + self._realized_pnl)
+            cap = self._cfg.forecast_daily_cap_pct / 100.0 * self._balance_base()
             return max(0.0, cap - sum(self._forecast_exposure.values()))
 
     def _release_forecast(self, key: tuple[str, int], cost_released: float) -> None:

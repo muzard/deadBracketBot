@@ -33,5 +33,6 @@ jobs:
             --cov=dead_bracket.executor \
             --cov=dead_bracket.forecast \
             --cov=dead_bracket.forecast_feeds \
+            --cov=dead_bracket.balance \
             --cov-report=term-missing \
             --cov-fail-under=90

@@ -6,8 +6,12 @@ paths, one order pipeline:
 
 1. **Dead path (certainty).** Once the resolution-grade METAR's running max
    passes a bracket, that bracket can never be the high, so its NO is certain
-   → buy the NO if offered <98¢ (IOC), then rest a 99.9¢ maker sell to recycle
-   capital; else hold to $1.
+   → buy the NO if offered <98¢ (IOC). By default the NO is then **held to $1**;
+   the 99.9¢ maker recycle sell is posted only when a *new* dead-NO buy this tick
+   is blocked purely by the bankroll caps (`strategy.last_blocked_value > 0`),
+   sized to cover just that shortfall, and cancelled when the block clears
+   (`recycle_on_opportunity`, default on; set False for the legacy always-rest).
+   Forecast entries keep their immediate 99.9¢ de-risk exit (see path 2).
 2. **Forecast path (probabilistic, 2026-07-08 — a deliberate mandate widening,
    NO-side only).** Sub-hourly national-met feeds (same/co-located sensors as
    the resolver METAR) predict the next METAR print 6–30+ min early. The
@@ -47,7 +51,7 @@ python -m dead_bracket.main --live --bankroll 40 --forecast --forecast-live # fo
 TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate  # + Shenzhen calibration collectors
 python -m dead_bracket.tools.lfs_calibrate      # offline K1/K2/K3/ε report
 python -m dead_bracket.tools.forecast_calibrate # offline sensor-σ/Brier/hold-rate report (the go/no-go input)
-python -m pytest                           # 335 tests; NO live network in tests
+python -m pytest                           # 355 tests; NO live network in tests
 ```
 Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feeds
 (+ keep worker there too). Keep it green.
@@ -127,10 +131,14 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feed
 ## Conventions
 - All behaviour is config (`config.py`); scalar knobs override via UPPERCASE env
   vars. `--bankroll` is a **percentage of current balance** (`config.bankroll_pct`):
-  every cap (total = per-city = per-bracket) is that % of `initial_balance +
-  realized_pnl`, so bet sizes grow as the bot wins (all-in on a single dead
-  bracket). Live reads the wallet balance at startup; paper needs `--balance`.
-  With `--bankroll 0` the static dollar caps (`MAX_EXPOSURE_*`) apply instead.
+  every cap (total = per-city = per-bracket) is that % of the sizing base, so bet
+  sizes grow as the bot wins (all-in on a single dead bracket). The base is the
+  **live wallet equity** (`balance.py::LiveBalanceTracker` — real USDC cash + open
+  exposure, polled with an adaptive cadence: fast while a buy is being attempted,
+  cooling down when consecutive reads are unchanged) in live mode, and the
+  synthetic `initial_balance + realized_pnl` in paper (`RiskManager.set_equity_source`
+  installs the live source; `BALANCE_POLL_*` knobs tune the cadence). Paper needs
+  `--balance`. With `--bankroll 0` the static dollar caps (`MAX_EXPOSURE_*`) apply.
 - Forecast sizing/caps (all config): `kelly_fraction` (≤0.5 enforced),
   `forecast_min_edge`, `forecast_min_margin_c` (≥0.4 °C — METAR rounds),
   `forecast_p_cap` 0.99, the 17–21h local evening cutoff, same-ob cap 25% of

@@ -53,7 +53,11 @@
       "WebFetch(domain:data.weather.gov.hk)",
       "WebFetch(domain:www.hko.gov.hk)",
       "Bash(python3)",
-      "Bash(jq 'select\\(.event==\"discovery\"\\)' -r)"
+      "Bash(jq 'select\\(.event==\"discovery\"\\)' -r)",
+      "Bash(awk -F',' 'NR>1{print $9}' calib/_global/cycles.csv)",
+      "Bash(awk -F',' 'NR>1{print $2}' calib/_global/cycles.csv)",
+      "Bash(awk -F',' 'NR>1{print $1}' calib/_global/cycles.csv)",
+      "Read(//tmp/**)"
     ]
   }
 }

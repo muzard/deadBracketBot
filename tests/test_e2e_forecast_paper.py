@@ -72,6 +72,23 @@ def test_win_path_buy_confirm_recycle():
     assert risk.forecast_exposure == pytest.approx(0.0)
 
 
+def test_forecast_exit_kept_by_gated_recycle():
+    """A forecast position keeps its immediate 99.9c de-risk exit under the
+    default gated policy: a later dead-path tick with no capital block must NOT
+    cancel it (only pure dead-path positions are opportunity-gated)."""
+
+    worker, ex, metar, risk, rep, forecast, holder = setup()
+    worker.process_book(alive_30_snapshot())
+    pos = ex.positions[("paris", 30)]
+    assert pos.resting_sell == pos.shares  # forecast de-risk exit is resting
+
+    # A quiet tick: no dead-NO opportunity anywhere -> shortfall is 0. The gated
+    # recycle logic must leave the forecast position's resting sell intact.
+    holder["reading"] = None  # no fresh feed reading -> no new forecast entry
+    worker.process_book(make_snapshot("paris", [make_bracket(30, bids=[(0.5, 10)])]))
+    assert pos.resting_sell == pos.shares  # still resting (not cancelled)
+
+
 def test_loss_path_settles_at_zero_and_pauses_forecast():
     worker, ex, metar, risk, rep, forecast, _ = setup()
     worker.process_book(alive_30_snapshot())

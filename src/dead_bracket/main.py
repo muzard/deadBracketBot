@@ -15,6 +15,7 @@ import sys
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from .balance import LiveBalanceTracker, PaperBalanceTracker
 from .config import Config, select_cities
 from .executor import PaperExecutor, make_executor
 from .feeds_http import (
@@ -197,6 +198,29 @@ def resolve_initial_balance(config: Config, balance_arg: Optional[float],
     return 0.0
 
 
+def build_balance_tracker(config: Config, risk: RiskManager, initial_balance: float,
+                          live_client=None):
+    """Build the wallet-balance tracker and wire live equity into the risk caps.
+
+    Live: an adaptive-cadence tracker over the real USDC balance, and the risk
+    manager's percentage-sizing base becomes ``wallet_cash + open exposure`` so
+    the caps self-correct against the wallet. Paper: a fixed synthetic tracker
+    (no wallet to poll) — the risk manager keeps its exact synthetic accounting.
+    """
+
+    if config.mode == "live" and live_client is not None:
+        tracker = LiveBalanceTracker(
+            fetch=lambda: _fetch_wallet_balance(live_client),
+            initial=initial_balance,
+            fast_sec=config.balance_poll_fast_sec,
+            slow_sec=config.balance_poll_slow_sec,
+            cool_after=config.balance_poll_cool_after,
+        )
+        risk.set_equity_source(lambda: tracker.cash() + risk.total_exposure)
+        return tracker
+    return PaperBalanceTracker(initial_balance)
+
+
 def build_forecast_workers(config: Config, reporter: Reporter, city_ids
                            ) -> tuple[list[FeedPollerWorker], dict[str, FeedCollector]]:
     """Wire the sub-hourly feed pollers for the forecast path.
@@ -249,7 +273,7 @@ def build_forecast_workers(config: Config, reporter: Reporter, city_ids
 
 def build_supervisor(config: Config, reporter: Reporter, risk: RiskManager,
                      city_ids, *, live_client=None, no_trade_cities=(),
-                     use_hko=False, feed_collectors=None) -> Supervisor:
+                     use_hko=False, feed_collectors=None, balance=None) -> Supervisor:
     selected = select_cities(config, city_ids)
     no_trade = set(no_trade_cities)
     # One batched METAR request for ALL stations, instead of N per cycle —
@@ -324,7 +348,7 @@ def build_supervisor(config: Config, reporter: Reporter, risk: RiskManager,
         workers.append(CityWorker(
             city_cfg, config, metar=metar, market=market, executor=executor,
             strategy=strategy, risk=risk, reporter=reporter,
-            forecast=forecast, feed_reader=feed_reader,
+            forecast=forecast, feed_reader=feed_reader, balance=balance,
         ))
     return Supervisor(workers, risk=risk, reporter=reporter,
                       rollover_tz=config.rollover_tz, daily_rearm=config.daily_rearm)
@@ -437,6 +461,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     city_tz = {c.id: c.tz for c in config.cities}
     reporter = Reporter(config.data_dir, city_tz=city_tz, progress=not args.quiet)
     risk = RiskManager(config, initial_balance=initial_balance)
+    # Wallet-balance tracker: live polls the real USDC balance (adaptive cadence)
+    # and drives percentage sizing off actual capital; paper stays synthetic.
+    balance = build_balance_tracker(config, risk, initial_balance, live_client)
     # Default: all configured cities. "--cities all" is an explicit alias.
     if not args.cities or args.cities.strip().lower() == "all":
         city_ids = [c.id for c in config.cities]
@@ -449,7 +476,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     feed_workers, feed_collectors = build_forecast_workers(config, reporter, city_ids)
     supervisor = build_supervisor(config, reporter, risk, city_ids,
                                   live_client=live_client, no_trade_cities=no_trade_cities,
-                                  use_hko=args.hko, feed_collectors=feed_collectors)
+                                  use_hko=args.hko, feed_collectors=feed_collectors,
+                                  balance=balance)
     # LFS calibration collectors (Shenzhen): --calibrate or LFS_CALIBRATION=1.
     calibrate = bool(args.calibrate) or config.lfs_calibration
     cal_workers = (build_calibration_workers(config, reporter, city_ids)

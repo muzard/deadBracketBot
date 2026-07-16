@@ -36,6 +36,7 @@ class Settlement:
 class Executor(Protocol):
     def execute_entry(self, intent: Intent, bracket: Bracket) -> Optional[Fill]: ...
     def place_exit(self, intent: Intent) -> None: ...
+    def cancel_exit(self, city: str, temp: int) -> None: ...
     def on_book(self, snapshot: MarketSnapshot) -> list[Fill]: ...
     def settle(self, final_max: Optional[int] = None) -> list[Settlement]: ...
 
@@ -126,6 +127,19 @@ class PaperExecutor:
         # Record the actual grid-clamped resting price (e.g. 0.99 on a 0.01-tick
         # market) so fills/PnL reflect the real exit price, not the raw SELL_PX.
         pos.resting_px = intent.limit_px
+
+    def cancel_exit(self, city: str, temp: int) -> None:
+        """Withdraw the resting maker sell for one bracket (revert to hold-to-$1).
+
+        Shares are untouched — only the pending exit is retracted, so the NO is
+        held to $1 settlement instead of being recycled at 99.9c.
+        """
+
+        pos = self._positions.get((city, temp))
+        if pos is None or pos.resting_sell <= 0:
+            return
+        pos.resting_sell = 0.0
+        pos.resting_px = 0.0
 
     def on_book(self, snapshot: MarketSnapshot) -> list[Fill]:
         """Fill resting maker sells when the book shows a bid >= SELL_PX.
@@ -342,6 +356,31 @@ class LiveExecutor:
             RestingOrder(order_id=str(order_id), size=intent.size, price=limit_px))
         self._pos(intent.city, intent.temp).resting_sell += intent.size
 
+    def cancel_exit(self, city: str, temp: int) -> None:
+        """Cancel every resting maker sell for one bracket (revert to hold-to-$1).
+
+        Only the still-open (unmatched) size is retracted from ``resting_sell`` —
+        anything already matched has left through ``on_book`` and reduced shares.
+        A failed cancel raises :class:`OrderError` so the worker's per-city error
+        path handles it (a canceled-order-not-found is treated as already gone).
+        """
+
+        key = (city, temp)
+        orders = self._resting.get(key)
+        if not orders:
+            return
+        pos = self._pos(city, temp)
+        for ro in list(orders):
+            open_size = max(0.0, ro.size - ro.matched)
+            try:
+                self._client.cancel_order(order_id=ro.order_id)
+            except Exception as exc:
+                raise OrderError(f"failed to cancel exit {ro.order_id}: {exc!r}")
+            pos.resting_sell = max(0.0, pos.resting_sell - open_size)
+            orders.remove(ro)
+        if not orders:
+            self._resting.pop(key, None)
+
     def on_book(self, snapshot: MarketSnapshot) -> list[Fill]:
         """Reconcile resting maker sells against the venue's order status."""
 
@@ -428,6 +467,9 @@ class DisabledExecutor:
         return None
 
     def place_exit(self, intent: Intent) -> None:
+        return None
+
+    def cancel_exit(self, city: str, temp: int) -> None:
         return None
 
     def on_book(self, snapshot: MarketSnapshot) -> list[Fill]:

@@ -76,6 +76,22 @@ def test_from_env_overrides():
     assert c.stale_feed_min == 30
 
 
+def test_recycle_and_balance_defaults_and_env():
+    c = Config()
+    assert c.recycle_on_opportunity is True  # hold-to-$1 gated recycling by default
+    assert c.balance_poll_fast_sec == 2.0
+    assert c.balance_poll_slow_sec == 60.0
+    assert c.balance_poll_cool_after == 3
+    over = Config.from_env({"RECYCLE_ON_OPPORTUNITY": "false",
+                            "BALANCE_POLL_FAST_SEC": "1.5",
+                            "BALANCE_POLL_SLOW_SEC": "90",
+                            "BALANCE_POLL_COOL_AFTER": "5"})
+    assert over.recycle_on_opportunity is False
+    assert over.balance_poll_fast_sec == 1.5
+    assert over.balance_poll_slow_sec == 90.0
+    assert over.balance_poll_cool_after == 5
+
+
 def test_select_cities():
     c = Config()
     selected = select_cities(c, ["london"])

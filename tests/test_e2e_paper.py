@@ -15,7 +15,10 @@ from conftest import StubReporter, build_worker, make_bracket, make_snapshot
 
 
 def test_recorded_sequence_deterministic_output_and_pnl():
-    config = Config()
+    # Legacy always-rest mode: every buy is immediately backed by a 99.9c sell, so
+    # the recycle-on-bid PnL is deterministic (the default gated policy holds to $1
+    # unless capital is blocked — covered by the capped-out replay test below).
+    config = replace(Config(), recycle_on_opportunity=False)
     risk = RiskManager(config)
     rep = StubReporter()
     worker, ex, metar = build_worker(
@@ -84,10 +87,10 @@ def test_later_bracket_plays_while_earlier_still_held():
 
 
 def test_capped_out_city_replays_after_funds_freed():
-    """Requirement 1+2: when an earlier bracket consumes the whole budget, a
-    later dead bracket is blocked (the bot honours the cap); once the earlier
-    bracket's resting 0.999 sell fills and frees the exposure, the bot knows the
-    funds are usable again and the later bracket is bought.
+    """Gated recycling (default): an earlier bracket consumes the whole budget and
+    is held to $1; when a later dead bracket appears but is blocked by the caps,
+    the held bracket is recycled (99.9c sell posted) to free capital; once a 0.999
+    bid lifts that sell the freed funds buy the later bracket.
     """
 
     # Tight caps so a single bracket exhausts the budget; full-depth taking and a
@@ -102,24 +105,30 @@ def test_capped_out_city_replays_after_funds_freed():
     )
     metar.poll_once()
 
-    # Tick 1: bracket 22 dead+cheap -> consumes essentially the whole budget.
+    # Tick 1: bracket 22 dead+cheap -> consumes essentially the whole budget. No
+    # competing opportunity yet, so it is held to $1 (no recycle sell posted).
     worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.96, 50)])]))
-    bought22 = ex.positions[("paris", 22)].shares
+    pos22 = ex.positions[("paris", 22)]
+    bought22 = pos22.shares
     assert bought22 > 0
+    assert pos22.resting_sell == 0  # held to $1 by default
     assert risk.total_cap_remaining() < 10  # capped out (small conservative slack)
 
-    # Tick 2: bracket 23 is dead+cheap but funds are locked in 22 -> blocked. The
-    # min order size stops the tiny residual from trading, so nothing is bought.
-    snap23 = make_snapshot("paris", [make_bracket(23, asks=[(0.97, 50)], min_order_size=10)])
-    worker.process_book(snap23)
+    # Tick 2: bracket 23 is dead+cheap but funds are locked in 22 -> blocked. 22 is
+    # still in the book (held positions are always fetched), so it is recycled: a
+    # 99.9c sell is posted to free capital. Nothing new is bought yet.
+    snap_both = make_snapshot("paris", [
+        make_bracket(22), make_bracket(23, asks=[(0.97, 50)], min_order_size=10)])
+    worker.process_book(snap_both)
+    assert pos22.resting_sell > 0  # recycle sell posted to cover the shortfall
     assert ("paris", 23) not in ex.positions or ex.positions[("paris", 23)].shares == 0
 
-    # Tick 3: a 0.999 bid lifts 22's resting maker sell -> exposure frees.
-    worker.process_book(make_snapshot("paris", [make_bracket(22, bids=[(0.999, bought22)])]))
-    assert risk.total_cap_remaining() > 40  # the bot now sees the funds as free
-
-    # Tick 4: with funds recycled, the later bracket 23 is finally bought.
-    worker.process_book(snap23)
+    # Tick 3: a 0.999 bid lifts 22's resting maker sell -> exposure frees IN the
+    # same tick, and the freed funds immediately buy the still-blocked bracket 23.
+    snap_fill = make_snapshot("paris", [
+        make_bracket(22, bids=[(0.999, bought22)]),
+        make_bracket(23, asks=[(0.97, 50)], min_order_size=10)])
+    worker.process_book(snap_fill)
     assert ex.positions[("paris", 23)].shares > 0
 
     bought = [ln for ln in rep.console if ln.startswith("BOUGHT")]

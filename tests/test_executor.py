@@ -83,6 +83,25 @@ def test_exit_uses_fine_tick_price(config, risk):
     assert risk.realized_pnl == pytest.approx(100 * 0.999 - 100 * 0.95)
 
 
+def test_cancel_exit_reverts_to_hold(config, risk):
+    ex = PaperExecutor(config, risk)
+    bracket = make_bracket(22, asks=[(0.95, 100)])
+    fill = ex.execute_entry(buy_intent(22, 100), bracket)
+    ex.place_exit(Intent(city="paris", temp=22, side="sell", limit_px=0.999,
+                         size=fill.size, tif="GTC", reason="recycle"))
+    pos = ex.positions[("paris", 22)]
+    assert pos.resting_sell == 100
+    ex.cancel_exit("paris", 22)
+    assert pos.resting_sell == 0.0  # exit withdrawn
+    assert pos.shares == 100  # shares untouched -> held to $1
+    # A later high bid no longer fills anything (nothing rests).
+    snap = make_snapshot("paris", [make_bracket(22, bids=[(0.999, 100)])])
+    assert ex.on_book(snap) == []
+    # Cancelling with nothing resting is a harmless no-op.
+    ex.cancel_exit("paris", 22)
+    ex.cancel_exit("paris", 999)
+
+
 def test_exit_partial_fill_keeps_remainder_resting(config, risk):
     ex = PaperExecutor(config, risk)
     bracket = make_bracket(22, asks=[(0.95, 100)])

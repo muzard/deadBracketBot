@@ -8,34 +8,72 @@ from datetime import datetime, timezone
 
 import pytest
 
+from dead_bracket.config import Config
 from dead_bracket.models import Intent
 from dead_bracket.reporter import Reporter
+from dead_bracket.risk import RiskManager
 from conftest import StubReporter, build_worker, make_bracket, make_snapshot
 
 NOW = datetime(2026, 6, 3, 16, 0, tzinfo=timezone.utc)
 
 
-def test_exit_placed_on_open_and_retried_if_lost(config, risk):
+@pytest.fixture
+def risk_capped():
+    """Tight caps so a single bracket exhausts the budget — the setup where a
+    second dead bracket is capital-blocked and recycling is triggered."""
+
+    from dataclasses import replace
+    cfg = replace(Config(), max_total_exposure=48.0, max_exposure_per_city=48.0,
+                  max_frac_of_depth=1.0)
+    return RiskManager(cfg), cfg
+
+
+def test_dead_no_held_to_dollar_by_default(config, risk):
+    """Default policy: a lone dead-NO buy is NOT recycled — it is held to $1, so
+    no resting 99.9c sell is posted when there is no capital-blocked opportunity."""
+
     rep = StubReporter()
     worker, ex, metar = build_worker(
         config=config, risk=risk, reporter=rep, metar_raw="LFPB 031530Z 24/10 Q1018")
     metar.poll_once()
-    # Open a position: the resting 99.9c sell is placed immediately on the fill.
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    pos = ex.positions[("paris", 22)]
+    assert pos.shares == 100
+    assert pos.resting_sell == 0  # held to $1, no recycle sell posted
+
+    # A later tick with no new opportunity keeps it held (still no sell).
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert pos.resting_sell == 0
+    assert not any(line.startswith("SOLD") for line in rep.console)
+
+
+def test_legacy_mode_rests_and_retries():
+    """recycle_on_opportunity=False restores the always-rest behaviour: every buy
+    is immediately backed by a resting sell, and a lost exit is re-covered."""
+
+    from dataclasses import replace
+    cfg = replace(Config(), recycle_on_opportunity=False)
+    risk = RiskManager(cfg)
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=cfg, risk=risk, reporter=rep, metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
     worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
     pos = ex.positions[("paris", 22)]
     assert pos.shares == 100 and pos.resting_sell == 100  # fully covered on open
 
-    # Simulate the resting sell being lost (e.g. an exit placement that failed).
-    pos.resting_sell = 0.0
-    # Next tick (bracket present, no asks -> no new buy) re-covers the position.
+    pos.resting_sell = 0.0  # simulate the resting sell being lost
     worker.process_book(make_snapshot("paris", [make_bracket(22)]))
     assert pos.resting_sell == pos.shares  # exit guaranteed back in place
 
 
-def test_full_buy_then_sell_cycle(config, risk):
+def test_full_buy_then_sell_cycle_legacy():
+    from dataclasses import replace
+    cfg = replace(Config(), recycle_on_opportunity=False)
+    risk = RiskManager(cfg)
     rep = StubReporter()
     worker, ex, metar = build_worker(
-        config=config, risk=risk, reporter=rep,
+        config=cfg, risk=risk, reporter=rep,
         metar_raw="LFPB 031530Z 24/10 Q1018",  # running max 24
     )
     metar.poll_once()
@@ -45,6 +83,96 @@ def test_full_buy_then_sell_cycle(config, risk):
     # Next book shows a high bid -> resting maker sell fills.
     worker.process_book(make_snapshot("paris", [make_bracket(22, bids=[(0.999, 100)])]))
     assert any(line.startswith("SOLD") for line in rep.console)
+
+
+def test_recycle_sell_posted_only_when_capital_blocked(risk_capped):
+    """Default policy: a held dead NO is recycled (99.9c sell posted) only when a
+    NEW dead-NO buy is blocked by the bankroll caps this tick; when the block
+    clears the unfilled recycle sell is cancelled and the NO reverts to hold-$1."""
+
+    risk, cfg = risk_capped
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=cfg, risk=risk, reporter=rep, metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
+
+    # Tick 1: bracket 22 dead+cheap consumes essentially the whole budget; nothing
+    # else is competing for capital, so it is held to $1 (no recycle sell).
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.96, 50)])]))
+    pos22 = ex.positions[("paris", 22)]
+    assert pos22.shares > 0 and pos22.resting_sell == 0
+
+    # Tick 2: bracket 23 dead+cheap but funds are locked in 22 -> a real buy is
+    # blocked by the caps, so 22 is recycled to free capital (both in the book).
+    snap_both = make_snapshot("paris", [
+        make_bracket(22), make_bracket(23, asks=[(0.97, 50)], min_order_size=10)])
+    worker.process_book(snap_both)
+    assert pos22.resting_sell > 0  # recycle sell now posted on the held 22
+
+    # Tick 3: the blocking opportunity disappears (23 gone) -> cancel the unfilled
+    # recycle sell and revert to holding 22 to $1.
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert pos22.resting_sell == 0
+
+
+def test_maintain_recycle_covers_shortfall_and_stops(config, risk):
+    """Unit: the dead-path recycle loop covers only up to the shortfall — skipping
+    a bracket absent from the book and one already fully resting, then stopping
+    once enough value is posted (leaving later positions untouched)."""
+
+    from dead_bracket.models import Position
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=config, risk=risk, reporter=rep, metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
+    # Four held dead positions (insertion order fixes iteration order).
+    ex.positions[("paris", 19)] = Position("paris", 19, shares=100, cost_basis=95)
+    ex.positions[("paris", 20)] = Position("paris", 20, shares=10, cost_basis=9,
+                                           resting_sell=10, resting_px=0.999)
+    ex.positions[("paris", 21)] = Position("paris", 21, shares=100, cost_basis=95)
+    ex.positions[("paris", 22)] = Position("paris", 22, shares=100, cost_basis=95)
+    # Bracket 19 is absent from the book (skipped); 20/21/22 present.
+    snap = make_snapshot("paris", [make_bracket(20), make_bracket(21), make_bracket(22)])
+    worker._maintain_recycle_sells(snap, frozenset(), shortfall=30.0)
+    assert ex.positions[("paris", 19)].resting_sell == 0    # absent -> skipped
+    assert ex.positions[("paris", 20)].resting_sell == 10   # already covered -> unchanged
+    assert ex.positions[("paris", 21)].resting_sell == 20   # posts the 20-share gap (10 pre + 20)
+    assert ex.positions[("paris", 22)].resting_sell == 0    # shortfall met -> not reached
+
+
+def test_maintain_recovers_lost_forecast_exit(config, risk):
+    """Unit: a forecast position is exempt from gating — its de-risk exit is
+    re-covered here even when there is no capital block (shortfall == 0)."""
+
+    from dead_bracket.models import Fill, Position
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=config, risk=risk, reporter=rep, metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
+    # Mark bracket 30 as a forecast position (risk tracks the forecast exposure).
+    risk.record_buy_fill(Fill(city="paris", temp=30, side="buy", price=0.9,
+                              size=50, fee=0.0, reason="fcast p=0.98"))
+    ex.positions[("paris", 30)] = Position("paris", 30, shares=50, cost_basis=45)
+    snap = make_snapshot("paris", [make_bracket(30)])
+    worker._maintain_recycle_sells(snap, frozenset(), shortfall=0.0)
+    assert ex.positions[("paris", 30)].resting_sell == 50  # de-risk exit re-covered
+
+
+def test_cancel_exit_error_trips_per_city_pause(config, risk):
+    """A failing cancel routes through the per-city order-error path."""
+
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=config, risk=risk, reporter=rep, metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
+
+    def boom(city, temp):
+        raise RuntimeError("venue down")
+
+    ex.cancel_exit = boom
+    for _ in range(config.max_order_errors):
+        worker._cancel_exit_for(22)
+    assert risk.is_city_blocked("paris")
 
 
 def test_opportunity_logged_even_when_not_acted(config, risk, tmp_path):

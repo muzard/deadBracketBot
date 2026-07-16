@@ -199,6 +199,65 @@ def test_exit_then_reconcile_partial_and_complete(config):
     assert ex.positions[("paris", 22)].shares == pytest.approx(0.0)
 
 
+def test_cancel_exit_cancels_order_and_frees_resting(config):
+    risk = RiskManager(config)
+    client = FakeClient(responses=[
+        accepted(status="matched", making="95.0", taking="100"),  # entry
+        accepted(order_id="s1", status="live"),                   # the GTC sell
+    ])
+    ex = LiveExecutor(live_cfg(config), risk, client)
+    ex.execute_entry(buy_intent(size=100), make_bracket(22))
+    ex.place_exit(sell_intent(size=100))
+    assert ex.positions[("paris", 22)].resting_sell == 100
+
+    ex.cancel_exit("paris", 22)
+    assert client.cancelled == ["s1"]  # the resting order was cancelled
+    assert ex.positions[("paris", 22)].resting_sell == 0.0  # freed
+    assert ex.positions[("paris", 22)].shares == 100  # shares held to $1
+    # No resting orders remain; a second cancel is a no-op (no extra API calls).
+    ex.cancel_exit("paris", 22)
+    assert client.cancelled == ["s1"]
+
+
+def test_cancel_exit_only_frees_unmatched_size(config):
+    # 30 of 100 already matched via on_book; cancelling frees only the open 70.
+    risk = RiskManager(config)
+    client = FakeClient(
+        responses=[
+            accepted(status="matched", making="95.0", taking="100"),  # entry
+            accepted(order_id="s1", status="live"),                   # the GTC sell
+        ],
+        order_status={"s1": [30.0]},
+    )
+    ex = LiveExecutor(live_cfg(config), risk, client)
+    ex.execute_entry(buy_intent(size=100), make_bracket(22))
+    ex.place_exit(sell_intent(size=100))
+    ex.on_book(make_snapshot("paris", [make_bracket(22)]))  # books 30 matched
+    assert ex.positions[("paris", 22)].resting_sell == 70
+
+    ex.cancel_exit("paris", 22)
+    assert client.cancelled == ["s1"]
+    assert ex.positions[("paris", 22)].resting_sell == 0.0
+    assert ex.positions[("paris", 22)].shares == pytest.approx(70.0)
+
+
+def test_cancel_exit_failure_raises_order_error(config):
+    class UncancelableClient(FakeClient):
+        def cancel_order(self, *, order_id):
+            raise RuntimeError("venue down")
+
+    risk = RiskManager(config)
+    client = UncancelableClient(responses=[
+        accepted(status="matched", making="95.0", taking="100"),
+        accepted(order_id="s1", status="live"),
+    ])
+    ex = LiveExecutor(live_cfg(config), risk, client)
+    ex.execute_entry(buy_intent(size=100), make_bracket(22))
+    ex.place_exit(sell_intent(size=100))
+    with pytest.raises(OrderError):
+        ex.cancel_exit("paris", 22)
+
+
 def test_exit_post_only_would_cross_raises(config):
     risk = RiskManager(config)
     client = FakeClient(responses=[

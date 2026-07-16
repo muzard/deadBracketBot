@@ -51,6 +51,7 @@ class CityWorker:
         reporter: Reporter,
         forecast: Optional[ForecastStrategy] = None,
         feed_reader=None,  # Callable[[], Optional[FeedReading]] from FeedCollector.latest
+        balance=None,  # BalanceTracker (live) / PaperBalanceTracker; refreshed before buys
         monotonic=time.monotonic,
         wall_clock=None,  # () -> aware UTC datetime; injectable for tests
     ) -> None:
@@ -63,6 +64,13 @@ class CityWorker:
         self._strategy = strategy
         self._risk = risk
         self._reporter = reporter
+        # Wallet-balance tracker: refreshed at high frequency while a buy is being
+        # attempted and cooled down when the balance is stable (see balance.py).
+        # Defaults to a fixed synthetic tracker so paper/tests need no wallet.
+        if balance is None:
+            from .balance import PaperBalanceTracker
+            balance = PaperBalanceTracker(risk.current_balance)
+        self._balance = balance
         # Forecast path (optional): probabilistic entries from a sub-hourly
         # feed reading. Both stay None unless the run passes --forecast and
         # this city has an active feed.
@@ -278,6 +286,16 @@ class CityWorker:
         if self._risk.is_city_blocked(self.city):
             return
 
+        # Refresh the wallet balance before sizing: poll fast while a buy is
+        # liftable (a dead bracket with a cheap NO in the book), and cool the
+        # cadence down otherwise — so percentage sizing bases off the real
+        # available capital without hammering the venue's balance API.
+        wants_to_buy = any(
+            is_dead(b.temp, rmax, upper_open=b.upper_open)
+            and b.no_best_ask is not None and b.no_best_ask < self._cfg.cap
+            for b in snapshot.brackets)
+        self._balance.refresh(urgent=wants_to_buy)
+
         intents = self._strategy.evaluate(snapshot, rmax)
         acted = {i.temp for i in intents}
         blocked_this_tick = self._strategy.last_blocked_value
@@ -317,7 +335,8 @@ class CityWorker:
         # the first tick of a new day doesn't wipe it.
         self._capped_peak = max(self._capped_peak, blocked_this_tick)
 
-        # 5. Execute entries and post the matching resting exits.
+        # 5. Execute entries. Whether the freshly-bought NO is held to $1 or
+        #    immediately backed by a recycle sell is decided in step 6.
         for intent in intents:
             bracket = snapshot.bracket(intent.temp)
             if bracket is None:
@@ -331,12 +350,21 @@ class CityWorker:
             if fill is None:
                 continue
             self._reporter.buy(fill)
-            self._place_exit_for(fill.temp, fill.size, bracket)
+            if not self._cfg.recycle_on_opportunity or fill.reason.startswith("fcast"):
+                # Legacy always-rest, OR a forecast entry: a probabilistic bet
+                # gets its immediate 99.9c exit so it's de-risked (locked in) the
+                # moment the market confirms. Dead-path entries in gated mode
+                # defer to step 6 and are held to $1 unless capital is blocked.
+                self._place_exit_for(fill.temp, fill.size, bracket)
 
-        # 6. Guarantee every held position has its resting 99.9c sell (spec §4):
-        #    cover any shares not yet backed by a resting sell — e.g. a place_exit
-        #    that failed on a prior tick — retrying until it rests.
-        self._ensure_exits(snapshot)
+        # 6. Capital recycling. Default (opportunity-gated): hold every dead NO to
+        #    $1 and post recycle sells only to cover a bankroll-blocked buy this
+        #    tick, cancelling them when the block clears. Legacy: guarantee every
+        #    held share rests (spec §4 as originally written).
+        if self._cfg.recycle_on_opportunity:
+            self._maintain_recycle_sells(snapshot, frozenset(acted), blocked_this_tick)
+        else:
+            self._ensure_exits(snapshot)
 
     def _evaluate_forecast(self, snapshot: MarketSnapshot, rmax: Optional[int],
                            skip_temps: frozenset[int]) -> list:
@@ -402,6 +430,81 @@ class CityWorker:
             if bracket is None:
                 continue  # bracket not in the current book; will retry next tick
             self._place_exit_for(pos.temp, uncovered, bracket)
+
+    def _cancel_exit_for(self, temp: int) -> None:
+        """Retract the resting recycle sell for one bracket (revert to hold-$1)."""
+
+        try:
+            self._executor.cancel_exit(self.city, temp)
+        except Exception as exc:
+            self._handle_order_error(exc)
+
+    def _maintain_recycle_sells(self, snapshot: MarketSnapshot,
+                                acted: frozenset[int], shortfall: float) -> None:
+        """Opportunity-gated capital recycling (the default policy).
+
+        A dead NO is certain to pay $1, so hold it — UNLESS a liftable dead-NO buy
+        was blocked purely by the bankroll caps this tick (``shortfall`` > 0). In
+        that case post resting 99.9c maker sells on OTHER held positions, enough to
+        cover the shortfall, so capital frees as those sells fill against arriving
+        99.9c bids and the blocked buy can be taken on a later tick. When there is
+        no such block, cancel any still-unfilled recycle sells and revert to
+        holding every NO to $1.
+
+        Brackets bought this tick (``acted``) are never recycled — we just paid to
+        acquire them; selling them back would be churn, not recycling. Each freed
+        share redeems at ~$1, so shares are used directly as the dollar proxy.
+
+        Forecast positions are exempt: they keep their immediate 99.9c de-risk
+        exit (posted in step 5) and are re-covered on retry here, never cancelled —
+        only the dead-path positions are opportunity-gated.
+        """
+
+        positions = getattr(self._executor, "positions", {})
+        mine = [p for p in positions.values()
+                if p.city == self.city and p.shares > 0]
+        forecast_pos, dead_pos = [], []
+        for pos in mine:
+            (forecast_pos if self._risk.forecast_exposure_for(self.city, pos.temp) > 0
+             else dead_pos).append(pos)
+
+        # Forecast positions: guarantee their resting de-risk exit stays in place
+        # (re-cover a prior place_exit that failed); never cancel or gate them.
+        for pos in forecast_pos:
+            uncovered = pos.shares - pos.resting_sell
+            if uncovered <= 0:
+                continue
+            bracket = snapshot.bracket(pos.temp)
+            if bracket is None:
+                continue
+            self._place_exit_for(pos.temp, uncovered, bracket)
+
+        if shortfall <= 0:
+            # No unfunded opportunity: hold dead positions to $1, retract any
+            # resting recycle sell so nothing sells at 99.9c needlessly.
+            for pos in dead_pos:
+                if pos.resting_sell > 0:
+                    self._cancel_exit_for(pos.temp)
+            return
+
+        # Value already-resting recycle sells (on dead brackets we didn't just buy)
+        # toward the shortfall, so we don't over-post across ticks.
+        recyclable = [p for p in dead_pos if p.temp not in acted]
+        covered = sum(p.resting_sell for p in recyclable)
+        for pos in recyclable:
+            if covered >= shortfall:
+                break
+            uncovered = pos.shares - pos.resting_sell
+            if uncovered <= 0:
+                continue
+            bracket = snapshot.bracket(pos.temp)
+            if bracket is None:
+                continue  # bracket not in the current book; retry next tick
+            size = min(uncovered, shortfall - covered)
+            if size <= 0:
+                continue
+            self._place_exit_for(pos.temp, size, bracket)
+            covered += size
 
     def _check_books(self, snapshot: MarketSnapshot, rmax: Optional[int]) -> None:
         """Police order-book validity (spec §9).

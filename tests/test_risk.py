@@ -71,6 +71,30 @@ def test_bankroll_pct_subtracts_open_exposure(config):
     assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(30.0 / cfg.cap)
 
 
+def test_equity_source_drives_percentage_sizing(config):
+    # Live mode: the sizing base is the ground-truth wallet equity
+    # (wallet cash + open exposure), not the synthetic initial + realised PnL.
+    cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000)
+    r = RiskManager(cfg, initial_balance=0.0)  # synthetic base would be $0
+    wallet = {"cash": 100.0}
+    r.set_equity_source(lambda: wallet["cash"] + r.total_exposure)
+    assert r.current_balance == pytest.approx(100.0)  # equity source wins
+    assert r.total_cap_remaining() == pytest.approx(50.0 / cfg.cap)
+
+    # A buy moves cash -> exposure; equity (hence the cap) is unchanged.
+    r.record_buy_fill(buy("paris", 22, 0.50, 40))  # $20 cost
+    wallet["cash"] -= 20.0
+    assert r.current_balance == pytest.approx(100.0)
+    assert r.per_city_cap_remaining("paris") == pytest.approx((50.0 - 20.0) / cfg.cap)
+
+    # A failing equity source falls back to the synthetic base (never zeroes caps).
+    def boom():
+        raise RuntimeError("balance read failed")
+
+    r.set_equity_source(boom)
+    assert r.current_balance == pytest.approx(0.0 + r.realized_pnl)
+
+
 def test_sell_frees_exposure(config):
     r = RiskManager(config)
     r.record_buy_fill(buy("paris", 22, 0.95, 100))
