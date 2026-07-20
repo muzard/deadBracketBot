@@ -121,6 +121,11 @@ def test_hko_collector_restart_seeds_dedupe_from_file(tmp_path):
 # ---------------------------------------------------------------------------
 # Component 2 — TWC row-version collector
 # ---------------------------------------------------------------------------
+# A recent slot epoch: the collector rejects payloads whose newest row is
+# stale (freshness guard), so fixtures must sit near the test clock.
+VT = int(NOW.timestamp()) - 600
+
+
 def _ob(vt, temp=24, pressure=1002.8, **kw):
     ob = {"valid_time_gmt": vt, "temp": temp, "dewPt": 24, "rh": 100,
           "pressure": pressure, "wdir": 80, "wspd": 11, "gust": None,
@@ -135,24 +140,24 @@ def _payload(obs, txn="t1"):
 
 def test_twc_rows_appends_only_new_versions(tmp_path):
     path = str(tmp_path / "twc_rows.jsonl")
-    feed = {"p": _payload([_ob(1000)], "t1")}
+    feed = {"p": _payload([_ob(VT)], "t1")}
     c = TwcRowCollector(fetch=lambda: feed["p"], path=path, clock=_clock())
     assert len(c.poll_once()) == 1
-    feed["p"] = _payload([_ob(1000)], "t2")          # identical tuple -> nothing
+    feed["p"] = _payload([_ob(VT)], "t2")          # identical tuple -> nothing
     assert c.poll_once() == []
     # pressure moves 0.1 hPa with temp flat -> that IS a new version (the
     # change detector the requirements call out).
-    feed["p"] = _payload([_ob(1000, pressure=1002.9)], "t3")
+    feed["p"] = _payload([_ob(VT, pressure=1002.9)], "t3")
     new = c.poll_once()
     assert len(new) == 1 and new[0]["pressure"] == 1002.9
     recs = read_jsonl(path)
-    assert len(recs) == 2 and all(r["valid_time_gmt"] == 1000 for r in recs)
+    assert len(recs) == 2 and all(r["valid_time_gmt"] == VT for r in recs)
     assert twc_version_tuple(recs[0]) != twc_version_tuple(recs[1])
 
 
 def test_twc_rows_detects_stale_cache_and_counts_failures(tmp_path):
     path = str(tmp_path / "twc_rows.jsonl")
-    feed = {"p": _payload([_ob(1000)], "same-txn")}
+    feed = {"p": _payload([_ob(VT)], "same-txn")}
     c = TwcRowCollector(fetch=lambda: feed["p"], path=path, clock=_clock())
     c.poll_once()
     c.poll_once()                                    # same transaction_id again
@@ -163,9 +168,9 @@ def test_twc_rows_detects_stale_cache_and_counts_failures(tmp_path):
 
 def test_twc_rows_restart_seeds_versions_from_file(tmp_path):
     path = str(tmp_path / "twc_rows.jsonl")
-    c1 = TwcRowCollector(fetch=lambda: _payload([_ob(1000)]), path=path, clock=_clock())
+    c1 = TwcRowCollector(fetch=lambda: _payload([_ob(VT)]), path=path, clock=_clock())
     c1.poll_once()
-    c2 = TwcRowCollector(fetch=lambda: _payload([_ob(1000)]), path=path, clock=_clock())
+    c2 = TwcRowCollector(fetch=lambda: _payload([_ob(VT)]), path=path, clock=_clock())
     assert c2.poll_once() == []                      # version known across restart
     assert len(read_jsonl(path)) == 1
 

@@ -13,16 +13,21 @@ it expires, so the bot never keeps hammering a closed event's tokens (the cause
 of the CLOB 404 storm). Per-token book failures are tolerated — a single
 bracket's missing book skips that bracket instead of failing the whole snapshot.
 
-The only weather input that can mark a bracket dead is the resolution METAR.
-The sub-hourly national feeds at the bottom of this module (Météo-France /
-KNMI / FMI / JMA / NEA, added for the forecast path) are SIGNAL-ONLY: they
-feed forecast.py's probabilistic entries and never reach a MetarFeed, a
-running max, or the dead-bracket logic.
+The only weather input that can mark a bracket dead is the market's resolution
+source: the resolution METAR — or, for a TWC-resolved city under ``--twc``,
+the CLOSED rows of the resolver's own timeseries (``TwcResolverFetcher``, the
+L1 layer of the Shenzhen re-enable plan: the row content IS what the market
+settles on, so it is resolution truth by definition). The sub-hourly national
+feeds at the bottom of this module (Météo-France / KNMI / FMI / JMA / NEA,
+added for the forecast path) and the HKO 1-min calibration feed are
+SIGNAL-ONLY: they feed probabilistic entries / calibration and never reach a
+MetarFeed, a running max, or the dead-bracket logic.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -52,6 +57,7 @@ class TransientBookError(Exception):
     blip / CLOB rate limit). It is distinct from "no market" (snapshot -> None):
     the caller skips the tick instead of flapping the market-unavailable notice.
     """
+
 
 _DEFAULT_UA = "dead-bracket-bot/0.1 (METAR resolution feed; contact: ops@example.com)"
 AVIATIONWEATHER_URL = "https://aviationweather.gov/api/data/metar"
@@ -90,7 +96,9 @@ _TEMP_IN_QUESTION = re.compile(r"(-?\d+)\s*°?\s*[cC]\b")
 # Open-ended top bracket: "... or higher/above/more/over/greater", or a trailing
 # "+" (e.g. "30°C+" / "30+"). Matched on the bracket title to exempt it from the
 # dead check (see ``bracket_is_upper_open``).
-_UPPER_OPEN = re.compile(r"\bor\s+(?:higher|above|more|over|greater)\b|\+\s*$", re.IGNORECASE)
+_UPPER_OPEN = re.compile(
+    r"\bor\s+(?:higher|above|more|over|greater)\b|\+\s*$", re.IGNORECASE
+)
 
 
 # --------------------------------------------------------------------------
@@ -249,8 +257,14 @@ def source_confirmed(ev: dict, icao: Optional[str]) -> bool:
     return WUNDERGROUND_TERM in text
 
 
-def choose_event(events: list, terms: tuple[str, ...], *, now: Optional[datetime] = None,
-                 require_date: Optional[date] = None, icao: Optional[str] = None) -> Optional[dict]:
+def choose_event(
+    events: list,
+    terms: tuple[str, ...],
+    *,
+    now: Optional[datetime] = None,
+    require_date: Optional[date] = None,
+    icao: Optional[str] = None,
+) -> Optional[dict]:
     """Pick the city's daily-temperature event from candidates.
 
     Matches all city terms against the slug/title and drops closed events. When
@@ -307,10 +321,12 @@ def _pooled_session():  # pragma: no cover - exercised only with the real networ
     sess = requests.Session()
     if HTTPAdapter is not None and Retry is not None:
         retry = Retry(
-            total=1, backoff_factor=0.5,
+            total=1,
+            backoff_factor=0.5,
             status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=frozenset({"GET", "POST"}),
-            respect_retry_after_header=True, raise_on_status=False,
+            respect_retry_after_header=True,
+            raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
         sess.mount("https://", adapter)
@@ -323,7 +339,9 @@ def make_metar_fetch(
 ) -> Callable[[str], Optional[str]]:
     """Return a fetch callable that yields the raw METAR for an ICAO."""
 
-    def fetch(icao: str, max_age: Optional[float] = None) -> Optional[str]:  # pragma: no cover - network
+    def fetch(
+        icao: str, max_age: Optional[float] = None
+    ) -> Optional[str]:  # pragma: no cover - network
         if requests is None:
             return None
         resp = requests.get(
@@ -400,10 +418,18 @@ class HkoStationFetcher:
     ``session`` is injected so tests exercise it with canned JSON (no live network).
     """
 
-    def __init__(self, *, station: str, icao: str, session,
-                 user_agent: str = _DEFAULT_UA, timeout: float = 15.0,
-                 ttl: float = 240.0, max_age: float = 1200.0,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        station: str,
+        icao: str,
+        session,
+        user_agent: str = _DEFAULT_UA,
+        timeout: float = 15.0,
+        ttl: float = 240.0,
+        max_age: float = 1200.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._station = station
         self._icao = icao
         self._session = session
@@ -417,7 +443,9 @@ class HkoStationFetcher:
         self._last_attempt: Optional[float] = None
         self._lock = threading.Lock()
 
-    def raw_for(self, icao: Optional[str] = None, max_age: Optional[float] = None) -> Optional[str]:
+    def raw_for(
+        self, icao: Optional[str] = None, max_age: Optional[float] = None
+    ) -> Optional[str]:
         interval = max_age if max_age is not None else self._ttl
         with self._lock:
             now = self._clock()
@@ -458,20 +486,25 @@ class HkoStationFetcher:
 # renders). Fetchers return None on any failure — the collectors count it and
 # skip the tick, so an outage never crashes the calibration worker.
 # --------------------------------------------------------------------------
-HKO_1MIN_URL = ("https://data.weather.gov.hk/weatherAPI/hko_data/"
-                "regional-weather/latest_1min_temperature.csv")
-TWC_TIMESERIES_URL = ("https://api.weather.com/v1/location/{location}/"
-                      "observations/timeseries.json")
-TWC_HISTORICAL_URL = ("https://api.weather.com/v1/location/{location}/"
-                      "observations/historical.json")
+HKO_1MIN_URL = (
+    "https://data.weather.gov.hk/weatherAPI/hko_data/"
+    "regional-weather/latest_1min_temperature.csv"
+)
+TWC_TIMESERIES_URL = (
+    "https://api.weather.com/v1/location/{location}/observations/timeseries.json"
+)
+TWC_HISTORICAL_URL = (
+    "https://api.weather.com/v1/location/{location}/observations/historical.json"
+)
 
 
 def _cache_bust() -> str:
     return str(int(time.time() * 1000))
 
 
-def make_hko_1min_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
-                        timeout: float = 15.0) -> Callable[[], Optional[str]]:
+def make_hko_1min_fetch(
+    *, session=None, user_agent: str = _DEFAULT_UA, timeout: float = 15.0
+) -> Callable[[], Optional[str]]:
     """Fetch callable for the HKO latest-1-minute regional temperature CSV.
 
     Returns the CSV text or None. Served as ``application/octet-stream`` with a
@@ -486,10 +519,12 @@ def make_hko_1min_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
         if sess is None:
             return None
         try:
-            resp = sess.get(HKO_1MIN_URL, params={"_": _cache_bust()},
-                            headers={"User-Agent": user_agent,
-                                     "Cache-Control": "no-cache"},
-                            timeout=timeout)
+            resp = sess.get(
+                HKO_1MIN_URL,
+                params={"_": _cache_bust()},
+                headers={"User-Agent": user_agent, "Cache-Control": "no-cache"},
+                timeout=timeout,
+            )
         except Exception:
             return None
         if resp.status_code != 200:
@@ -500,6 +535,160 @@ def make_hko_1min_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
             return None
 
     return fetch
+
+
+def synth_twc_metar(
+    icao: str, temp_c: int, slot_start_utc: datetime, location: str
+) -> str:
+    """Render a CLOSED TWC resolver row as a minimal, parseable METAR line.
+
+    Same trick as :func:`synth_hko_metar`: the line drives an existing
+    ``MetarFeed`` with no downstream changes. The temp is TWC's own integer —
+    the literal content of the table the market resolves on — so there is no
+    rounding/translation layer at all. The observation time is nominally
+    ``slot start + 50 min``: the value that persists in a row matches the HKO
+    sample at ~h:40–h:50 (measured 2026-07-08, 19/23 exact), and the +50 label
+    keeps the reading inside its own hour and its own HKT day. ``RMK SRC=TWC``
+    keeps the logged raw honest while ``icao`` stays the market station so the
+    feed's station-isolation guard passes.
+    """
+
+    obs_time = slot_start_utc.astimezone(timezone.utc) + timedelta(minutes=50)
+    z = obs_time.strftime("%d%H%MZ")
+    tt = f"M{abs(temp_c):02d}" if temp_c < 0 else f"{temp_c:02d}"
+    return f"{icao} {z} {tt}/XX RMK SRC=TWC:{location} CLOSED"
+
+
+class TwcResolverFetcher:
+    """MetarFeed-compatible fetch serving CLOSED-hour TWC resolver rows (L1).
+
+    The Shenzhen re-enable plan's L1 layer: ``running_max`` computed from the
+    resolver's literal row content instead of any sensor of our own. Reads
+    ``twc_rows.jsonl`` — written by the calibration ``TwcRowCollector``, the
+    process's single (cache-busted, freshness-checked) TWC poller — so this
+    class does NO network of its own and stays trivially testable.
+
+    Only rows whose hour has CLOSED (slot start + 1 h <= now) are ever served:
+    the still-revising current-hour row must not fold into a running max (the
+    July 8 near-miss: an intra-hour value that later vanished). On each call it
+    serves the oldest closed row not yet emitted at its current value, then the
+    newest closed row once caught up — so a restart mid-day replays the whole
+    day's closed rows into the feed's running max within a few polls.
+
+    Staleness: if the newest ``first_seen_ts`` in the file (ANY row activity,
+    including current-hour revisions) is older than ``stale_sec``, ``raw_for``
+    returns None so the feed's stale-halt trips — a dead TWC key or collector
+    outage pauses the city instead of trading on old truth.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        icao: str,
+        location: str = "ZGSZ:9:CN",
+        ttl: float = 30.0,
+        stale_sec: float = 5400.0,
+        backfill_hours: float = 26.0,
+        clock: Callable[[], float] = time.monotonic,
+        utc_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    ) -> None:
+        self._path = path
+        self._icao = icao
+        self._location = location
+        self._ttl = ttl
+        self._stale_sec = stale_sec
+        self._backfill_sec = backfill_hours * 3600.0
+        self._clock = clock
+        self._utc = utc_clock
+        self._lock = threading.Lock()
+        self._offset = 0
+        self._rows: dict[int, int] = {}  # slot start epoch -> latest temp
+        self._emitted: dict[int, int] = {}  # slot -> temp already served
+        self._last_activity: Optional[datetime] = None
+        self._last_read: Optional[float] = None
+
+    def _ingest(self, line: str, now_utc: datetime) -> None:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(rec, dict):
+            return
+        vt, temp = rec.get("valid_time_gmt"), rec.get("temp")
+        ts_raw = rec.get("first_seen_ts")
+        if ts_raw:
+            try:
+                seen = datetime.fromisoformat(str(ts_raw))
+                if self._last_activity is None or seen > self._last_activity:
+                    self._last_activity = seen
+            except ValueError:
+                pass
+        if vt is None or temp is None:
+            return
+        try:
+            vt, temp = int(vt), int(temp)
+        except (TypeError, ValueError):
+            return
+        if vt < now_utc.timestamp() - self._backfill_sec:
+            return  # ancient history — bounds memory, irrelevant to today
+        self._rows[vt] = temp
+
+    def _read_new(self, now_utc: datetime) -> None:
+        try:
+            size = os.path.getsize(self._path)
+        except OSError:
+            return
+        if size < self._offset:  # truncated/rotated -> re-read from the top
+            self._offset = 0
+        if size == self._offset:
+            return
+        try:
+            with open(self._path, "r", encoding="utf-8") as fh:
+                fh.seek(self._offset)
+                chunk = fh.read()
+                self._offset = fh.tell()
+        except OSError:
+            return
+        for line in chunk.splitlines():
+            line = line.strip()
+            if line:
+                self._ingest(line, now_utc)
+        cutoff = now_utc.timestamp() - self._backfill_sec
+        for d in (self._rows, self._emitted):
+            for vt in [v for v in d if v < cutoff]:
+                del d[vt]
+
+    def raw_for(
+        self, icao: Optional[str] = None, max_age: Optional[float] = None
+    ) -> Optional[str]:
+        interval = min(self._ttl, max_age) if max_age is not None else self._ttl
+        with self._lock:
+            now_m = self._clock()
+            now_utc = self._utc()
+            if self._last_read is None or (now_m - self._last_read) >= interval:
+                self._last_read = now_m
+                self._read_new(now_utc)
+            if (
+                self._last_activity is None
+                or (now_utc - self._last_activity).total_seconds() > self._stale_sec
+            ):
+                return None  # poller dead / key dead -> let the feed stale-halt
+            closed = [vt for vt in self._rows if vt + 3600 <= now_utc.timestamp()]
+            if not closed:
+                return None
+            pending = sorted(
+                vt for vt in closed if self._emitted.get(vt) != self._rows[vt]
+            )
+            vt = pending[0] if pending else max(closed)
+            temp = self._rows[vt]
+            self._emitted[vt] = temp
+            return synth_twc_metar(
+                self._icao,
+                temp,
+                datetime.fromtimestamp(vt, tz=timezone.utc),
+                self._location,
+            )
 
 
 # api.weather.com REJECTS unknown query params with a 400 (verified live
@@ -514,10 +703,15 @@ def make_hko_1min_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
 TWC_HOURS_ROTATION = (2, 3, 4, 5, 6, 7)
 
 
-def make_twc_timeseries_fetch(*, api_key: str, location: str = "ZGSZ:9:CN",
-                              hours_rotation: tuple[int, ...] = TWC_HOURS_ROTATION,
-                              session=None, user_agent: str = _DEFAULT_UA,
-                              timeout: float = 15.0) -> Callable[[], Optional[dict]]:
+def make_twc_timeseries_fetch(
+    *,
+    api_key: str,
+    location: str = "ZGSZ:9:CN",
+    hours_rotation: tuple[int, ...] = TWC_HOURS_ROTATION,
+    session=None,
+    user_agent: str = _DEFAULT_UA,
+    timeout: float = 15.0,
+) -> Callable[[], Optional[dict]]:
     """Fetch callable for TWC's observation timeseries (the WU row source).
 
     Returns the parsed JSON payload or None. Cache-busted by rotating the
@@ -536,11 +730,12 @@ def make_twc_timeseries_fetch(*, api_key: str, location: str = "ZGSZ:9:CN",
         hours = hours_rotation[state["i"] % len(hours_rotation)]
         state["i"] += 1
         try:
-            resp = sess.get(TWC_TIMESERIES_URL.format(location=location),
-                            params={"apiKey": api_key, "units": "m",
-                                    "hours": hours},
-                            headers={"User-Agent": user_agent},
-                            timeout=timeout)
+            resp = sess.get(
+                TWC_TIMESERIES_URL.format(location=location),
+                params={"apiKey": api_key, "units": "m", "hours": hours},
+                headers={"User-Agent": user_agent},
+                timeout=timeout,
+            )
         except Exception:
             return None
         if resp.status_code != 200:
@@ -554,9 +749,14 @@ def make_twc_timeseries_fetch(*, api_key: str, location: str = "ZGSZ:9:CN",
     return fetch
 
 
-def make_twc_historical_fetch(*, api_key: str, location: str = "ZGSZ:9:CN",
-                              session=None, user_agent: str = _DEFAULT_UA,
-                              timeout: float = 20.0) -> Callable[[str], Optional[dict]]:
+def make_twc_historical_fetch(
+    *,
+    api_key: str,
+    location: str = "ZGSZ:9:CN",
+    session=None,
+    user_agent: str = _DEFAULT_UA,
+    timeout: float = 20.0,
+) -> Callable[[str], Optional[dict]]:
     """Fetch callable for TWC's historical daily table (the K3 capture).
 
     Takes the target day as ``yyyyMMdd`` (start=end, i.e. one HKT day of final
@@ -573,12 +773,17 @@ def make_twc_historical_fetch(*, api_key: str, location: str = "ZGSZ:9:CN",
             # No cache-bust param (api.weather.com 400s on unknown params);
             # the per-day startDate/endDate already vary the cache key, and
             # the two capture slots are hours apart (>> the 5-min cache TTL).
-            resp = sess.get(TWC_HISTORICAL_URL.format(location=location),
-                            params={"apiKey": api_key, "units": "m",
-                                    "startDate": day_yyyymmdd,
-                                    "endDate": day_yyyymmdd},
-                            headers={"User-Agent": user_agent},
-                            timeout=timeout)
+            resp = sess.get(
+                TWC_HISTORICAL_URL.format(location=location),
+                params={
+                    "apiKey": api_key,
+                    "units": "m",
+                    "startDate": day_yyyymmdd,
+                    "endDate": day_yyyymmdd,
+                },
+                headers={"User-Agent": user_agent},
+                timeout=timeout,
+            )
         except Exception:
             return None
         if resp.status_code != 200:
@@ -592,8 +797,9 @@ def make_twc_historical_fetch(*, api_key: str, location: str = "ZGSZ:9:CN",
     return fetch
 
 
-def make_tgftp_fetch(*, user_agent: str = _DEFAULT_UA, timeout: float = 5.0,
-                     session=None) -> Callable[[str], Optional[str]]:
+def make_tgftp_fetch(
+    *, user_agent: str = _DEFAULT_UA, timeout: float = 5.0, session=None
+) -> Callable[[str], Optional[str]]:
     """Per-station fetch from NOAA's tgftp file server (hot-window fast path).
 
     One tiny text file per station, updated as reports arrive — the canonical
@@ -606,9 +812,11 @@ def make_tgftp_fetch(*, user_agent: str = _DEFAULT_UA, timeout: float = 5.0,
     def fetch(icao: str) -> Optional[str]:  # pragma: no cover - network
         if sess is None:
             return None
-        resp = sess.get(TGFTP_URL.format(icao=icao),
-                        headers={"User-Agent": user_agent, "Cache-Control": "no-cache"},
-                        timeout=timeout)
+        resp = sess.get(
+            TGFTP_URL.format(icao=icao),
+            headers={"User-Agent": user_agent, "Cache-Control": "no-cache"},
+            timeout=timeout,
+        )
         if resp.status_code != 200:
             return None
         lines = [ln for ln in resp.text.splitlines() if ln.strip()]
@@ -636,7 +844,11 @@ def latest_by_icao(text: str) -> dict[str, str]:
         if not line:
             continue
         toks = line.split()
-        icao = toks[1] if toks and toks[0] in ("METAR", "SPECI") and len(toks) > 1 else toks[0]
+        icao = (
+            toks[1]
+            if toks and toks[0] in ("METAR", "SPECI") and len(toks) > 1
+            else toks[0]
+        )
         if not re.fullmatch(r"[A-Z]{4}", icao):
             continue
         t = _obs_key(line)
@@ -671,8 +883,9 @@ def latest_json_by_icao(records, exclude_speci_icaos=()) -> dict[str, tuple]:
         obs_time = rec.get("obsTime")
         if not icao or not raw or obs_time is None:
             continue
-        if icao in exclude and (rec.get("metarType") == "SPECI"
-                                or str(raw).strip().startswith("SPECI")):
+        if icao in exclude and (
+            rec.get("metarType") == "SPECI" or str(raw).strip().startswith("SPECI")
+        ):
             continue
         try:
             obs_time = int(obs_time)
@@ -762,7 +975,10 @@ class SharedMetarFetcher:
             # Batched fetch: while hot, bust the CDN but go no faster than the
             # origin-friendly floor; the per-station path covers the gap.
             batch_interval = max(interval, self._hot_origin_min) if hot else interval
-            if self._last_attempt is None or (now - self._last_attempt) >= batch_interval:
+            if (
+                self._last_attempt is None
+                or (now - self._last_attempt) >= batch_interval
+            ):
                 self._last_attempt = now
                 self._refresh(now, bust=hot)
             # Per-station fast path at the full hot cadence (tiny tgftp file).
@@ -770,7 +986,11 @@ class SharedMetarFetcher:
             # can't tell a routine METAR from a SPECI there and an off-cycle SPECI
             # would fold into the max looking routine. Their SPECIs still arrive
             # (marked) via the JSON batch, where the feed logs-but-doesn't-fold.
-            if hot and self._station_fetch is not None and icao not in self._exclude_speci:
+            if (
+                hot
+                and self._station_fetch is not None
+                and icao not in self._exclude_speci
+            ):
                 last = self._station_last.get(icao)
                 if last is None or (now - last) >= interval:
                     self._station_last[icao] = now
@@ -796,8 +1016,9 @@ class SharedMetarFetcher:
             served = self._served.get(icao)
             return served.get("receipt") if served else None
 
-    def _store(self, icao: str, raw: str, obs: tuple, receipt: Optional[datetime],
-               now: float) -> None:
+    def _store(
+        self, icao: str, raw: str, obs: tuple, receipt: Optional[datetime], now: float
+    ) -> None:
         """Keep the newest observation per station (and its receipt time)."""
 
         cur = self._cache.get(icao)
@@ -839,7 +1060,9 @@ class SharedMetarFetcher:
         except ValueError:
             return None
 
-    def _refresh(self, now: float, bust: bool = False) -> None:  # pragma: no cover - network
+    def _refresh(
+        self, now: float, bust: bool = False
+    ) -> None:  # pragma: no cover - network
         # JSON carries obsTime + receiptTime + rawOb per record (raw format does
         # not), so we can report the publish/receipt split.
         params = {"ids": ",".join(self._icaos), "format": "json", "hours": 2}
@@ -966,7 +1189,9 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
         if self._discovered_date != self._local_date(now).isoformat():
             return True
         # Safety: cached event must be today's and must be a HIGHEST market.
-        hay = f"{self._event.get('slug') or ''} {self._event.get('title') or ''}".lower()
+        hay = (
+            f"{self._event.get('slug') or ''} {self._event.get('title') or ''}".lower()
+        )
         if not is_highest_event(hay):
             self._event = None  # poison: drop a non-high event immediately
             return True
@@ -988,8 +1213,13 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
             events = []
             offset = 0
             while True:
-                page = self._get(GAMMA_EVENTS_URL, closed="false",
-                                 tag_slug=DAILY_TEMP_TAG, limit=100, offset=offset)
+                page = self._get(
+                    GAMMA_EVENTS_URL,
+                    closed="false",
+                    tag_slug=DAILY_TEMP_TAG,
+                    limit=100,
+                    offset=offset,
+                )
                 if not page:
                     break
                 events.extend(page)
@@ -1002,18 +1232,26 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
             # strategy is incoherent (and loss-making) on a lowest market —
             # and must confirm our resolution station + source.
             if ev is not None and not is_highest_event(
-                    f"{ev.get('slug') or ''} {ev.get('title') or ''}"):
+                f"{ev.get('slug') or ''} {ev.get('title') or ''}"
+            ):
                 ev = None
             if ev is not None and not source_confirmed(ev, self._icao):
                 ev = None
         else:
             # Require today's local-date event — never tomorrow's forecast market
             # — and confirm its resolution station + source (icao cross-check).
-            ev = choose_event(events, self._terms, now=now,
-                              require_date=self._local_date(now), icao=self._icao)
+            ev = choose_event(
+                events,
+                self._terms,
+                now=now,
+                require_date=self._local_date(now),
+                icao=self._icao,
+            )
         today = self._local_date(now).isoformat()
         if ev is not None:
-            changed = ev.get("slug") != (self._event.get("slug") if self._event else None)
+            changed = ev.get("slug") != (
+                self._event.get("slug") if self._event else None
+            )
             self._event = ev
             self._discovered_date = today
             # Announce only on an actual event change, not every re-resolve.
@@ -1027,8 +1265,9 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
             self._discovered_date = None
         return ev
 
-    def snapshot(self, running_max: Optional[int] = None,
-                 keep_temps=()) -> Optional[MarketSnapshot]:
+    def snapshot(
+        self, running_max: Optional[int] = None, keep_temps=()
+    ) -> Optional[MarketSnapshot]:
         """Build the frontier-band book snapshot for today's event.
 
         Only the brackets near ``running_max`` (the band ``[max-below, max+above]``)
@@ -1067,13 +1306,17 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
         else:
             low = running_max - self._book_band_below
             high = running_max + self._book_band_above
-            wanted = [(t, tok, m) for (t, tok, m) in resolvable
-                      if (low <= t <= high) or t in keep]
+            wanted = [
+                (t, tok, m)
+                for (t, tok, m) in resolvable
+                if (low <= t <= high) or t in keep
+            ]
         if not wanted:
             # Market is up but nothing is near the frontier yet — available, just
             # empty. NOT "unavailable" (that is reserved for a vanished market).
-            return MarketSnapshot(city=self._terms[0], brackets=(),
-                                  event_slug=ev.get("slug"))
+            return MarketSnapshot(
+                city=self._terms[0], brackets=(), event_slug=ev.get("slug")
+            )
 
         books = self._get_books([tok for (_t, tok, _m) in wanted])
         if books is None:
@@ -1118,10 +1361,13 @@ FMI_WFS_URL = "https://opendata.fmi.fi/wfs"
 JMA_LATEST_TIME_URL = "https://www.jma.go.jp/bosai/amedas/data/latest_time.txt"
 JMA_MAP_URL = "https://www.jma.go.jp/bosai/amedas/data/map/{stamp}.json"
 NEA_AIR_TEMP_URL = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature"
-MF_INFRAHORAIRE_URL = ("https://public-api.meteofrance.fr/public/DPObs/v1/"
-                       "station/infrahoraire-6m")
-KNMI_EDR_URL = ("https://api.dataplatform.knmi.nl/edr/v1/collections/"
-                "observations/locations/{location}")
+MF_INFRAHORAIRE_URL = (
+    "https://public-api.meteofrance.fr/public/DPObs/v1/station/infrahoraire-6m"
+)
+KNMI_EDR_URL = (
+    "https://api.dataplatform.knmi.nl/edr/v1/collections/"
+    "observations/locations/{location}"
+)
 
 # (obs_time UTC, temp degC in tenths) — the parsers' common output row.
 FeedObs = tuple[datetime, float]
@@ -1178,8 +1424,12 @@ def parse_jma_amedas(payload: dict, station: str, obs_time: datetime) -> list[Fe
     if not isinstance(entry, dict):
         return []
     temp = entry.get("temp")
-    if (not isinstance(temp, (list, tuple)) or len(temp) < 2
-            or temp[0] is None or temp[1] != 0):
+    if (
+        not isinstance(temp, (list, tuple))
+        or len(temp) < 2
+        or temp[0] is None
+        or temp[1] != 0
+    ):
         return []
     try:
         return [(obs_time.astimezone(timezone.utc), float(temp[0]))]
@@ -1247,8 +1497,14 @@ def parse_knmi_edr(payload: dict, parameter: str = "ta") -> list[FeedObs]:
     return out
 
 
-def make_fmi_fetch(*, station_id: str, session=None, user_agent: str = _DEFAULT_UA,
-                   timeout: float = 15.0, window_min: int = 40) -> Callable[[], Optional[str]]:
+def make_fmi_fetch(
+    *,
+    station_id: str,
+    session=None,
+    user_agent: str = _DEFAULT_UA,
+    timeout: float = 15.0,
+    window_min: int = 40,
+) -> Callable[[], Optional[str]]:
     """Fetch callable for FMI's 10-min observations (no key needed)."""
 
     sess = session or (requests.Session() if requests else None)
@@ -1256,14 +1512,22 @@ def make_fmi_fetch(*, station_id: str, session=None, user_agent: str = _DEFAULT_
     def fetch() -> Optional[str]:  # pragma: no cover - network
         if sess is None:
             return None
-        start = (datetime.now(timezone.utc) - timedelta(minutes=window_min))
+        start = datetime.now(timezone.utc) - timedelta(minutes=window_min)
         try:
-            resp = sess.get(FMI_WFS_URL, params={
-                "service": "WFS", "version": "2.0.0", "request": "getFeature",
-                "storedquery_id": "fmi::observations::weather::simple",
-                "fmisid": station_id, "parameters": "t2m",
-                "starttime": start.strftime("%Y-%m-%dT%H:%M:%SZ")},
-                headers={"User-Agent": user_agent}, timeout=timeout)
+            resp = sess.get(
+                FMI_WFS_URL,
+                params={
+                    "service": "WFS",
+                    "version": "2.0.0",
+                    "request": "getFeature",
+                    "storedquery_id": "fmi::observations::weather::simple",
+                    "fmisid": station_id,
+                    "parameters": "t2m",
+                    "starttime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                headers={"User-Agent": user_agent},
+                timeout=timeout,
+            )
         except Exception:
             return None
         return resp.text if resp.status_code == 200 else None
@@ -1271,9 +1535,9 @@ def make_fmi_fetch(*, station_id: str, session=None, user_agent: str = _DEFAULT_
     return fetch
 
 
-def make_jma_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
-                   timeout: float = 15.0
-                   ) -> Callable[[], Optional[tuple[datetime, Optional[dict]]]]:
+def make_jma_fetch(
+    *, session=None, user_agent: str = _DEFAULT_UA, timeout: float = 15.0
+) -> Callable[[], Optional[tuple[datetime, Optional[dict]]]]:
     """Fetch callable for JMA AMeDAS (no key): latest_time.txt -> map JSON.
 
     Returns ``(obs_time_utc, map_payload)`` or None on failure. The map file
@@ -1286,12 +1550,15 @@ def make_jma_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
     sess = session or (requests.Session() if requests else None)
     state: dict[str, Optional[str]] = {"stamp": None}
 
-    def fetch() -> Optional[tuple[datetime, Optional[dict]]]:  # pragma: no cover - network
+    def fetch() -> Optional[
+        tuple[datetime, Optional[dict]]
+    ]:  # pragma: no cover - network
         if sess is None:
             return None
         try:
-            r1 = sess.get(JMA_LATEST_TIME_URL, headers={"User-Agent": user_agent},
-                          timeout=timeout)
+            r1 = sess.get(
+                JMA_LATEST_TIME_URL, headers={"User-Agent": user_agent}, timeout=timeout
+            )
             if r1.status_code != 200:
                 return None
             latest = _parse_iso_utc(r1.text)
@@ -1302,8 +1569,11 @@ def make_jma_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
             stamp = local.strftime("%Y%m%d%H%M%S")
             if stamp == state["stamp"]:
                 return (latest, None)  # nothing new published yet
-            r2 = sess.get(JMA_MAP_URL.format(stamp=stamp),
-                          headers={"User-Agent": user_agent}, timeout=timeout)
+            r2 = sess.get(
+                JMA_MAP_URL.format(stamp=stamp),
+                headers={"User-Agent": user_agent},
+                timeout=timeout,
+            )
             if r2.status_code != 200:
                 return None
             payload = r2.json()
@@ -1317,8 +1587,9 @@ def make_jma_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
     return fetch
 
 
-def make_nea_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
-                   timeout: float = 15.0) -> Callable[[], Optional[dict]]:
+def make_nea_fetch(
+    *, session=None, user_agent: str = _DEFAULT_UA, timeout: float = 15.0
+) -> Callable[[], Optional[dict]]:
     """Fetch callable for NEA/data.gov.sg v2 air temperature (no key)."""
 
     sess = session or (requests.Session() if requests else None)
@@ -1327,8 +1598,9 @@ def make_nea_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
         if sess is None:
             return None
         try:
-            resp = sess.get(NEA_AIR_TEMP_URL, headers={"User-Agent": user_agent},
-                            timeout=timeout)
+            resp = sess.get(
+                NEA_AIR_TEMP_URL, headers={"User-Agent": user_agent}, timeout=timeout
+            )
             if resp.status_code != 200:
                 return None
             payload = resp.json()
@@ -1339,9 +1611,14 @@ def make_nea_fetch(*, session=None, user_agent: str = _DEFAULT_UA,
     return fetch
 
 
-def make_meteofrance_fetch(*, api_key: str, station_id: str, session=None,
-                           user_agent: str = _DEFAULT_UA,
-                           timeout: float = 15.0) -> Callable[[], Optional[list]]:
+def make_meteofrance_fetch(
+    *,
+    api_key: str,
+    station_id: str,
+    session=None,
+    user_agent: str = _DEFAULT_UA,
+    timeout: float = 15.0,
+) -> Callable[[], Optional[list]]:
     """Fetch callable for Météo-France's 6-min station observations (apikey)."""
 
     sess = session or (requests.Session() if requests else None)
@@ -1350,10 +1627,12 @@ def make_meteofrance_fetch(*, api_key: str, station_id: str, session=None,
         if sess is None:
             return None
         try:
-            resp = sess.get(MF_INFRAHORAIRE_URL,
-                            params={"id_station": station_id, "format": "json"},
-                            headers={"User-Agent": user_agent, "apikey": api_key},
-                            timeout=timeout)
+            resp = sess.get(
+                MF_INFRAHORAIRE_URL,
+                params={"id_station": station_id, "format": "json"},
+                headers={"User-Agent": user_agent, "apikey": api_key},
+                timeout=timeout,
+            )
             if resp.status_code != 200:
                 return None
             payload = resp.json()
@@ -1364,9 +1643,15 @@ def make_meteofrance_fetch(*, api_key: str, station_id: str, session=None,
     return fetch
 
 
-def make_knmi_fetch(*, api_key: str, station_id: str, parameter: str = "ta",
-                    session=None, user_agent: str = _DEFAULT_UA,
-                    timeout: float = 15.0) -> Callable[[], Optional[dict]]:
+def make_knmi_fetch(
+    *,
+    api_key: str,
+    station_id: str,
+    parameter: str = "ta",
+    session=None,
+    user_agent: str = _DEFAULT_UA,
+    timeout: float = 15.0,
+) -> Callable[[], Optional[dict]]:
     """Fetch callable for KNMI EDR 10-min observations (Authorization key).
 
     ``station_id`` may be the bare synop number ("06240"); it is expanded to
@@ -1375,18 +1660,26 @@ def make_knmi_fetch(*, api_key: str, station_id: str, parameter: str = "ta",
     """
 
     sess = session or (requests.Session() if requests else None)
-    location = station_id if "-" in station_id else f"0-20000-0-{station_id.lstrip('0') or '0'}"
+    location = (
+        station_id
+        if "-" in station_id
+        else f"0-20000-0-{station_id.lstrip('0') or '0'}"
+    )
 
     def fetch() -> Optional[dict]:  # pragma: no cover - network
         if sess is None:
             return None
         start = datetime.now(timezone.utc) - timedelta(minutes=60)
         try:
-            resp = sess.get(KNMI_EDR_URL.format(location=location),
-                            params={"parameter-name": parameter,
-                                    "datetime": start.strftime("%Y-%m-%dT%H:%M:%SZ") + "/.."},
-                            headers={"User-Agent": user_agent, "Authorization": api_key},
-                            timeout=timeout)
+            resp = sess.get(
+                KNMI_EDR_URL.format(location=location),
+                params={
+                    "parameter-name": parameter,
+                    "datetime": start.strftime("%Y-%m-%dT%H:%M:%SZ") + "/..",
+                },
+                headers={"User-Agent": user_agent, "Authorization": api_key},
+                timeout=timeout,
+            )
             if resp.status_code != 200:
                 return None
             payload = resp.json()
@@ -1397,8 +1690,9 @@ def make_knmi_fetch(*, api_key: str, station_id: str, parameter: str = "ta",
     return fetch
 
 
-def build_feed_fetcher(city_cfg, config, *, session=None
-                       ) -> Optional[Callable[[], Optional[list[FeedObs]]]]:
+def build_feed_fetcher(
+    city_cfg, config, *, session=None
+) -> Optional[Callable[[], Optional[list[FeedObs]]]]:
     """Compose fetch + parse for a city's forecast feed.
 
     Returns a callable yielding ``list[(obs_time_utc, temp_c)]`` (None on
@@ -1428,17 +1722,23 @@ def build_feed_fetcher(city_cfg, config, *, session=None
         return run_jma
     if src == "nea":
         fetch = make_nea_fetch(session=session)
-        return lambda: (lambda p: None if p is None else parse_nea_air_temp(p, station))(fetch())
+        return lambda: (
+            lambda p: None if p is None else parse_nea_air_temp(p, station)
+        )(fetch())
     if src == "meteofrance":
         if not config.mf_api_key:
             return None
-        fetch = make_meteofrance_fetch(api_key=config.mf_api_key, station_id=station,
-                                       session=session)
-        return lambda: (lambda p: None if p is None else parse_mf_obs(p, station))(fetch())
+        fetch = make_meteofrance_fetch(
+            api_key=config.mf_api_key, station_id=station, session=session
+        )
+        return lambda: (lambda p: None if p is None else parse_mf_obs(p, station))(
+            fetch()
+        )
     if src == "knmi":
         if not config.knmi_api_key:
             return None
-        fetch = make_knmi_fetch(api_key=config.knmi_api_key, station_id=station,
-                                session=session)
+        fetch = make_knmi_fetch(
+            api_key=config.knmi_api_key, station_id=station, session=session
+        )
         return lambda: (lambda p: None if p is None else parse_knmi_edr(p))(fetch())
     return None

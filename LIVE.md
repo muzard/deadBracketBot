@@ -24,6 +24,16 @@
    source) but still must name their station ICAO. If either market's source ever
    becomes WU-confirmable, drop it from that set in `feeds_http.py`; to add another
    non-WU city, add its ICAO to the set (the station match stays required).
+2c. **Shenzhen trades only via `--twc`** (running max = the CLOSED rows of the
+   WU/TWC resolver table — see README "`--twc`: the L1 resolver feed"). Never
+   trade it off ZGSZ METAR or HKO rhrread: both diverge from the resolver
+   (station_audit_2026-07-02, wu_lfs_discrepancy_2026-07-03). Re-enable order:
+   3–5 days `--twc --no-trade shenzhen --calibrate`, then check the calibration
+   report's L1 closed-row-stability section (downward post-close revisions ~0)
+   and that each day's `metar_twc` running max equals WU's printed High, then
+   drop `--no-trade` (operator decision). L2 lock-ahead and L3 forecast stay
+   shadow/paper until their own gates pass
+   (`data/shenzhen_reenable_plan_2026-07-08.md`).
 3. **Run paper first** and check `data/<city>/opportunities.jsonl` actually shows
    sub-98¢ dead-NO offers with usable size. Per spec §13, only deploy live once
    the opportunity log proves real occurrences.

@@ -57,7 +57,22 @@
       "Bash(awk -F',' 'NR>1{print $9}' calib/_global/cycles.csv)",
       "Bash(awk -F',' 'NR>1{print $2}' calib/_global/cycles.csv)",
       "Bash(awk -F',' 'NR>1{print $1}' calib/_global/cycles.csv)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(:)",
+      "Bash(awk -F/ '{print $NF}')",
+      "Bash(xargs ls -la)",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?slug=highest-temperature-in-seoul-on-july-19-2026\")",
+      "Bash(curl -s \"https://data-api.polymarket.com/trades?market=0xcd6e520d985ddad04800f26272dad7ba201786c3d2785b388500d857fd347516&limit=100\")",
+      "Bash(curl -s \"https://data-api.polymarket.com/trades?user=0x8406B9B77E95908deC58933B9F87c77d455AB962&limit=200\")",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?slug=highest-temperature-in-seoul-on-july-8-2026\")",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?slug=highest-temperature-in-munich-on-july-12-2026\")",
+      "Bash(git -C /Users/arttu/Projects/hustle/deadBracketBot status --short)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:8799/)",
+      "Bash(/Users/arttu/Projects/hustle/deadBracketBot/.venv/bin/python --version)",
+      "Bash(pkill -f \"droneplanner serve\")",
+      "Bash(curl -s -o /dev/null -w \"port 8799 now: HTTP %{http_code}\\\\n\" --max-time 2 http://127.0.0.1:8799/)",
+      "Bash(git init *)",
+      "Bash(cp \"/Users/arttu/Library/Application Support/Claude/local-agent-mode-sessions/74f121a9-d4a9-4ee5-bb8a-6f6d10bc6006/c0fd509b-9c3f-4cf8-a505-fde2fe5521b7/local_53d6a45f-88e9-47a8-bfe8-76631ec30783/outputs/arb-scanner-plan.md\" /Users/arttu/Projects/hustle/arbScanner/docs/arb-scanner-plan.md)"
     ]
   }
 }

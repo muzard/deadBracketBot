@@ -84,27 +84,70 @@ DEFAULT_CITIES: tuple[CityConfig, ...] = (
     # KNMI_API_KEY is available); FMI fmisid 100968 = Helsinki-Vantaa;
     # JMA AMeDAS 44166 = Haneda; NEA S24 sits at the Changi climate station
     # coordinates (sensor identity provisional until calibration accepts it).
-    CityConfig(id="paris", metar_icao="LFPB", tz="Europe/Paris", market_terms=("paris",),
-               feed_source="meteofrance", feed_station_id="95088001",
-               feed_cadence_sec=360, metar_minutes=(0, 30)),
-    CityConfig(id="london", metar_icao="EGLC", tz="Europe/London", market_terms=("london",)),
+    CityConfig(
+        id="paris",
+        metar_icao="LFPB",
+        tz="Europe/Paris",
+        market_terms=("paris",),
+        feed_source="meteofrance",
+        feed_station_id="95088001",
+        feed_cadence_sec=360,
+        metar_minutes=(0, 30),
+    ),
+    CityConfig(
+        id="london", metar_icao="EGLC", tz="Europe/London", market_terms=("london",)
+    ),
     # weather.gov-resolving (WUNDERGROUND_EXEMPT) cities resolve on the routine
     # cycle only -> SPECIs are collected but must not trigger trades.
-    CityConfig(id="moscow", metar_icao="UUWW", tz="Europe/Moscow", market_terms=("moscow",),
-               include_speci=False),
-    CityConfig(id="milan", metar_icao="LIMC", tz="Europe/Rome", market_terms=("milan",)),
-    CityConfig(id="madrid", metar_icao="LEMD", tz="Europe/Madrid", market_terms=("madrid",)),
-    CityConfig(id="ankara", metar_icao="LTAC", tz="Europe/Istanbul", market_terms=("ankara",)),
-    CityConfig(id="istanbul", metar_icao="LTFM", tz="Europe/Istanbul", market_terms=("istanbul",),
-               include_speci=False),  # weather.gov, routine-only (see moscow)
-    CityConfig(id="helsinki", metar_icao="EFHK", tz="Europe/Helsinki", market_terms=("helsinki",),
-               feed_source="fmi", feed_station_id="100968",
-               feed_cadence_sec=600, metar_minutes=(20, 50)),
-    CityConfig(id="amsterdam", metar_icao="EHAM", tz="Europe/Amsterdam", market_terms=("amsterdam",),
-               feed_source="knmi", feed_station_id="06240",
-               feed_cadence_sec=600, metar_minutes=(25, 55)),
-    CityConfig(id="warsaw", metar_icao="EPWA", tz="Europe/Warsaw", market_terms=("warsaw",)),
-    CityConfig(id="munich", metar_icao="EDDM", tz="Europe/Berlin", market_terms=("munich",)),
+    CityConfig(
+        id="moscow",
+        metar_icao="UUWW",
+        tz="Europe/Moscow",
+        market_terms=("moscow",),
+        include_speci=False,
+    ),
+    CityConfig(
+        id="milan", metar_icao="LIMC", tz="Europe/Rome", market_terms=("milan",)
+    ),
+    CityConfig(
+        id="madrid", metar_icao="LEMD", tz="Europe/Madrid", market_terms=("madrid",)
+    ),
+    CityConfig(
+        id="ankara", metar_icao="LTAC", tz="Europe/Istanbul", market_terms=("ankara",)
+    ),
+    CityConfig(
+        id="istanbul",
+        metar_icao="LTFM",
+        tz="Europe/Istanbul",
+        market_terms=("istanbul",),
+        include_speci=False,
+    ),  # weather.gov, routine-only (see moscow)
+    CityConfig(
+        id="helsinki",
+        metar_icao="EFHK",
+        tz="Europe/Helsinki",
+        market_terms=("helsinki",),
+        feed_source="fmi",
+        feed_station_id="100968",
+        feed_cadence_sec=600,
+        metar_minutes=(20, 50),
+    ),
+    CityConfig(
+        id="amsterdam",
+        metar_icao="EHAM",
+        tz="Europe/Amsterdam",
+        market_terms=("amsterdam",),
+        feed_source="knmi",
+        feed_station_id="06240",
+        feed_cadence_sec=600,
+        metar_minutes=(25, 55),
+    ),
+    CityConfig(
+        id="warsaw", metar_icao="EPWA", tz="Europe/Warsaw", market_terms=("warsaw",)
+    ),
+    CityConfig(
+        id="munich", metar_icao="EDDM", tz="Europe/Berlin", market_terms=("munich",)
+    ),
     # Additional cities (Asia / Mideast / Africa / Americas). Each (icao, tz) pair
     # was verified against authoritative ICAO references so the running max comes
     # from the airport the market actually resolves on — a wrong station here is a
@@ -113,37 +156,118 @@ DEFAULT_CITIES: tuple[CityConfig, ...] = (
     # market_terms are tokens that appear in the hyphenated ASCII slug/title; for
     # accented names (são paulo) the term avoids the accent so it still matches.
     CityConfig(id="seoul", metar_icao="RKSI", tz="Asia/Seoul", market_terms=("seoul",)),
-    CityConfig(id="tokyo", metar_icao="RJTT", tz="Asia/Tokyo", market_terms=("tokyo",),
-               feed_source="jma", feed_station_id="44166",
-               feed_cadence_sec=600, metar_minutes=(0, 30)),
-    CityConfig(id="shanghai", metar_icao="ZSPD", tz="Asia/Shanghai", market_terms=("shanghai",)),
-    CityConfig(id="beijing", metar_icao="ZBAA", tz="Asia/Shanghai", market_terms=("beijing",)),
-    CityConfig(id="taipei", metar_icao="RCSS", tz="Asia/Taipei", market_terms=("taipei",)),
-    CityConfig(id="guangzhou", metar_icao="ZGGG", tz="Asia/Shanghai", market_terms=("guangzhou",)),
+    CityConfig(
+        id="tokyo",
+        metar_icao="RJTT",
+        tz="Asia/Tokyo",
+        market_terms=("tokyo",),
+        feed_source="jma",
+        feed_station_id="44166",
+        feed_cadence_sec=600,
+        metar_minutes=(0, 30),
+    ),
+    CityConfig(
+        id="shanghai", metar_icao="ZSPD", tz="Asia/Shanghai", market_terms=("shanghai",)
+    ),
+    CityConfig(
+        id="beijing", metar_icao="ZBAA", tz="Asia/Shanghai", market_terms=("beijing",)
+    ),
+    CityConfig(
+        id="taipei", metar_icao="RCSS", tz="Asia/Taipei", market_terms=("taipei",)
+    ),
+    CityConfig(
+        id="guangzhou",
+        metar_icao="ZGGG",
+        tz="Asia/Shanghai",
+        market_terms=("guangzhou",),
+    ),
     CityConfig(id="busan", metar_icao="RKPK", tz="Asia/Seoul", market_terms=("busan",)),
-    CityConfig(id="singapore", metar_icao="WSSS", tz="Asia/Singapore", market_terms=("singapore",),
-               feed_source="nea", feed_station_id="S24",
-               feed_cadence_sec=60, metar_minutes=(0, 30)),
-    CityConfig(id="chongqing", metar_icao="ZUCK", tz="Asia/Shanghai", market_terms=("chongqing",)),
-    CityConfig(id="qingdao", metar_icao="ZSQD", tz="Asia/Shanghai", market_terms=("qingdao",)),
-    CityConfig(id="chengdu", metar_icao="ZUUU", tz="Asia/Shanghai", market_terms=("chengdu",)),
-    CityConfig(id="wellington", metar_icao="NZWN", tz="Pacific/Auckland", market_terms=("wellington",)),
-    CityConfig(id="kuala_lumpur", metar_icao="WMKK", tz="Asia/Kuala_Lumpur", market_terms=("kuala",)),
-    CityConfig(id="lucknow", metar_icao="VILK", tz="Asia/Kolkata", market_terms=("lucknow",)),
+    CityConfig(
+        id="singapore",
+        metar_icao="WSSS",
+        tz="Asia/Singapore",
+        market_terms=("singapore",),
+        feed_source="nea",
+        feed_station_id="S24",
+        feed_cadence_sec=60,
+        metar_minutes=(0, 30),
+    ),
+    CityConfig(
+        id="chongqing",
+        metar_icao="ZUCK",
+        tz="Asia/Shanghai",
+        market_terms=("chongqing",),
+    ),
+    CityConfig(
+        id="qingdao", metar_icao="ZSQD", tz="Asia/Shanghai", market_terms=("qingdao",)
+    ),
+    CityConfig(
+        id="chengdu", metar_icao="ZUUU", tz="Asia/Shanghai", market_terms=("chengdu",)
+    ),
+    CityConfig(
+        id="wellington",
+        metar_icao="NZWN",
+        tz="Pacific/Auckland",
+        market_terms=("wellington",),
+    ),
+    CityConfig(
+        id="kuala_lumpur",
+        metar_icao="WMKK",
+        tz="Asia/Kuala_Lumpur",
+        market_terms=("kuala",),
+    ),
+    CityConfig(
+        id="lucknow", metar_icao="VILK", tz="Asia/Kolkata", market_terms=("lucknow",)
+    ),
     # WU resolves Shenzhen off HKO Lau Fau Shan (WMO 45035), not the ZGSZ airport
     # METAR — only read via HKO when the run passes --hko (else NOAA as normal).
-    CityConfig(id="shenzhen", metar_icao="ZGSZ", tz="Asia/Shanghai", market_terms=("shenzhen",),
-               resolution_hko_place="Lau Fau Shan"),
-    CityConfig(id="manila", metar_icao="RPLL", tz="Asia/Manila", market_terms=("manila",)),
-    CityConfig(id="wuhan", metar_icao="ZHHH", tz="Asia/Shanghai", market_terms=("wuhan",)),
-    CityConfig(id="karachi", metar_icao="OPKC", tz="Asia/Karachi", market_terms=("karachi",)),
-    CityConfig(id="jeddah", metar_icao="OEJN", tz="Asia/Riyadh", market_terms=("jeddah",)),
-    CityConfig(id="cape_town", metar_icao="FACT", tz="Africa/Johannesburg", market_terms=("cape town",)),
-    CityConfig(id="tel_aviv", metar_icao="LLBG", tz="Asia/Jerusalem", market_terms=("tel aviv",),
-               include_speci=False),  # weather.gov, routine-only (see moscow)
-    CityConfig(id="panama_city", metar_icao="MPMG", tz="America/Panama", market_terms=("panama",)),
-    CityConfig(id="sao_paulo", metar_icao="SBGR", tz="America/Sao_Paulo", market_terms=("paulo",)),
-    CityConfig(id="toronto", metar_icao="CYYZ", tz="America/Toronto", market_terms=("toronto",)),
+    CityConfig(
+        id="shenzhen",
+        metar_icao="ZGSZ",
+        tz="Asia/Shanghai",
+        market_terms=("shenzhen",),
+        resolution_hko_place="Lau Fau Shan",
+    ),
+    CityConfig(
+        id="manila", metar_icao="RPLL", tz="Asia/Manila", market_terms=("manila",)
+    ),
+    CityConfig(
+        id="wuhan", metar_icao="ZHHH", tz="Asia/Shanghai", market_terms=("wuhan",)
+    ),
+    CityConfig(
+        id="karachi", metar_icao="OPKC", tz="Asia/Karachi", market_terms=("karachi",)
+    ),
+    CityConfig(
+        id="jeddah", metar_icao="OEJN", tz="Asia/Riyadh", market_terms=("jeddah",)
+    ),
+    CityConfig(
+        id="cape_town",
+        metar_icao="FACT",
+        tz="Africa/Johannesburg",
+        market_terms=("cape town",),
+    ),
+    CityConfig(
+        id="tel_aviv",
+        metar_icao="LLBG",
+        tz="Asia/Jerusalem",
+        market_terms=("tel aviv",),
+        include_speci=False,
+    ),  # weather.gov, routine-only (see moscow)
+    CityConfig(
+        id="panama_city",
+        metar_icao="MPMG",
+        tz="America/Panama",
+        market_terms=("panama",),
+    ),
+    CityConfig(
+        id="sao_paulo",
+        metar_icao="SBGR",
+        tz="America/Sao_Paulo",
+        market_terms=("paulo",),
+    ),
+    CityConfig(
+        id="toronto", metar_icao="CYYZ", tz="America/Toronto", market_terms=("toronto",)
+    ),
 )
 
 
@@ -251,13 +375,21 @@ class Config:
     # they run for cities with ``resolution_hko_place`` set, i.e. Shenzhen, and
     # are off by default (enable with --calibrate or LFS_CALIBRATION=1).
     lfs_calibration: bool = False
-    hko_1min_poll_sec: float = 60.0   # HKO latest-1-min CSV poll cadence
-    twc_poll_sec: float = 60.0        # TWC timeseries row-version poll cadence
-    twc_api_key: str = ""             # TWC_API_KEY (the public wunderground.com
-                                      # frontend key works); empty -> HKO-only
-    twc_location: str = "ZGSZ:9:CN"   # TWC location id resolving to obs 45035
+    hko_1min_poll_sec: float = 60.0  # HKO latest-1-min CSV poll cadence
+    twc_poll_sec: float = 60.0  # TWC timeseries row-version poll cadence
+    twc_api_key: str = ""  # TWC_API_KEY (the public wunderground.com
+    # frontend key works); empty -> HKO-only
+    twc_location: str = "ZGSZ:9:CN"  # TWC location id resolving to obs 45035
     twc_daily_hkt: str = "00:30,09:00"  # daily-table capture times (HKT):
-                                      # first full table + revision-window guard
+    # first full table + revision-window guard
+    # --twc (L1 resolver feed): the CityWorker's running max reads CLOSED rows
+    # from twc_rows.jsonl. If the TWC poller produces nothing new for this many
+    # seconds the feed reports stale and the city halts (dead key / outage).
+    twc_resolver_stale_sec: float = 5400.0
+    # L2 lock-ahead shadow margin: an in-window HKO sample locks integer K only
+    # when temp_c - K >= this (covers rounding/conversion noise; tighten after
+    # the K2 rounding map is measured).
+    lock_ahead_margin_c: float = 0.3
     # Best-guess K2 rule the prediction shadow runs (half_up | half_even |
     # floor). Its measured hit rate is direct evidence for/against the rule.
     lfs_predict_rounding: str = "half_up"
@@ -303,7 +435,7 @@ class Config:
     # Feed-vs-METAR sensor noise (degC) used until calibration measures a
     # per-city value (CityConfig.sensor_sigma). Deliberately inflated.
     forecast_sensor_sigma_default: float = 0.3
-    mf_api_key: str = ""    # MF_API_KEY — Météo-France portail-api (paris)
+    mf_api_key: str = ""  # MF_API_KEY — Météo-France portail-api (paris)
     knmi_api_key: str = ""  # KNMI_API_KEY — KNMI Data Platform (amsterdam)
     # Daily rollover: re-arm risk and settle positions at this tz's midnight so
     # the bot runs unattended across days. daily_rearm=False disables it.
@@ -326,13 +458,17 @@ class Config:
         if self.lfs_predict_rounding not in ("half_up", "half_even", "floor"):
             raise ValueError("lfs_predict_rounding must be half_up, half_even or floor")
         if not (0.0 < self.kelly_fraction <= 0.5):
-            raise ValueError("kelly_fraction must be in (0, 0.5] — half-Kelly is the ceiling")
+            raise ValueError(
+                "kelly_fraction must be in (0, 0.5] — half-Kelly is the ceiling"
+            )
         if not (0.0 <= self.forecast_min_edge < 1.0):
             raise ValueError("forecast_min_edge must be in [0, 1)")
         if not (0.0 < self.forecast_p_cap <= 1.0):
             raise ValueError("forecast_p_cap must be in (0, 1]")
         if not (0 <= self.forecast_evening_start <= self.forecast_evening_end <= 24):
-            raise ValueError("forecast evening window must satisfy 0 <= start <= end <= 24")
+            raise ValueError(
+                "forecast evening window must satisfy 0 <= start <= end <= 24"
+            )
         if self.forecast_live and self.mode != "live":
             raise ValueError("forecast_live requires live mode")
 
@@ -386,6 +522,8 @@ class Config:
             "twc_api_key": str,
             "twc_location": str,
             "twc_daily_hkt": str,
+            "twc_resolver_stale_sec": float,
+            "lock_ahead_margin_c": float,
             "lfs_predict_rounding": str,
             "forecast": _as_bool,
             "forecast_live": _as_bool,

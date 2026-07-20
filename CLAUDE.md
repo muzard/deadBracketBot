@@ -49,9 +49,10 @@ python -m dead_bracket.main --forecast --balance 100   # + forecast path, paper 
 python -m dead_bracket.main --live --bankroll 40 --forecast                 # live dead path; forecast SIGNALS ONLY
 python -m dead_bracket.main --live --bankroll 40 --forecast --forecast-live # forecast live orders (human go/no-go!)
 TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate  # + Shenzhen calibration collectors
-python -m dead_bracket.tools.lfs_calibrate      # offline K1/K2/K3/ε report
+python -m dead_bracket.main --twc --no-trade shenzhen --calibrate  # Shenzhen L1 shadow: running max from the resolver's CLOSED rows + L2 lock-ahead shadow (key via .env)
+python -m dead_bracket.tools.lfs_calibrate      # offline K1/K2/K3/ε report + L1 stability + L2 hold rate
 python -m dead_bracket.tools.forecast_calibrate # offline sensor-σ/Brier/hold-rate report (the go/no-go input)
-python -m pytest                           # 355 tests; NO live network in tests
+python -m pytest                           # 372 tests; NO live network in tests
 ```
 Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feeds
 (+ keep worker there too). Keep it green.
@@ -86,14 +87,22 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feed
 - **METAR/resolver-only for RESOLUTION TRUTH.** Only the resolution-grade METAR
   running max may mark a bracket dead; decimal temps are rejected from
   `MetarFeed` (non-resolution). The sub-hourly national feeds (forecast path)
-  and the HKO/TWC calibration collectors are **signal/data-collection only**:
+  and the HKO 1-min calibration feed are **signal/data-collection only**:
   they must NEVER reach a `MetarFeed`, a running max, the dead-bracket logic,
-  or discovery. A forecast entry may only ever *anticipate* what the resolver
-  would confirm (NO-side below a predicted print) — never contradict it, and
-  never bet YES/day-max (spec non-goal). Don't import/extend
-  `weatherTrader/multipleCityPoller.py`. Shenzhen stays `no_trade` until the
-  LFS calibration acceptance gates pass (a human decision, see
-  `shenzhen_calibration_requirements.md`).
+  or discovery. **One deliberate exception (re-enable plan, 2026-07-08):**
+  under `--twc`, the CLOSED rows of the TWC timeseries — the literal table the
+  market resolves on — feed the running max via `TwcResolverFetcher` →
+  `metar_twc.jsonl`. That is not a sensor anticipating the resolver; it IS the
+  resolver, which is the whole point (L1). The still-open current-hour row and
+  every HKO/ZGSZ reading stay out of the trading path. A forecast entry may
+  only ever *anticipate* what the resolver would confirm (NO-side below a
+  predicted print) — never contradict it, and never bet YES/day-max (spec
+  non-goal). Don't import/extend `weatherTrader/multipleCityPoller.py`.
+  Shenzhen stays `no_trade` until the calibration acceptance gates AND the
+  re-enable plan's shadow gates (L1 closed-row stability, end-of-day
+  running-max-vs-WU-High agreement) pass — a human decision, see
+  `shenzhen_calibration_requirements.md` and
+  `data/shenzhen_reenable_plan_2026-07-08.md`.
 - **Forecast live orders are human-gated.** `--forecast` alone trades only in
   paper; in live mode it logs signals. Real forecast orders require the
   explicit `--forecast-live` flag, to be flipped only after the paper soak +

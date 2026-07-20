@@ -49,8 +49,9 @@ def load_readings(recs: list[dict]) -> list[dict]:
         temp = rec.get("temp_c")
         if t is None or temp is None:
             continue
-        out.append({"t": t, "temp": float(temp),
-                    "day": t.astimezone(HKT).date().isoformat()})
+        out.append(
+            {"t": t, "temp": float(temp), "day": t.astimezone(HKT).date().isoformat()}
+        )
     out.sort(key=lambda r: r["t"])
     return out
 
@@ -65,12 +66,14 @@ def load_rows(recs: list[dict]) -> list[dict]:
         if vt is None or fs is None:
             continue
         vt = int(vt)
-        out.append({
-            "vt": vt,
-            "temp": rec.get("temp"),
-            "first_seen": fs,
-            "day": datetime.fromtimestamp(vt, HKT).date().isoformat(),
-        })
+        out.append(
+            {
+                "vt": vt,
+                "temp": rec.get("temp"),
+                "first_seen": fs,
+                "day": datetime.fromtimestamp(vt, HKT).date().isoformat(),
+            }
+        )
     out.sort(key=lambda r: (r["vt"], r["first_seen"]))
     return out
 
@@ -103,23 +106,36 @@ def match_versions(rows: list[dict], readings: list[dict]) -> list[dict]:
         temp = int(temp)
         vt, first_seen = row["vt"], row["first_seen"]
         fs_epoch = first_seen.timestamp()
-        cands = [r for r in readings
-                 if vt <= r["t"].timestamp() <= fs_epoch
-                 and r["t"].timestamp() < vt + 3600
-                 and temp - 1 < r["temp"] < temp + 1]
-        res = {"vt": vt, "temp": temp, "first_seen": first_seen, "day": row["day"],
-               "matched": bool(cands)}
+        cands = [
+            r
+            for r in readings
+            if vt <= r["t"].timestamp() <= fs_epoch
+            and r["t"].timestamp() < vt + 3600
+            and temp - 1 < r["temp"] < temp + 1
+        ]
+        res = {
+            "vt": vt,
+            "temp": temp,
+            "first_seen": first_seen,
+            "day": row["day"],
+            "matched": bool(cands),
+        }
         if cands:
             match = max(cands, key=lambda r: r["t"])
-            near = {r["temp"] for r in cands
-                    if (match["t"] - r["t"]).total_seconds() <= 15 * 60}
-            res.update({
-                "basis_t": match["t"],
-                "basis_temp": match["temp"],
-                "minute": match["t"].astimezone(HKT).minute,
-                "latency_sec": (first_seen - match["t"]).total_seconds(),
-                "ambiguous": len(near) > 1,
-            })
+            near = {
+                r["temp"]
+                for r in cands
+                if (match["t"] - r["t"]).total_seconds() <= 15 * 60
+            }
+            res.update(
+                {
+                    "basis_t": match["t"],
+                    "basis_temp": match["temp"],
+                    "minute": match["t"].astimezone(HKT).minute,
+                    "latency_sec": (first_seen - match["t"]).total_seconds(),
+                    "ambiguous": len(near) > 1,
+                }
+            )
         out.append(res)
     return out
 
@@ -151,8 +167,11 @@ def k1_summary(matches: list[dict]) -> dict:
 def k2_pairs(matches: list[dict]) -> list[tuple[float, int]]:
     """Clean (0.1 °C matched reading, WU integer) pairs (unambiguous matches)."""
 
-    return [(m["basis_temp"], m["temp"]) for m in matches
-            if m["matched"] and not m.get("ambiguous")]
+    return [
+        (m["basis_temp"], m["temp"])
+        for m in matches
+        if m["matched"] and not m.get("ambiguous")
+    ]
 
 
 def infer_rounding(pairs: list[tuple[float, int]]) -> dict:
@@ -178,19 +197,27 @@ def infer_rounding(pairs: list[tuple[float, int]]) -> dict:
     elif len(fits) == 1 and x5:
         verdict = f"exact: {fits[0]}"
     else:
-        verdict = (f"consistent with {'/'.join(fits)}; "
-                   + ("boundary decided by x.5 cases" if x5 else
-                      "no x.5 case observed -> rule undetermined at the boundary"))
-    return {"pairs": len(pairs), "contradictions": {r: len(c) for r, c in contradictions.items()},
-            "contradiction_examples": {r: c[:5] for r, c in contradictions.items() if c},
-            "fits": fits, "x5_cases": x5, "verdict": verdict}
+        verdict = f"consistent with {'/'.join(fits)}; " + (
+            "boundary decided by x.5 cases"
+            if x5
+            else "no x.5 case observed -> rule undetermined at the boundary"
+        )
+    return {
+        "pairs": len(pairs),
+        "contradictions": {r: len(c) for r, c in contradictions.items()},
+        "contradiction_examples": {r: c[:5] for r, c in contradictions.items() if c},
+        "fits": fits,
+        "x5_cases": x5,
+        "verdict": verdict,
+    }
 
 
 # ---------------------------------------------------------------------------
 # K3 — what WU's daily "High Temp" is the max OF
 # ---------------------------------------------------------------------------
-def k3_compare(daily_recs: list[dict], rows: list[dict], readings: list[dict],
-               rule: str) -> list[dict]:
+def k3_compare(
+    daily_recs: list[dict], rows: list[dict], readings: list[dict], rule: str
+) -> list[dict]:
     """Per captured HKT day: WU High vs the three candidate maxima.
 
     ``wu_high`` prefers the LAST capture of the day (the 09:00 revision-window
@@ -219,17 +246,32 @@ def k3_compare(daily_recs: list[dict], rows: list[dict], readings: list[dict],
         max_final = max(final_by_vt.values()) if final_by_vt else None
         max_all = max(int(r["temp"]) for r in day_rows) if day_rows else None
         day_readings = [r for r in readings if r["day"] == day]
-        max_1min = (max(predict_wu_integer(r["temp"], rule) for r in day_readings)
-                    if day_readings else None)
+        max_1min = (
+            max(predict_wu_integer(r["temp"], rule) for r in day_readings)
+            if day_readings
+            else None
+        )
 
-        matches = [name for name, v in (("final_rows", max_final),
-                                        ("all_versions", max_all),
-                                        ("1min_rounded", max_1min))
-                   if v is not None and wu_high is not None and v == wu_high]
-        out.append({"day": day, "wu_high": wu_high,
-                    "wu_high_from": "max_temp" if max_temps else "max(final rows)",
-                    "max_final_rows": max_final, "max_all_versions": max_all,
-                    "max_1min_rounded": max_1min, "matches": matches})
+        matches = [
+            name
+            for name, v in (
+                ("final_rows", max_final),
+                ("all_versions", max_all),
+                ("1min_rounded", max_1min),
+            )
+            if v is not None and wu_high is not None and v == wu_high
+        ]
+        out.append(
+            {
+                "day": day,
+                "wu_high": wu_high,
+                "wu_high_from": "max_temp" if max_temps else "max(final rows)",
+                "max_final_rows": max_final,
+                "max_all_versions": max_all,
+                "max_1min_rounded": max_1min,
+                "matches": matches,
+            }
+        )
     return out
 
 
@@ -240,12 +282,17 @@ def k3_verdict(days: list[dict]) -> str:
     if not scored:
         return "no daily captures yet"
     # The discriminating days are those where the candidates DISAGREE.
-    discriminating = [d for d in scored
-                      if d["max_final_rows"] != d["max_all_versions"]
-                      or d["max_all_versions"] != d["max_1min_rounded"]]
+    discriminating = [
+        d
+        for d in scored
+        if d["max_final_rows"] != d["max_all_versions"]
+        or d["max_all_versions"] != d["max_1min_rounded"]
+    ]
     if not discriminating:
-        return (f"{len(scored)} day(s) logged but candidates never diverged — "
-                "K3 not yet discriminated (needs an intra-hour spike day)")
+        return (
+            f"{len(scored)} day(s) logged but candidates never diverged — "
+            "K3 not yet discriminated (needs an intra-hour spike day)"
+        )
     verdicts = []
     for d in discriminating:
         if "all_versions" in d["matches"] and "final_rows" not in d["matches"]:
@@ -296,8 +343,15 @@ def spike_sample_rate(readings: list[dict], rows: list[dict], rule: str) -> dict
         sampled = day_version_max.get(d, -999) >= n
         if not sampled:
             missed += 1
-        detail.append({"day": d, "t": r["t"].isoformat(), "temp": r["temp"],
-                       "integer": n, "sampled": sampled})
+        detail.append(
+            {
+                "day": d,
+                "t": r["t"].isoformat(),
+                "temp": r["temp"],
+                "integer": n,
+                "sampled": sampled,
+            }
+        )
     rate = (missed / crossings) if crossings else None
     return {"crossings": crossings, "missed": missed, "rate": rate, "detail": detail}
 
@@ -319,14 +373,23 @@ def coverage_by_day(readings: list[dict]) -> list[dict]:
     out = []
     for day, ts in sorted(by_day.items()):
         ts.sort()
-        gaps = [round((b - a).total_seconds() / 60.0)
-                for a, b in zip(ts, ts[1:]) if (b - a).total_seconds() > 0]
+        gaps = [
+            round((b - a).total_seconds() / 60.0)
+            for a, b in zip(ts, ts[1:])
+            if (b - a).total_seconds() > 0
+        ]
         modal = Counter(gaps).most_common(1)[0][0] if gaps else None
         expected = (1440 / modal) if modal else None
         cov = (100.0 * len(ts) / expected) if expected else None
-        out.append({"day": day, "count": len(ts), "modal_interval_min": modal,
-                    "coverage_pct": cov,
-                    "full": cov is not None and cov >= 99.0})
+        out.append(
+            {
+                "day": day,
+                "count": len(ts),
+                "modal_interval_min": modal,
+                "coverage_pct": cov,
+                "full": cov is not None and cov >= 99.0,
+            }
+        )
     return out
 
 
@@ -342,8 +405,10 @@ def health_summary(health_recs: list[dict]) -> dict:
     for name, rec in sorted(last.items()):
         polls, fails = rec.get("polls"), rec.get("failures")
         rate = (100.0 * fails / polls) if polls else None
-        out[name] = {**{k: v for k, v in rec.items() if k not in ("ts", "collector")},
-                     "failure_pct": rate}
+        out[name] = {
+            **{k: v for k, v in rec.items() if k not in ("ts", "collector")},
+            "failure_pct": rate,
+        }
     return out
 
 
@@ -352,26 +417,115 @@ def prediction_scorecard(eval_recs: list[dict]) -> dict:
     daily = [r for r in eval_recs if r.get("kind") == "daily_max"]
 
     def score(recs: list[dict]) -> dict:
-        scored = [r for r in recs
-                  if r.get("pred_temp") is not None and r.get("actual_temp") is not None]
+        scored = [
+            r
+            for r in recs
+            if r.get("pred_temp") is not None and r.get("actual_temp") is not None
+        ]
         hits = sum(1 for r in scored if r.get("hit"))
-        mae = (statistics.mean(abs(float(r["pred_temp"]) - float(r["actual_temp"]))
-                               for r in scored) if scored else None)
-        return {"n": len(scored), "hits": hits,
-                "hit_pct": 100.0 * hits / len(scored) if scored else None,
-                "mae": mae}
+        mae = (
+            statistics.mean(
+                abs(float(r["pred_temp"]) - float(r["actual_temp"])) for r in scored
+            )
+            if scored
+            else None
+        )
+        return {
+            "n": len(scored),
+            "hits": hits,
+            "hit_pct": 100.0 * hits / len(scored) if scored else None,
+            "mae": mae,
+        }
 
-    return {"rows": score(rows), "daily": score(daily),
-            "daily_detail": [{k: r.get(k) for k in
-                              ("hkt_date", "pred_temp", "actual_temp", "hit",
-                               "basis_minutes")} for r in daily]}
+    return {
+        "rows": score(rows),
+        "daily": score(daily),
+        "daily_detail": [
+            {
+                k: r.get(k)
+                for k in (
+                    "hkt_date",
+                    "pred_temp",
+                    "actual_temp",
+                    "hit",
+                    "basis_minutes",
+                )
+            }
+            for r in daily
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Tier-1 recommendation (δ margin, m sustain minutes) — or insufficient data
 # ---------------------------------------------------------------------------
-def recommend(k1: dict, k2: dict, k3verdict: str, eps: dict,
-              coverage: list[dict]) -> dict:
+def closed_row_stability(rows: list[dict]) -> dict:
+    """L1 shadow gate (a): do closed rows ever revise, and ever DOWNWARD?
+
+    A version whose ``first_seen`` is after its slot's close (vt + 1 h) is a
+    post-close revision. Downward temp revisions are the dangerous kind — a
+    bracket marked dead by a closed row that later un-deads. Counts per slot.
+    """
+
+    by_vt: dict[int, list[dict]] = {}
+    for r in rows:
+        by_vt.setdefault(r["vt"], []).append(r)
+    slots = post_close = downward = 0
+    examples: list[dict] = []
+    for vt, versions in sorted(by_vt.items()):
+        slots += 1
+        close = datetime.fromtimestamp(vt + 3600, timezone.utc)
+        prev_temp = None
+        revised = dropped = False
+        for v in versions:  # already (vt, first_seen)-sorted by load_rows
+            if v["first_seen"] > close and prev_temp is not None:
+                revised = True
+                if v.get("temp") is not None and v["temp"] < prev_temp:
+                    dropped = True
+                    if len(examples) < 10:
+                        examples.append(
+                            {
+                                "vt": vt,
+                                "from": prev_temp,
+                                "to": v["temp"],
+                                "seen": v["first_seen"].isoformat(),
+                            }
+                        )
+            if v.get("temp") is not None:
+                prev_temp = v["temp"]
+        post_close += int(revised)
+        downward += int(dropped)
+    return {
+        "slots": slots,
+        "post_close_revisions": post_close,
+        "downward_revisions": downward,
+        "downward_examples": examples,
+    }
+
+
+def lock_ahead_summary(lock_recs: list[dict]) -> dict:
+    """L2 shadow gate: >=50 scored lock-ahead events at >=98% hold rate."""
+
+    locks = sum(1 for r in lock_recs if r.get("kind") == "lock")
+    scores = [r for r in lock_recs if r.get("kind") == "score"]
+    scored = [r for r in scores if r.get("hold") is not None]
+    holds = sum(1 for r in scores if r.get("hold"))
+    misses = [r for r in scored if not r.get("hold")]
+    hold_pct = (100.0 * holds / len(scored)) if scored else None
+    return {
+        "locks": locks,
+        "scored": len(scored),
+        "holds": holds,
+        "unscoreable": len(scores) - len(scored),
+        "hold_pct": hold_pct,
+        "gate_pass": len(scored) >= 50 and (hold_pct or 0.0) >= 98.0,
+        "miss_examples": misses[:10],
+    }
+
+
+def recommend(
+    k1: dict, k2: dict, k3verdict: str, eps: dict, coverage: list[dict]
+) -> dict:
     full_days = sum(1 for d in coverage if d["full"])
     gates: list[str] = []
     if full_days < 3:
@@ -379,15 +533,20 @@ def recommend(k1: dict, k2: dict, k3verdict: str, eps: dict,
     if k1["versions"] == 0 or k1["matched_pct"] < 95.0:
         gates.append(f"K1 match rate {k1['matched_pct']:.1f}% (need >= 95%)")
     if k2["pairs"] < 30 or not k2["fits"]:
-        gates.append(f"K2: {k2['pairs']} pairs, fits={k2['fits']} "
-                     "(need >= 30 pairs with a zero-contradiction rule)")
-    if "consistent" not in k3verdict and "count" not in k3verdict and "only" not in k3verdict:
+        gates.append(
+            f"K2: {k2['pairs']} pairs, fits={k2['fits']} "
+            "(need >= 30 pairs with a zero-contradiction rule)"
+        )
+    if (
+        "consistent" not in k3verdict
+        and "count" not in k3verdict
+        and "only" not in k3verdict
+    ):
         gates.append(f"K3 unanswered: {k3verdict}")
     if eps["crossings"] == 0:
         gates.append("epsilon: no integer crossings observed yet")
     if gates:
-        return {"status": "insufficient data", "gates": gates,
-                "delta": None, "m": None}
+        return {"status": "insufficient data", "gates": gates, "delta": None, "m": None}
 
     # δ: the K2 boundary decides it. With the rule exact incl. x.5 the only
     # margin needed is instrument noise (0.2-0.3 °C); undetermined boundary
@@ -402,7 +561,11 @@ def recommend(k1: dict, k2: dict, k3verdict: str, eps: dict,
         basis = "all-versions: m outlives p95 ingestion latency"
     else:
         minutes = sorted(k1["minute_histogram"])
-        grid = (max(minutes) - min(minutes)) // max(1, len(minutes) - 1) if len(minutes) > 1 else 10
+        grid = (
+            (max(minutes) - min(minutes)) // max(1, len(minutes) - 1)
+            if len(minutes) > 1
+            else 10
+        )
         m = max(10, grid, p95_min + 1)
         basis = "final-rows-only: m spans the sample grid to the hour's last sample"
     return {"status": "ok", "gates": [], "delta": delta, "m": m, "basis": basis}
@@ -419,8 +582,18 @@ def _fmt(v, nd: int = 1) -> str:
     return str(v)
 
 
-def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
-                 health_recs, rule: str, generated: Optional[datetime] = None) -> str:
+def build_report(
+    *,
+    city: str,
+    readings,
+    rows,
+    daily_recs,
+    eval_recs,
+    health_recs,
+    rule: str,
+    lock_recs=None,
+    generated: Optional[datetime] = None,
+) -> str:
     generated = generated or datetime.now(timezone.utc)
     matches = match_versions(rows, readings)
     k1 = k1_summary(matches)
@@ -432,14 +605,18 @@ def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
     health = health_summary(health_recs)
     pred = prediction_scorecard(eval_recs)
     rec = recommend(k1, k2, k3v, eps, cov)
+    stability = closed_row_stability(rows)
+    lock = lock_ahead_summary(lock_recs or [])
 
     L: list[str] = []
     L.append(f"# LFS calibration report — {city} — {generated.date().isoformat()}")
     L.append("")
-    L.append(f"Generated {generated.isoformat(timespec='seconds')} from "
-             f"{len(readings)} 1-min readings, {len(rows)} TWC row versions, "
-             f"{len(daily_recs)} daily captures, {len(eval_recs)} prediction evals. "
-             f"Predictor rounding rule under test: `{rule}`.")
+    L.append(
+        f"Generated {generated.isoformat(timespec='seconds')} from "
+        f"{len(readings)} 1-min readings, {len(rows)} TWC row versions, "
+        f"{len(daily_recs)} daily captures, {len(eval_recs)} prediction evals. "
+        f"Predictor rounding rule under test: `{rule}`."
+    )
     L.append("")
 
     L.append("## Data coverage")
@@ -447,8 +624,10 @@ def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
     L.append("| HKT day | readings | modal grid (min) | coverage | full? |")
     L.append("|---|---|---|---|---|")
     for d in cov:
-        L.append(f"| {d['day']} | {d['count']} | {_fmt(d['modal_interval_min'])} | "
-                 f"{_fmt(d['coverage_pct'])}% | {'yes' if d['full'] else 'no'} |")
+        L.append(
+            f"| {d['day']} | {d['count']} | {_fmt(d['modal_interval_min'])} | "
+            f"{_fmt(d['coverage_pct'])}% | {'yes' if d['full'] else 'no'} |"
+        )
     if not cov:
         L.append("| (none) | | | | |")
     L.append("")
@@ -456,23 +635,33 @@ def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
         L.append("Collector health (cumulative):")
         L.append("")
         for name, h in health.items():
-            L.append(f"- `{name}`: " + ", ".join(f"{k}={_fmt(v)}" for k, v in h.items()))
+            L.append(
+                f"- `{name}`: " + ", ".join(f"{k}={_fmt(v)}" for k, v in h.items())
+            )
         L.append("")
 
     L.append("## K1 — sample grid + ingestion latency")
     L.append("")
-    L.append(f"- Row versions scored: {k1['versions']}, matched: {k1['matched']} "
-             f"({_fmt(k1['matched_pct'])}%), ambiguous (K2-excluded): {k1['ambiguous']}")
-    L.append(f"- Latency (first-seen - matched reading, upper bound): "
-             f"p50 {_fmt(k1['latency_p50_sec'], 0)}s, p95 {_fmt(k1['latency_p95_sec'], 0)}s")
-    L.append(f"- Sampled minute-of-hour histogram: {k1['minute_histogram'] or '(empty)'}")
+    L.append(
+        f"- Row versions scored: {k1['versions']}, matched: {k1['matched']} "
+        f"({_fmt(k1['matched_pct'])}%), ambiguous (K2-excluded): {k1['ambiguous']}"
+    )
+    L.append(
+        f"- Latency (first-seen - matched reading, upper bound): "
+        f"p50 {_fmt(k1['latency_p50_sec'], 0)}s, p95 {_fmt(k1['latency_p95_sec'], 0)}s"
+    )
+    L.append(
+        f"- Sampled minute-of-hour histogram: {k1['minute_histogram'] or '(empty)'}"
+    )
     L.append("")
     L.append(f"> {JOIN_DOC}")
     L.append("")
 
     L.append("## K2 — rounding rule (0.1 °C -> WU integer)")
     L.append("")
-    L.append(f"- Clean pairs: {k2['pairs']}; contradictions per rule: {k2['contradictions']}")
+    L.append(
+        f"- Clean pairs: {k2['pairs']}; contradictions per rule: {k2['contradictions']}"
+    )
     if k2["contradiction_examples"]:
         L.append(f"- Contradiction examples: {k2['contradiction_examples']}")
     L.append(f"- x.5 cases observed: {k2['x5_cases'] or 'none'}")
@@ -481,12 +670,16 @@ def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
 
     L.append("## K3 — what the daily High is the max of")
     L.append("")
-    L.append("| HKT day | WU High (from) | max(final rows) | max(all versions) | max(1-min rounded) | High matches |")
+    L.append(
+        "| HKT day | WU High (from) | max(final rows) | max(all versions) | max(1-min rounded) | High matches |"
+    )
     L.append("|---|---|---|---|---|---|")
     for d in k3days:
-        L.append(f"| {d['day']} | {_fmt(d['wu_high'])} ({d['wu_high_from']}) | "
-                 f"{_fmt(d['max_final_rows'])} | {_fmt(d['max_all_versions'])} | "
-                 f"{_fmt(d['max_1min_rounded'])} | {', '.join(d['matches']) or '--'} |")
+        L.append(
+            f"| {d['day']} | {_fmt(d['wu_high'])} ({d['wu_high_from']}) | "
+            f"{_fmt(d['max_final_rows'])} | {_fmt(d['max_all_versions'])} | "
+            f"{_fmt(d['max_1min_rounded'])} | {', '.join(d['matches']) or '--'} |"
+        )
     if not k3days:
         L.append("| (no daily captures yet) | | | | | |")
     L.append("")
@@ -495,26 +688,64 @@ def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
 
     L.append("## ε — spike-never-sampled rate")
     L.append("")
-    L.append(f"- Upward integer crossings on the 1-min feed: {eps['crossings']}; "
-             f"never reached any row version: {eps['missed']} "
-             f"-> ε = {_fmt(eps['rate'], 3) if eps['rate'] is not None else '--'} "
-             f"({eps['missed']}/{eps['crossings']})")
+    L.append(
+        f"- Upward integer crossings on the 1-min feed: {eps['crossings']}; "
+        f"never reached any row version: {eps['missed']} "
+        f"-> ε = {_fmt(eps['rate'], 3) if eps['rate'] is not None else '--'} "
+        f"({eps['missed']}/{eps['crossings']})"
+    )
     misses = [d for d in eps["detail"] if not d["sampled"]]
     if misses:
         L.append(f"- Missed crossings: {misses}")
     L.append("")
 
+    L.append("## L1 — closed-row stability (re-enable plan shadow gate a)")
+    L.append("")
+    L.append(
+        f"- Slots observed: {stability['slots']}; revised post-close: "
+        f"{stability['post_close_revisions']}; revised DOWNWARD post-close: "
+        f"**{stability['downward_revisions']}**"
+    )
+    if stability["downward_examples"]:
+        L.append(f"- Downward examples: {stability['downward_examples']}")
+    L.append(
+        "- Gate: downward post-close revisions should be ~0 before L1 "
+        "trades at full size (an upward revision only helps a NO buyer)."
+    )
+    L.append("")
+
+    L.append("## L2 — lock-ahead shadow (re-enable plan gate 3)")
+    L.append("")
+    L.append(
+        f"- Locks: {lock['locks']}; scored: {lock['scored']}; holds: "
+        f"{lock['holds']} ({_fmt(lock['hold_pct'])}%); unscoreable: "
+        f"{lock['unscoreable']}"
+    )
+    if lock["miss_examples"]:
+        L.append(f"- Misses: {lock['miss_examples']}")
+    L.append(
+        f"- Gate (>= 50 scored at >= 98% hold): "
+        f"**{'PASS' if lock['gate_pass'] else 'not yet'}**"
+    )
+    L.append("")
+
     L.append("## Prediction scorecard (our WU estimate vs WU's publication)")
     L.append("")
     r, d = pred["rows"], pred["daily"]
-    L.append(f"- Hourly rows: {r['n']} scored, {r['hits']} hits "
-             f"({_fmt(r['hit_pct'])}%), MAE {_fmt(r['mae'], 2)} °C")
-    L.append(f"- Daily max: {d['n']} scored, {d['hits']} hits "
-             f"({_fmt(d['hit_pct'])}%), MAE {_fmt(d['mae'], 2)} °C")
+    L.append(
+        f"- Hourly rows: {r['n']} scored, {r['hits']} hits "
+        f"({_fmt(r['hit_pct'])}%), MAE {_fmt(r['mae'], 2)} °C"
+    )
+    L.append(
+        f"- Daily max: {d['n']} scored, {d['hits']} hits "
+        f"({_fmt(d['hit_pct'])}%), MAE {_fmt(d['mae'], 2)} °C"
+    )
     for row in pred["daily_detail"]:
-        L.append(f"  - {row['hkt_date']}: predicted {row['pred_temp']} vs actual "
-                 f"{row['actual_temp']} ({'HIT' if row['hit'] else 'MISS'}; "
-                 f"basis {row['basis_minutes']} readings)")
+        L.append(
+            f"  - {row['hkt_date']}: predicted {row['pred_temp']} vs actual "
+            f"{row['actual_temp']} ({'HIT' if row['hit'] else 'MISS'}; "
+            f"basis {row['basis_minutes']} readings)"
+        )
     L.append("")
 
     L.append("## Acceptance checklist")
@@ -522,15 +753,26 @@ def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
     full_days = sum(1 for c in cov if c["full"])
     checks = [
         (full_days >= 3, f">= 3 full HKT days logged (have {full_days}, target 5)"),
-        (all((h.get('failure_pct') or 0) < 1.0 for h in health.values()) if health else False,
-         "< 1% missed polls per collector"),
-        (k1["matched_pct"] >= 95.0 and k1["versions"] > 0,
-         f"K1 >= 95% versions matched (have {_fmt(k1['matched_pct'])}%)"),
-        (k2["pairs"] >= 30 and len(k2["fits"]) >= 1
-         and min(k2["contradictions"].values() or [1]) == 0,
-         f"K2 rule exact on >= 30 pairs, zero contradictions (have {k2['pairs']} pairs)"),
-        ("consistent" in k3v or "count" in k3v or "only" in k3v,
-         f"K3 answered consistently ({k3v})"),
+        (
+            all((h.get("failure_pct") or 0) < 1.0 for h in health.values())
+            if health
+            else False,
+            "< 1% missed polls per collector",
+        ),
+        (
+            k1["matched_pct"] >= 95.0 and k1["versions"] > 0,
+            f"K1 >= 95% versions matched (have {_fmt(k1['matched_pct'])}%)",
+        ),
+        (
+            k2["pairs"] >= 30
+            and len(k2["fits"]) >= 1
+            and min(k2["contradictions"].values() or [1]) == 0,
+            f"K2 rule exact on >= 30 pairs, zero contradictions (have {k2['pairs']} pairs)",
+        ),
+        (
+            "consistent" in k3v or "count" in k3v or "only" in k3v,
+            f"K3 answered consistently ({k3v})",
+        ),
         (eps["crossings"] > 0, "epsilon measured with a real numerator/denominator"),
     ]
     for ok, label in checks:
@@ -540,10 +782,14 @@ def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
     L.append("## Tier-1 recommendation")
     L.append("")
     if rec["status"] == "ok":
-        L.append(f"- δ (margin) = **{rec['delta']} °C**, m (sustain) = "
-                 f"**{rec['m']} min** — {rec['basis']}")
-        L.append("- Re-enabling Shenzhen is the operator's decision, not the "
-                 "bot's: review the checklist above first.")
+        L.append(
+            f"- δ (margin) = **{rec['delta']} °C**, m (sustain) = "
+            f"**{rec['m']} min** — {rec['basis']}"
+        )
+        L.append(
+            "- Re-enabling Shenzhen is the operator's decision, not the "
+            "bot's: review the checklist above first."
+        )
     else:
         L.append("**Insufficient data.** Open gates:")
         for g in rec["gates"]:
@@ -555,14 +801,21 @@ def build_report(*, city: str, readings, rows, daily_recs, eval_recs,
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         prog="lfs_calibrate",
-        description="Offline K1/K2/K3/epsilon analysis of the LFS calibration logs.")
+        description="Offline K1/K2/K3/epsilon analysis of the LFS calibration logs.",
+    )
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--city", default="shenzhen")
-    ap.add_argument("--rounding", default="half_up",
-                    choices=("half_up", "half_even", "floor"),
-                    help="K2 rule used for the 1-min-derived maxima/crossings")
-    ap.add_argument("--out", default=None,
-                    help="report path (default data/<city>/calibration_report_<date>.md)")
+    ap.add_argument(
+        "--rounding",
+        default="half_up",
+        choices=("half_up", "half_even", "floor"),
+        help="K2 rule used for the 1-min-derived maxima/crossings",
+    )
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="report path (default data/<city>/calibration_report_<date>.md)",
+    )
     args = ap.parse_args(argv)
 
     city_dir = os.path.join(args.data_dir, args.city)
@@ -571,12 +824,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     daily_recs = read_jsonl(os.path.join(city_dir, "twc_daily.jsonl"))
     eval_recs = read_jsonl(os.path.join(city_dir, "prediction_eval.jsonl"))
     health_recs = read_jsonl(os.path.join(city_dir, "collector_health.jsonl"))
+    lock_recs = read_jsonl(os.path.join(city_dir, "lock_ahead.jsonl"))
 
-    report = build_report(city=args.city, readings=readings, rows=rows,
-                          daily_recs=daily_recs, eval_recs=eval_recs,
-                          health_recs=health_recs, rule=args.rounding)
+    report = build_report(
+        city=args.city,
+        readings=readings,
+        rows=rows,
+        daily_recs=daily_recs,
+        eval_recs=eval_recs,
+        health_recs=health_recs,
+        rule=args.rounding,
+        lock_recs=lock_recs,
+    )
     out = args.out or os.path.join(
-        city_dir, f"calibration_report_{datetime.now(timezone.utc).date().isoformat()}.md")
+        city_dir,
+        f"calibration_report_{datetime.now(timezone.utc).date().isoformat()}.md",
+    )
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(report)

@@ -117,6 +117,11 @@ POLY_PRIVATE_KEY=... python -m dead_bracket.main --live --bankroll 40 --forecast
 # Shenzhen calibration run (data collection + prediction shadow, no orders):
 TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate
 
+# Shenzhen L1 shadow (re-enable plan): running max from the resolver's own
+# CLOSED rows + the L2 lock-ahead shadow. Still no orders (--no-trade).
+# TWC_API_KEY can live in a git-ignored .env at the repo root instead:
+python -m dead_bracket.main --twc --no-trade shenzhen --calibrate
+
 # Offline analysis of the collected calibration data (run any time):
 python -m dead_bracket.tools.lfs_calibrate --data-dir data --city shenzhen
 python -m dead_bracket.tools.forecast_calibrate --data-dir data
@@ -202,7 +207,15 @@ per-day):
   api.weather.com cache is `s-maxage=300` and 400s on unknown params, so the
   fetch cache-busts by **rotating `hours=2..7`** (each value is its own cache
   entry; a repeat only comes around after the TTL). `transaction_id` repeats
-  are counted as `stale_responses`.
+  are counted as `stale_responses`, and a payload whose newest row is older
+  than 3 h is **rejected outright** (the API has served days-old cached
+  responses; rejected payloads never reach this file, which `--twc` treats as
+  resolver truth).
+- `lock_ahead.jsonl` — the **L2 lock-ahead shadow** (re-enable plan gate 3):
+  a `lock` row whenever an HKO reading in [h:35, h:55] clears an integer with
+  ≥ `LOCK_AHEAD_MARGIN_C` (default 0.3), and a `score` row once the hour
+  closes (+5 min grace) — did the row finalize at/above the locked value? The
+  gate is ≥50 scored events at ≥98% hold rate.
 - `twc_daily.jsonl` — the previous HKT day's final table, captured at 00:30
   and 09:00 HKT (`TWC_DAILY_HKT`), rows + any `max_temp` summary fields.
 - `predictions.jsonl` / `prediction_eval.jsonl` — the **prediction shadow**:
@@ -212,11 +225,40 @@ per-day):
   predicted vs printed. The hit rate is direct evidence for/against the
   K1/K2/K3 assumptions before any capital touches them.
 - `collector_health.jsonl` — cumulative poll/failure counters (the <1%-missed
-  acceptance criterion).
+  acceptance criterion) + per-collector `stalled` flags. Failure counters are
+  blind to **source-side** gaps (a 90-min hko outage once logged `failures: 0`
+  — the CSV kept serving, just nothing new), so the worker also raises a
+  `staleness_alarm` event/notice when a collector produces no NEW record for
+  25 min (hko_1min) / 75 min (twc_rows), and a `staleness_recovered` when it
+  resumes.
 
 The TWC endpoints need `TWC_API_KEY` (the public wunderground.com frontend key
-works); without it only the HKO collector runs. Collector status goes to
+works); without it only the HKO collector runs. The key can live in a
+git-ignored `.env` at the repo root (`KEY=VALUE` lines, loaded at startup;
+real environment variables always win). Collector status goes to
 stderr/`events.jsonl` — stdout stays the pure trade stream.
+
+### `--twc`: the L1 resolver feed (Shenzhen re-enable plan)
+
+`--twc` switches a TWC/WU-resolved city's running max onto the **closed rows
+of the resolver's own timeseries** — the literal content the market settles
+on, so there is no station/sampling/rounding seam left at all. Mechanics: the
+calibration worker (required: `--calibrate` + `TWC_API_KEY`) is the process's
+single TWC poller and writes `twc_rows.jsonl`; a file-driven
+`TwcResolverFetcher` replays each hour's latest version **only after the hour
+closes** as a synthesized METAR (`metar_twc.jsonl`, temp = TWC's own integer)
+into the standard `MetarFeed` → running max → dead-bracket path. The
+still-revising current-hour row can never mark a bracket dead (the July 8
+near-miss class). If the poller goes quiet past `TWC_RESOLVER_STALE_SEC`
+(default 90 min) the feed reports stale and the city halts. `--twc` takes
+precedence over `--hko`; under it, ZGSZ METAR and HKO rhrread are **out of the
+trading path entirely** (`metar_hko.jsonl` is a deprecated trading source —
+it samples h:00 and disagrees with WU on ~45% of rows; HKO 1-min data remains
+as calibration/forecast signal only). Rollout per
+`data/shenzhen_reenable_plan_2026-07-08.md`: run `--twc --no-trade shenzhen`
+for 3–5 shadow days, check the calibration report's **L1 closed-row
+stability** and **L2 lock-ahead** sections, then dropping `--no-trade` is the
+operator's call.
 
 `python -m dead_bracket.tools.lfs_calibrate` writes
 `data/shenzhen/calibration_report_<date>.md`: K1 join (documented logic +

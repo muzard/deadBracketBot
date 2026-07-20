@@ -23,8 +23,10 @@ convention: all network code lives there). Files land under ``data/<city>/``
 - ``twc_daily.jsonl``         the previous HKT day's final table (00:30 + 09:00 HKT)
 - ``predictions.jsonl``       our best-guess WU row value + daily max, as formed
 - ``prediction_eval.jsonl``   prediction vs actual, one row per scoreable publish
+- ``lock_ahead.jsonl``        L2 shadow: in-window locks + their scores against
+  the row the hour finalized as (re-enable plan gate 3)
 - ``collector_health.jsonl``  cumulative poll/failure counters (the "<1% missed
-  polls" acceptance criterion needs a denominator)
+  polls" acceptance criterion needs a denominator) + per-collector stall flags
 
 Offline analysis: ``python -m dead_bracket.tools.lfs_calibrate``.
 """
@@ -48,8 +50,16 @@ HKT = timezone(timedelta(hours=8), name="HKT")
 # The TWC observation fields that form a row's VERSION identity. Temperature is
 # often flat for hours; pressure (0.1 hPa) and rh are the change detectors that
 # reveal a row being re-sampled even when temp doesn't move.
-TWC_VERSION_FIELDS = ("temp", "dewPt", "rh", "pressure", "wdir", "wspd", "gust",
-                      "precip_total")
+TWC_VERSION_FIELDS = (
+    "temp",
+    "dewPt",
+    "rh",
+    "pressure",
+    "wdir",
+    "wspd",
+    "gust",
+    "precip_total",
+)
 # What the daily capture keeps per final row (the full TWC row is ~40 mostly-
 # marine fields; keep the version tuple + the summary max/min).
 TWC_DAILY_FIELDS = ("valid_time_gmt",) + TWC_VERSION_FIELDS + ("max_temp", "min_temp")
@@ -101,7 +111,7 @@ class Hko1MinReading:
     it must never feed a MetarFeed / running max (decimal = non-resolution).
     """
 
-    obs_time_raw: str      # as published, e.g. "202607072150" (HKT, yyyyMMddHHmm)
+    obs_time_raw: str  # as published, e.g. "202607072150" (HKT, yyyyMMddHHmm)
     obs_time_utc: datetime
     temp_c: float
 
@@ -135,9 +145,11 @@ def parse_hko_1min_csv(text: Optional[str], station: str) -> Optional[Hko1MinRea
             except ValueError:
                 return None  # station present but reading is N/A
             local = datetime.strptime(dt_raw, "%Y%m%d%H%M").replace(tzinfo=HKT)
-            return Hko1MinReading(obs_time_raw=dt_raw,
-                                  obs_time_utc=local.astimezone(timezone.utc),
-                                  temp_c=temp)
+            return Hko1MinReading(
+                obs_time_raw=dt_raw,
+                obs_time_utc=local.astimezone(timezone.utc),
+                temp_c=temp,
+            )
     except (csv.Error, ValueError):
         return None
     return None
@@ -153,14 +165,20 @@ class Hko1MinCollector:
     None) so tests run with canned strings and no network.
     """
 
-    def __init__(self, *, fetch: Callable[[], Optional[str]], station: str,
-                 path: str, clock: Callable[[], datetime] = utcnow) -> None:
+    def __init__(
+        self,
+        *,
+        fetch: Callable[[], Optional[str]],
+        station: str,
+        path: str,
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
         self._fetch = fetch
         self._station = station
         self._path = path
         self._clock = clock
         self.polls = 0
-        self.failures = 0        # fetch/parse failures (the missed-poll numerator)
+        self.failures = 0  # fetch/parse failures (the missed-poll numerator)
         self.new_records = 0
         self._last_raw: Optional[str] = None
         self._last_utc: Optional[datetime] = None
@@ -229,15 +247,22 @@ class TwcRowCollector:
     versions are re-seeded from the file.
     """
 
-    def __init__(self, *, fetch: Callable[[], Optional[dict]], path: str,
-                 clock: Callable[[], datetime] = utcnow) -> None:
+    def __init__(
+        self,
+        *,
+        fetch: Callable[[], Optional[dict]],
+        path: str,
+        freshness_max_sec: float = 10800.0,
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
         self._fetch = fetch
         self._path = path
+        self._freshness_max_sec = freshness_max_sec
         self._clock = clock
         self.polls = 0
         self.failures = 0
         self.new_records = 0
-        self.stale_responses = 0  # same transaction_id twice in a row
+        self.stale_responses = 0  # repeated transaction_id OR rejected-stale payload
         self._last_txn: Optional[str] = None
         self._last: dict[int, tuple] = {}
         for rec in read_jsonl(path):  # restart-safe version seed
@@ -258,6 +283,21 @@ class TwcRowCollector:
         if txn is not None and txn == self._last_txn:
             self.stale_responses += 1  # cache-bust not working; analysis will see it
         self._last_txn = txn
+        # Freshness rejection (re-enable plan, L1): the API has served responses
+        # DAYS old (observed live 2026-07-08). A payload whose newest row is
+        # older than ``freshness_max_sec`` is rejected outright — its rows must
+        # never enter twc_rows.jsonl, which downstream (TwcResolverFetcher)
+        # treats as resolver truth. The next poll's rotated cache key retries.
+        obs_list = payload.get("observations") or []
+        vts = []
+        for ob in obs_list:
+            try:
+                vts.append(int(ob.get("valid_time_gmt")))
+            except (TypeError, ValueError):
+                continue
+        if vts and (self._clock().timestamp() - max(vts)) > self._freshness_max_sec:
+            self.stale_responses += 1
+            return []
         now_iso = self._clock().isoformat()
         new: list[dict] = []
         for ob in payload.get("observations") or []:
@@ -269,8 +309,11 @@ class TwcRowCollector:
             if self._last.get(vt) == tup:
                 continue  # same version -> nothing new for this slot
             self._last[vt] = tup
-            rec = {"first_seen_ts": now_iso, "valid_time_gmt": vt,
-                   **{f: ob.get(f) for f in TWC_VERSION_FIELDS}}
+            rec = {
+                "first_seen_ts": now_iso,
+                "valid_time_gmt": vt,
+                **{f: ob.get(f) for f in TWC_VERSION_FIELDS},
+            }
             append_jsonl(self._path, rec)
             new.append(rec)
         self.new_records += len(new)
@@ -292,9 +335,14 @@ class TwcDailyCollector:
     poll; the slot is marked done only on success. Restart-safe via the file.
     """
 
-    def __init__(self, *, fetch: Callable[[str], Optional[dict]], path: str,
-                 capture_hkt: tuple[str, ...] = ("00:30", "09:00"),
-                 clock: Callable[[], datetime] = utcnow) -> None:
+    def __init__(
+        self,
+        *,
+        fetch: Callable[[str], Optional[dict]],
+        path: str,
+        capture_hkt: tuple[str, ...] = ("00:30", "09:00"),
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
         self._fetch = fetch  # takes the target day as "yyyyMMdd"
         self._path = path
         self._clock = clock
@@ -388,17 +436,22 @@ class WuPredictor:
     re-emits an unchanged prediction row.
     """
 
-    def __init__(self, *, pred_path: str, eval_path: str,
-                 rounding: str = "half_up",
-                 seed_hko_path: Optional[str] = None,
-                 clock: Callable[[], datetime] = utcnow) -> None:
+    def __init__(
+        self,
+        *,
+        pred_path: str,
+        eval_path: str,
+        rounding: str = "half_up",
+        seed_hko_path: Optional[str] = None,
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
         self._pred_path = pred_path
         self._eval_path = eval_path
         self._rounding = rounding
         self._clock = clock
         self._readings: list[Hko1MinReading] = []  # pruned to the last 48 h
-        self._daily_max: dict[str, int] = {}       # HKT date -> predicted High
-        self._daily_count: dict[str, int] = {}     # HKT date -> readings absorbed
+        self._daily_max: dict[str, int] = {}  # HKT date -> predicted High
+        self._daily_count: dict[str, int] = {}  # HKT date -> readings absorbed
         self._last_pred: Optional[tuple] = None
         self.row_evals = 0
         self.row_hits = 0
@@ -410,7 +463,8 @@ class WuPredictor:
                     reading = Hko1MinReading(
                         obs_time_raw=str(rec["obs_time_raw"]),
                         obs_time_utc=datetime.fromisoformat(str(rec["obs_time_utc"])),
-                        temp_c=float(rec["temp_c"]))
+                        temp_c=float(rec["temp_c"]),
+                    )
                 except (KeyError, ValueError):
                     continue
                 pred_row, daily, _day, hour_epoch = self._absorb(reading)
@@ -482,10 +536,12 @@ class WuPredictor:
             first_seen = self._clock()
         vt = int(vt)
         candidates = [r for r in self._readings if r.obs_time_utc <= first_seen]
-        in_hour = [r for r in candidates
-                   if vt <= r.obs_time_utc.timestamp() < vt + 3600]
-        pool = in_hour or [r for r in candidates
-                           if (first_seen - r.obs_time_utc) <= timedelta(hours=2)]
+        in_hour = [
+            r for r in candidates if vt <= r.obs_time_utc.timestamp() < vt + 3600
+        ]
+        pool = in_hour or [
+            r for r in candidates if (first_seen - r.obs_time_utc) <= timedelta(hours=2)
+        ]
         if not pool:
             return None
         basis = max(pool, key=lambda r: r.obs_time_utc)
@@ -544,6 +600,144 @@ class WuPredictor:
 
 
 # ---------------------------------------------------------------------------
+# L2 lock-ahead shadow — re-enable plan gate 3 (>=50 events, >=98% hold rate)
+# ---------------------------------------------------------------------------
+class LockAheadShadow:
+    """Shadow-scores the L2 hypothesis: the HKO sample landing in [h:35, h:55]
+    is (to rounding, with margin) what the TWC row for hour h finalizes as.
+
+    A LOCK fires when an in-window 1-min reading clears an integer with margin:
+    ``locked_min_row = floor(temp_c - margin)`` is the highest K for which the
+    claim "the final row will print >= K" is made (trading translation: every
+    bracket B with B+1 <= K is dead). One lock per slot per K level — a later
+    in-window reading that raises K fires again. A SCORE lands once the hour
+    has closed plus a grace period, against the latest observed row version for
+    that slot: ``hold = actual >= locked_min_row``. Locks with no observed row
+    are logged unscoreable (hold=null) — they count against coverage, not the
+    hold rate. Restart-safe: pending locks and last-seen row temps are re-seeded
+    from the shadow file and ``twc_rows.jsonl``.
+
+    Shadow only: writes ``lock_ahead.jsonl``, touches nothing in the order path.
+    The gate ("L2 live after >=50 events shadow-scored at >=98% hold") is a
+    human decision on this file's contents.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        margin_c: float = 0.3,
+        window_min: tuple[int, int] = (35, 55),
+        grace_sec: float = 300.0,
+        seed_twc_path: Optional[str] = None,
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
+        self._path = path
+        self._margin = margin_c
+        self._window = window_min
+        self._grace = grace_sec
+        self._clock = clock
+        self.locks = 0
+        self.scored = 0
+        self.holds = 0
+        self.unscoreable = 0
+        self._best: dict[int, int] = {}  # slot -> highest locked K
+        self._pending: dict[int, list[dict]] = {}  # slot -> lock recs awaiting score
+        self._row_temp: dict[int, int] = {}  # slot -> latest observed row temp
+        if seed_twc_path:
+            for rec in read_jsonl(seed_twc_path):
+                self.on_twc_row(rec)
+        for rec in read_jsonl(path):  # replay own file: locks minus scores
+            vt = rec.get("valid_time_gmt")
+            k = rec.get("locked_min_row")
+            if vt is None or k is None:
+                continue
+            vt, k = int(vt), int(k)
+            if rec.get("kind") == "lock":
+                self._best[vt] = max(self._best.get(vt, k), k)
+                self._pending.setdefault(vt, []).append(rec)
+            elif rec.get("kind") == "score":
+                self._pending[vt] = [
+                    p
+                    for p in self._pending.get(vt, [])
+                    if int(p["locked_min_row"]) != k
+                ]
+                if not self._pending.get(vt):
+                    self._pending.pop(vt, None)
+
+    def on_reading(self, reading: Hko1MinReading) -> Optional[dict]:
+        """A new 1-min reading -> a lock record when it raises the slot's K."""
+
+        minute = reading.obs_time_utc.minute  # HKT offset is whole hours
+        if not (self._window[0] <= minute <= self._window[1]):
+            return None
+        k = math.floor(reading.temp_c - self._margin)
+        hour = reading.obs_time_utc.replace(minute=0, second=0, microsecond=0)
+        vt = int(hour.timestamp())
+        if k <= self._best.get(vt, -(10**6)):
+            return None
+        self._best[vt] = k
+        rec = {
+            "ts": self._clock().isoformat(),
+            "kind": "lock",
+            "valid_time_gmt": vt,
+            "obs_time_utc": reading.obs_time_utc.isoformat(),
+            "basis_temp_c": reading.temp_c,
+            "locked_min_row": k,
+            "pred_row": predict_wu_integer(reading.temp_c),
+            "margin_c": self._margin,
+        }
+        append_jsonl(self._path, rec)
+        self.locks += 1
+        self._pending.setdefault(vt, []).append(rec)
+        return rec
+
+    def on_twc_row(self, rec: dict) -> None:
+        """Track the latest observed row temp per slot (the scoring target)."""
+
+        vt, temp = rec.get("valid_time_gmt"), rec.get("temp")
+        if vt is None or temp is None:
+            return
+        try:
+            self._row_temp[int(vt)] = int(temp)
+        except (TypeError, ValueError):
+            return
+
+    def finalize_due(self, now: Optional[datetime] = None) -> list[dict]:
+        """Score every pending lock whose hour closed ``grace_sec`` ago."""
+
+        now = now or self._clock()
+        out: list[dict] = []
+        for vt in sorted(self._pending):
+            if now.timestamp() < vt + 3600 + self._grace:
+                continue
+            actual = self._row_temp.get(vt)
+            for lock in self._pending.pop(vt):
+                hold = (
+                    None
+                    if actual is None
+                    else bool(actual >= int(lock["locked_min_row"]))
+                )
+                if hold is None:
+                    self.unscoreable += 1
+                else:
+                    self.scored += 1
+                    self.holds += int(hold)
+                rec = {
+                    "ts": now.isoformat(),
+                    "kind": "score",
+                    "valid_time_gmt": vt,
+                    "locked_min_row": int(lock["locked_min_row"]),
+                    "basis_temp_c": lock.get("basis_temp_c"),
+                    "actual_row_temp": actual,
+                    "hold": hold,
+                }
+                append_jsonl(self._path, rec)
+                out.append(rec)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Worker — one daemon thread per calibrated city, fail-soft, unattended-safe
 # ---------------------------------------------------------------------------
 class LfsCalibrationWorker:
@@ -557,23 +751,32 @@ class LfsCalibrationWorker:
     the missed-poll acceptance criterion is measurable offline.
     """
 
-    def __init__(self, *, city: str, reporter,
-                 hko: Optional[Hko1MinCollector] = None,
-                 twc_rows: Optional[TwcRowCollector] = None,
-                 twc_daily: Optional[TwcDailyCollector] = None,
-                 predictor: Optional[WuPredictor] = None,
-                 health_path: Optional[str] = None,
-                 hko_poll_sec: float = 60.0,
-                 twc_poll_sec: float = 60.0,
-                 health_every_sec: float = 600.0,
-                 clock: Callable[[], datetime] = utcnow,
-                 monotonic: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        city: str,
+        reporter,
+        hko: Optional[Hko1MinCollector] = None,
+        twc_rows: Optional[TwcRowCollector] = None,
+        twc_daily: Optional[TwcDailyCollector] = None,
+        predictor: Optional[WuPredictor] = None,
+        lock_ahead: Optional[LockAheadShadow] = None,
+        health_path: Optional[str] = None,
+        hko_poll_sec: float = 60.0,
+        twc_poll_sec: float = 60.0,
+        health_every_sec: float = 600.0,
+        hko_stall_sec: float = 1500.0,
+        twc_stall_sec: float = 4500.0,
+        clock: Callable[[], datetime] = utcnow,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.city = city
         self._reporter = reporter
         self._hko = hko
         self._twc_rows = twc_rows
         self._twc_daily = twc_daily
         self._predictor = predictor
+        self._lock_ahead = lock_ahead
         self._health_path = health_path
         self._hko_poll = hko_poll_sec
         self._twc_poll = twc_poll_sec
@@ -583,6 +786,17 @@ class LfsCalibrationWorker:
         self._last_hko: Optional[float] = None
         self._last_twc: Optional[float] = None
         self._last_health: Optional[float] = None
+        # Staleness alarms: health counters alone are blind to SOURCE-side gaps
+        # (2026-07-08: a 90-min hko_1min outage with ``failures: 0`` — the CSV
+        # kept serving, just nothing new). Track the last time each collector
+        # produced a NEW record and alarm when that goes quiet too long. The
+        # clocks arm at start() so a fresh boot isn't an instant alarm.
+        self._stall_sec = {"hko_1min": hko_stall_sec, "twc_rows": twc_stall_sec}
+        self._last_new: dict[str, Optional[float]] = {
+            "hko_1min": None,
+            "twc_rows": None,
+        }
+        self._stalled: dict[str, bool] = {"hko_1min": False, "twc_rows": False}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -595,8 +809,9 @@ class LfsCalibrationWorker:
         try:
             return fn()
         except Exception as exc:
-            self._reporter.event(self.city, "calibration_error",
-                                 collector=collector, error=repr(exc))
+            self._reporter.event(
+                self.city, "calibration_error", collector=collector, error=repr(exc)
+            )
             return None
 
     def tick(self, now: Optional[float] = None) -> None:
@@ -606,26 +821,79 @@ class LfsCalibrationWorker:
         if self._hko is not None and self._due(self._last_hko, self._hko_poll, now):
             self._last_hko = now
             reading = self._guard("hko_1min", self._hko.poll_once)
-            if reading is not None and self._predictor is not None:
-                self._guard("predictor", lambda: self._predictor.on_reading(reading))
+            if reading is not None:
+                self._mark_alive("hko_1min", now)
+                if self._predictor is not None:
+                    self._guard(
+                        "predictor", lambda: self._predictor.on_reading(reading)
+                    )
+                if self._lock_ahead is not None:
+                    self._guard(
+                        "lock_ahead", lambda: self._lock_ahead.on_reading(reading)
+                    )
+            self._check_stall("hko_1min", now)
         if self._due(self._last_twc, self._twc_poll, now):
             self._last_twc = now
             if self._twc_rows is not None:
                 new_rows = self._guard("twc_rows", self._twc_rows.poll_once) or []
+                if new_rows:
+                    self._mark_alive("twc_rows", now)
                 for row in new_rows:
                     if self._predictor is not None:
-                        self._guard("predictor", lambda r=row: self._predictor.on_twc_row(r))
+                        self._guard(
+                            "predictor", lambda r=row: self._predictor.on_twc_row(r)
+                        )
+                    if self._lock_ahead is not None:
+                        self._guard(
+                            "lock_ahead", lambda r=row: self._lock_ahead.on_twc_row(r)
+                        )
+                if self._lock_ahead is not None:
+                    self._guard("lock_ahead", self._lock_ahead.finalize_due)
+                self._check_stall("twc_rows", now)
             if self._twc_daily is not None:
                 captured = self._guard("twc_daily", self._twc_daily.poll_once) or []
                 for rec in captured:
                     if self._predictor is not None:
-                        self._guard("predictor", lambda r=rec: self._predictor.on_daily(r))
+                        self._guard(
+                            "predictor", lambda r=rec: self._predictor.on_daily(r)
+                        )
                     self._reporter.notice(
-                        self.city, f"calibration: captured WU daily table "
-                        f"{rec['hkt_date']} @{rec['slot']} HKT ({rec['n_rows']} rows)")
+                        self.city,
+                        f"calibration: captured WU daily table "
+                        f"{rec['hkt_date']} @{rec['slot']} HKT ({rec['n_rows']} rows)",
+                    )
         if self._due(self._last_health, self._health_every, now):
             self._last_health = now
             self._flush_health()
+
+    def _mark_alive(self, collector: str, now: float) -> None:
+        self._last_new[collector] = now
+        if self._stalled[collector]:
+            self._stalled[collector] = False
+            self._reporter.event(self.city, "staleness_recovered", collector=collector)
+            self._reporter.notice(
+                self.city, f"calibration: {collector} producing again"
+            )
+
+    def _check_stall(self, collector: str, now: float) -> None:
+        last = self._last_new[collector]
+        if last is None:  # armed at start(); no baseline yet
+            self._last_new[collector] = now
+            return
+        quiet = now - last
+        if quiet > self._stall_sec[collector] and not self._stalled[collector]:
+            self._stalled[collector] = True
+            self._reporter.event(
+                self.city,
+                "staleness_alarm",
+                collector=collector,
+                quiet_sec=round(quiet),
+            )
+            self._reporter.notice(
+                self.city,
+                f"calibration ALARM: {collector} has produced no new "
+                f"record for {round(quiet / 60)} min (source-side gap? dead key?)",
+            )
 
     def _flush_health(self) -> None:
         """Cumulative counters -> collector_health.jsonl (+ events log)."""
@@ -635,24 +903,55 @@ class LfsCalibrationWorker:
         ts = self._clock().isoformat()
         rows = []
         if self._hko is not None:
-            rows.append({"collector": "hko_1min", "polls": self._hko.polls,
-                         "failures": self._hko.failures,
-                         "new_records": self._hko.new_records})
+            rows.append(
+                {
+                    "collector": "hko_1min",
+                    "polls": self._hko.polls,
+                    "failures": self._hko.failures,
+                    "new_records": self._hko.new_records,
+                    "stalled": self._stalled["hko_1min"],
+                }
+            )
         if self._twc_rows is not None:
-            rows.append({"collector": "twc_rows", "polls": self._twc_rows.polls,
-                         "failures": self._twc_rows.failures,
-                         "new_records": self._twc_rows.new_records,
-                         "stale_responses": self._twc_rows.stale_responses})
+            rows.append(
+                {
+                    "collector": "twc_rows",
+                    "polls": self._twc_rows.polls,
+                    "failures": self._twc_rows.failures,
+                    "new_records": self._twc_rows.new_records,
+                    "stale_responses": self._twc_rows.stale_responses,
+                    "stalled": self._stalled["twc_rows"],
+                }
+            )
+        if self._lock_ahead is not None:
+            rows.append(
+                {
+                    "collector": "lock_ahead",
+                    "locks": self._lock_ahead.locks,
+                    "scored": self._lock_ahead.scored,
+                    "holds": self._lock_ahead.holds,
+                    "unscoreable": self._lock_ahead.unscoreable,
+                }
+            )
         if self._twc_daily is not None:
-            rows.append({"collector": "twc_daily", "polls": self._twc_daily.polls,
-                         "failures": self._twc_daily.failures,
-                         "new_records": self._twc_daily.new_records})
+            rows.append(
+                {
+                    "collector": "twc_daily",
+                    "polls": self._twc_daily.polls,
+                    "failures": self._twc_daily.failures,
+                    "new_records": self._twc_daily.new_records,
+                }
+            )
         if self._predictor is not None:
-            rows.append({"collector": "predictor",
-                         "row_evals": self._predictor.row_evals,
-                         "row_hits": self._predictor.row_hits,
-                         "daily_evals": self._predictor.daily_evals,
-                         "daily_hits": self._predictor.daily_hits})
+            rows.append(
+                {
+                    "collector": "predictor",
+                    "row_evals": self._predictor.row_evals,
+                    "row_hits": self._predictor.row_hits,
+                    "daily_evals": self._predictor.daily_evals,
+                    "daily_hits": self._predictor.daily_hits,
+                }
+            )
         for row in rows:
             append_jsonl(self._health_path, {"ts": ts, **row})
         self._reporter.event(self.city, "calibration_health", collectors=rows)
@@ -663,16 +962,18 @@ class LfsCalibrationWorker:
             try:
                 self.tick()
             except Exception as exc:  # belt-and-braces: tick already guards
-                self._reporter.event(self.city, "calibration_error",
-                                     collector="worker", error=repr(exc))
+                self._reporter.event(
+                    self.city, "calibration_error", collector="worker", error=repr(exc)
+                )
             self._stop.wait(1.0)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self.run, daemon=True,
-                                        name=f"lfs-cal-{self.city}")
+        self._thread = threading.Thread(
+            target=self.run, daemon=True, name=f"lfs-cal-{self.city}"
+        )
         self._thread.start()
 
     def stop(self) -> None:
