@@ -13,21 +13,96 @@ NO buy can be), guaranteeing the dollar limit is never exceeded.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from .config import Config
 from .models import Fill, MarketSnapshot
 
 
+class Ledger:
+    """Disk-backed cumulative PnL, so the bankroll survives a restart.
+
+    Paper mode has no wallet to read the truth back from, so without this every
+    restart would reset the sizing base to the starting balance and a long soak
+    would never show a compounding (or shrinking) bankroll. Live mode reads the
+    real wallet instead and uses this only as a record.
+
+    The file is tiny and rewritten atomically on each realised PnL change:
+    ``{"initial_balance": ..., "cumulative_pnl": ..., "updated": ...}``.
+    """
+
+    def __init__(self, path: str, *, initial_balance: float = 0.0) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self.initial_balance = float(initial_balance)
+        self.cumulative_pnl = 0.0
+        self._load()
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    @property
+    def equity(self) -> float:
+        return max(0.0, self.initial_balance + self.cumulative_pnl)
+
+    def _load(self) -> None:
+        try:
+            with open(self._path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        try:
+            self.cumulative_pnl = float(data.get("cumulative_pnl", 0.0))
+        except (TypeError, ValueError):
+            self.cumulative_pnl = 0.0
+        # The starting balance is whatever the FIRST run recorded; a later
+        # --balance must not silently rebase the equity curve mid-soak.
+        try:
+            stored = data.get("initial_balance")
+            if stored is not None:
+                self.initial_balance = float(stored)
+        except (TypeError, ValueError):
+            pass
+
+    def save(self, cumulative_pnl: float) -> None:
+        with self._lock:
+            self.cumulative_pnl = float(cumulative_pnl)
+            rec = {
+                "initial_balance": self.initial_balance,
+                "cumulative_pnl": self.cumulative_pnl,
+                "equity": self.equity,
+                "updated": datetime.now(timezone.utc).isoformat(),
+            }
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            tmp = f"{self._path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, indent=2)
+                fh.write("\n")
+            os.replace(tmp, self._path)
+
+
 class RiskManager:
-    def __init__(self, config: Config, *, initial_balance: float = 0.0) -> None:
+    def __init__(self, config: Config, *, initial_balance: float = 0.0,
+                 ledger: Optional["Ledger"] = None) -> None:
         self._cfg = config
         self._lock = threading.RLock()
-        # Starting account balance, used only in percentage-sizing mode
-        # (config.bankroll_pct > 0). Current balance = this + realised PnL, so
-        # the exposure caps grow as the bot wins and shrink as it loses.
+        # Starting account balance. Current equity = this + CUMULATIVE realised
+        # PnL, so the exposure caps grow as the bot wins and shrink as it loses.
         self._initial_balance = initial_balance
+        # Cumulative realised PnL since inception. Distinct from _realized_pnl,
+        # which is the DAILY figure the loss breaker reads and roll_day resets:
+        # zeroing the sizing base every midnight made the paper bankroll snap
+        # back to its starting value forever, so results never compounded.
+        # Persisted via ``ledger`` so a restart resumes the equity curve too.
+        self._ledger = ledger
+        self._cumulative_pnl = ledger.cumulative_pnl if ledger is not None else 0.0
         # Optional ground-truth equity source (live mode): when set, the
         # percentage-sizing base is this callable's value (real wallet cash +
         # open exposure) instead of the synthetic initial_balance + realised PnL,
@@ -53,6 +128,11 @@ class RiskManager:
         self._halt_announced: bool = False
         self._city_halted: dict[str, str] = {}
         self._city_recoverable: set[str] = set()
+        # Sticky per-city blocks (resolver divergence). Unlike _city_halted these
+        # survive roll_day: a source that disagrees with the resolver is still
+        # the wrong source tomorrow. Cleared only by clear_sticky_block, i.e. by
+        # a human running tools/resolver_clear.
+        self._sticky_blocked: dict[str, str] = {}
         self._order_errors: dict[str, int] = {}  # per-city consecutive errors
         self._rolled_day: Optional[str] = None
 
@@ -88,9 +168,10 @@ class RiskManager:
     def _balance_base(self) -> float:
         """The equity used as the percentage-sizing base. Prefers the injected
         ground-truth source (real wallet cash + open exposure, live) and falls
-        back to the synthetic ``initial_balance + realised PnL`` (paper). Caller
-        must hold the lock; the source itself is read outside no extra lock —
-        the RLock is re-entrant so a source reading ``total_exposure`` is safe."""
+        back to the synthetic ``initial_balance + CUMULATIVE realised PnL``
+        (paper). Caller must hold the lock; the source itself is read outside no
+        extra lock — the RLock is re-entrant so a source reading
+        ``total_exposure`` is safe."""
 
         if self._equity_source is not None:
             try:
@@ -99,7 +180,26 @@ class RiskManager:
                 # A transient balance-read failure must not zero the caps; fall
                 # back to the synthetic base rather than halting sizing.
                 pass
-        return self._initial_balance + self._realized_pnl
+        return max(0.0, self._initial_balance + self._cumulative_pnl)
+
+    @property
+    def cumulative_pnl(self) -> float:
+        """Realised PnL since inception (survives daily rollovers/restarts)."""
+
+        with self._lock:
+            return self._cumulative_pnl
+
+    def _record_pnl(self, delta: float) -> None:
+        """Book realised PnL into both the daily and the cumulative figure.
+        Caller must hold the lock."""
+
+        self._realized_pnl += delta
+        self._cumulative_pnl += delta
+        if self._ledger is not None:
+            try:
+                self._ledger.save(self._cumulative_pnl)
+            except Exception:
+                pass  # a ledger write must never break trading/settlement
 
     @property
     def current_balance(self) -> float:
@@ -110,15 +210,49 @@ class RiskManager:
         with self._lock:
             return self._balance_base()
 
+    def _equity_known(self) -> bool:
+        """Whether the account size is actually known to us.
+
+        The solvency and concentration clamps below are only meaningful against
+        a real equity figure. A run with no wallet source and no starting
+        balance (static dollar caps, the historical default and most unit
+        tests) has nothing to clamp against, so those runs keep the plain
+        static caps rather than being silently zeroed. Caller holds the lock."""
+
+        return self._equity_source is not None or self._initial_balance > 0
+
     def _cap_dollars(self, static_cap: float) -> float:
         """The active dollar exposure cap. In percentage-sizing mode it's
-        ``bankroll_pct`` of the current balance (so all three caps track equity,
-        all-in on a single dead bracket); otherwise the static config cap.
-        Caller must hold the lock."""
+        ``bankroll_pct`` of the current equity; otherwise the static config cap.
+        When equity is known the result is clamped to ``max_deployed_pct`` of
+        it, so the caps can never authorise money the account does not have —
+        the paper book used to let a $100 balance "buy" $1000 of NO because the
+        static caps never consulted the balance at all. Caller holds the lock."""
 
         if self._cfg.bankroll_pct > 0:
-            return max(0.0, self._cfg.bankroll_pct / 100.0 * self._balance_base())
-        return static_cap
+            cap = self._cfg.bankroll_pct / 100.0 * self._balance_base()
+        else:
+            cap = static_cap
+        if self._equity_known():
+            cap = min(cap, self._cfg.max_deployed_pct / 100.0 * self._balance_base())
+        return max(0.0, cap)
+
+    def _available_dollars(self) -> Optional[float]:
+        """Capital not already committed: the deployable ceiling minus open
+        exposure, or None when equity is unknown (no clamp). Every remaining-cap
+        query is clamped by this so concurrent brackets cannot collectively
+        overspend the account. Caller holds the lock."""
+
+        if not self._equity_known():
+            return None
+        ceiling = self._cfg.max_deployed_pct / 100.0 * self._balance_base()
+        return max(0.0, ceiling - self._total_exposure)
+
+    def _clamp_available(self, dollars: float) -> float:
+        """Apply the available-capital clamp when equity is known."""
+
+        avail = self._available_dollars()
+        return dollars if avail is None else min(dollars, avail)
 
     def city_exposure(self, city: str) -> float:
         with self._lock:
@@ -132,7 +266,32 @@ class RiskManager:
         """True if new entries for ``city`` must not be placed."""
 
         with self._lock:
-            return self._halted or city in self._city_halted
+            return (self._halted or city in self._city_halted
+                    or city in self._sticky_blocked)
+
+    def block_city_sticky(self, city: str, reason: str) -> bool:
+        """Block a city until a human clears it — survives the daily rollover.
+
+        Used for resolver divergence: our source and the resolver's published
+        table disagreed, so every "certain" dead bracket in this city is
+        actually a guess. Returns True if newly blocked.
+        """
+
+        with self._lock:
+            if city in self._sticky_blocked:
+                return False
+            self._sticky_blocked[city] = reason
+            return True
+
+    def clear_sticky_block(self, city: str) -> bool:
+        """Manual resolution: lift a sticky block. Returns True if one existed."""
+
+        with self._lock:
+            return self._sticky_blocked.pop(city, None) is not None
+
+    def sticky_block_reason(self, city: str) -> Optional[str]:
+        with self._lock:
+            return self._sticky_blocked.get(city)
 
     def city_cap_dollars(self) -> float:
         """Effective per-city dollar cap: bankroll_pct × balance, or the static
@@ -220,29 +379,38 @@ class RiskManager:
 
     # -- remaining caps (in shares) ---------------------------------------
     def per_bracket_cap_remaining(self, city: str, temp: int) -> float:
-        """Remaining shares for a bracket: the lesser of the share cap and the
+        """Remaining shares for a bracket: the lesser of the share cap, the
         per-bracket DOLLAR cap (``max_exposure_per_bracket``, or a percentage of
-        the current balance when ``bankroll_pct`` is set), converted to shares at
-        the CAP price (conservative)."""
+        current equity when ``bankroll_pct`` is set), the CONCENTRATION limit
+        (``max_bracket_pct`` of equity — no single bracket may be the whole
+        account), and the capital actually available. Converted to shares at the
+        CAP price (conservative)."""
 
         with self._lock:
             key = (city, temp)
             cap_dollars = self._cap_dollars(self._cfg.max_exposure_per_bracket)
+            if self._equity_known():
+                cap_dollars = min(
+                    cap_dollars,
+                    self._cfg.max_bracket_pct / 100.0 * self._balance_base(),
+                )
             share_rem = max(0.0, self._cfg.max_shares_per_bracket - self._bracket_shares.get(key, 0.0))
             dollars_rem = max(0.0, cap_dollars - self._bracket_exposure.get(key, 0.0))
+            dollars_rem = self._clamp_available(dollars_rem)
             return min(share_rem, dollars_rem / self._cfg.cap)
 
     def per_city_cap_remaining(self, city: str) -> float:
         with self._lock:
             cap_dollars = self._cap_dollars(self._cfg.max_exposure_per_city)
             used = self._city_exposure.get(city, 0.0)
-            remaining_dollars = max(0.0, cap_dollars - used)
+            remaining_dollars = self._clamp_available(max(0.0, cap_dollars - used))
             return remaining_dollars / self._cfg.cap
 
     def total_cap_remaining(self) -> float:
         with self._lock:
             cap_dollars = self._cap_dollars(self._cfg.max_total_exposure)
-            remaining_dollars = max(0.0, cap_dollars - self._total_exposure)
+            remaining_dollars = self._clamp_available(
+                max(0.0, cap_dollars - self._total_exposure))
             return remaining_dollars / self._cfg.cap
 
     # -- fill bookkeeping --------------------------------------------------
@@ -277,7 +445,7 @@ class RiskManager:
             self._bracket_exposure[key] = max(0.0, self._bracket_exposure.get(key, 0.0) - cost_released)
             self._city_exposure[fill.city] = max(0.0, self._city_exposure.get(fill.city, 0.0) - cost_released)
             self._total_exposure = max(0.0, self._total_exposure - cost_released)
-            self._realized_pnl += (fill.notional - cost_released)
+            self._record_pnl(fill.notional - cost_released)
         self._check_daily_loss()
 
     def record_settlement(self, *, city: str, temp: int, shares: float, cost_basis: float,
@@ -298,7 +466,7 @@ class RiskManager:
             self._bracket_exposure[key] = max(0.0, self._bracket_exposure.get(key, 0.0) - cost_basis)
             self._city_exposure[city] = max(0.0, self._city_exposure.get(city, 0.0) - cost_basis)
             self._total_exposure = max(0.0, self._total_exposure - cost_basis)
-            self._realized_pnl += (payout * shares - cost_basis)
+            self._record_pnl(payout * shares - cost_basis)
         self._check_daily_loss()
 
     # -- kill-switch / halts ----------------------------------------------
@@ -390,9 +558,13 @@ class RiskManager:
         """Re-arm for a new trading day (idempotent per ``day_key``).
 
         Clears the global kill-switch, all per-city halts, error counters, and
-        resets daily PnL and exposures so the bot runs unattended across days.
+        resets DAILY PnL and exposures so the bot runs unattended across days.
         Returns True only on the first call for a given day. Positions should be
         settled by the caller *before* this resets exposure.
+
+        Deliberately NOT cleared: cumulative PnL (the sizing base must compound
+        across days rather than snapping back to the starting balance), the
+        sticky forecast pause, and sticky resolver blocks.
         """
 
         with self._lock:

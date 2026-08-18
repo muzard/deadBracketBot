@@ -28,6 +28,7 @@ from .feeds_http import (
     make_metar_fetch,
     make_tgftp_fetch,
     make_twc_historical_fetch,
+    make_twc_range_fetch,
     make_twc_timeseries_fetch,
 )
 from .forecast import ForecastStrategy
@@ -43,7 +44,14 @@ from .lfs_calibration import (
 from .market import MarketFeed
 from .metar import MetarFeed
 from .reporter import Reporter
-from .risk import RiskManager
+from .resolver_guard import (
+    ResolverBlockStore,
+    ResolverCrossCheck,
+    ResolverPollerWorker,
+    ResolverRowCollector,
+    seed_records_from_metar_log,
+)
+from .risk import Ledger, RiskManager
 from .strategy import Strategy
 from .supervisor import Supervisor
 from .worker import CityWorker
@@ -381,6 +389,113 @@ def build_forecast_workers(
     return workers, collectors
 
 
+def build_resolver_guards(
+    config: Config, reporter: Reporter, risk: RiskManager, city_ids
+) -> tuple[dict[str, ResolverCrossCheck], list[ResolverPollerWorker], ResolverBlockStore]:
+    """Wire the resolver cross-check: one guard + poller per selected city.
+
+    Each guard's own side is seeded from the city's existing ``metar.jsonl`` so
+    a restart has the trailing history the 24 h coverage rule needs instead of
+    idling for a day; the resolver side is seeded from ``wu_rows.jsonl`` by the
+    collector. Sticky divergence blocks are re-adopted from disk here, so a
+    restart comes back blocked rather than forgetting and re-buying.
+
+    Without a TWC API key nothing can be verified, so every city stays
+    ``unverified`` and therefore untradeable — deliberately fail-closed, with
+    one loud startup notice rather than a silent return to the old behaviour.
+    """
+
+    guards: dict[str, ResolverCrossCheck] = {}
+    pollers: list[ResolverPollerWorker] = []
+    blocks = ResolverBlockStore(
+        os.path.join(config.data_dir, "_global", "resolver_blocks.json")
+    )
+    if not config.resolver_check:
+        return guards, pollers, blocks
+
+    if not config.twc_api_key:
+        reporter.notice(
+            "_global",
+            "resolver cross-check has NO TWC_API_KEY — every city is unverified "
+            "and will NOT trade. Set TWC_API_KEY (.env) to enable trading.",
+        )
+        reporter.event("_global", "resolver_no_key")
+
+    for city_cfg in select_cities(config, city_ids):
+        tz = None
+        try:
+            tz = ZoneInfo(city_cfg.tz)
+        except Exception:
+            pass
+        configured = bool(city_cfg.resolver_location and config.twc_api_key)
+        guard = ResolverCrossCheck(
+            city_cfg.id,
+            tz=tz,
+            window_hours=config.resolver_window_hours,
+            min_pairs=config.resolver_min_pairs,
+            min_span_hours=config.resolver_min_span_hours,
+            max_gap_hours=config.resolver_max_gap_hours,
+            max_lag_hours=config.resolver_max_lag_hours,
+            settle_lag_min=config.resolver_settle_lag_min,
+            tolerance_c=config.resolver_tolerance_c,
+            configured=configured,
+        )
+        city_dir = os.path.join(config.data_dir, city_cfg.id)
+        # Seed our side from whichever log this city's running max is fed by.
+        for log_name in ("metar.jsonl", "metar_twc.jsonl", "metar_hko.jsonl"):
+            path = os.path.join(city_dir, log_name)
+            if os.path.exists(path):
+                guard.seed_ours(seed_records_from_metar_log(
+                    path,
+                    hours=config.resolver_window_hours * 2,
+                    include_speci=city_cfg.include_speci,
+                ))
+                break
+        # Re-arm a divergence recorded by an earlier run.
+        prior = blocks.blocked(city_cfg.id)
+        if prior:
+            detail = prior.get("detail") or prior.get("reason") or "resolver divergence"
+            guard.adopt_block(detail)
+            risk.block_city_sticky(city_cfg.id, detail)
+            reporter.notice(
+                city_cfg.id,
+                f"TRADING BLOCKED since {prior.get('since', '?')} — {detail}. "
+                f"Clear with: python -m dead_bracket.tools.resolver_clear {city_cfg.id}",
+            )
+        guards[city_cfg.id] = guard
+
+        if not configured:
+            if not city_cfg.resolver_location:
+                reporter.notice(
+                    city_cfg.id,
+                    "no resolver table configured — city can never be verified "
+                    "and will NOT trade (data collection continues)",
+                )
+            continue
+        collector = ResolverRowCollector(
+            city=city_cfg.id,
+            guard=guard,
+            fetch=make_twc_range_fetch(
+                api_key=config.twc_api_key,
+                location=city_cfg.resolver_location,
+                session=_new_session(),
+            ),
+            path=os.path.join(city_dir, "wu_rows.jsonl"),
+            tz=tz,
+        )
+        pollers.append(
+            ResolverPollerWorker(
+                city=city_cfg.id,
+                collector=collector,
+                reporter=reporter,
+                poll_sec=config.resolver_poll_sec,
+            )
+        )
+        reporter.event(city_cfg.id, "resolver_start",
+                       location=city_cfg.resolver_location)
+    return guards, pollers, blocks
+
+
 def build_supervisor(
     config: Config,
     reporter: Reporter,
@@ -393,6 +508,8 @@ def build_supervisor(
     use_twc=False,
     feed_collectors=None,
     balance=None,
+    resolver_guards=None,
+    resolver_blocks=None,
 ) -> Supervisor:
     selected = select_cities(config, city_ids)
     no_trade = set(no_trade_cities)
@@ -519,6 +636,8 @@ def build_supervisor(
                 forecast=forecast,
                 feed_reader=feed_reader,
                 balance=balance,
+                resolver=(resolver_guards or {}).get(city_cfg.id),
+                resolver_blocks=resolver_blocks,
             )
         )
     return Supervisor(
@@ -662,6 +781,24 @@ def main(argv: Optional[list[str]] = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        # Live lock (2026-08-18). The 2026-07-19 Seoul false-dead emptied the
+        # wallet because nothing cross-checked our METAR against the table the
+        # market settles on. That guard now exists but has no soak behind it,
+        # so live trading is opt-in through the environment rather than a bare
+        # --live: a flag alone is too easy to reach for out of habit.
+        if os.environ.get("DEAD_BRACKET_ALLOW_LIVE", "").strip() not in ("1", "true", "yes", "on"):
+            print(
+                "HALT: live trading is locked. The 2026-07-19 Seoul false-dead "
+                "wiped the wallet (our METAR 27C vs the resolver's 26C for the "
+                "same observation).\n"
+                "      The resolver cross-check that would have caught it is "
+                "new and unsoaked. Run paper until it has a clean record:\n"
+                "        python -m dead_bracket.main --balance <amount>\n"
+                "        python -m dead_bracket.tools.resolver_status\n"
+                "      To deliberately override: DEAD_BRACKET_ALLOW_LIVE=1",
+                file=sys.stderr,
+            )
+            return 2
         live_client = _build_live_client(config)
     if config.bankroll_pct > 0 and config.mode != "live" and args.balance is None:
         print(
@@ -685,7 +822,24 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     city_tz = {c.id: c.tz for c in config.cities}
     reporter = Reporter(config.data_dir, city_tz=city_tz, progress=not args.quiet)
-    risk = RiskManager(config, initial_balance=initial_balance)
+    # Paper equity ledger: cumulative realised PnL persisted across restarts so
+    # the bankroll actually tracks results instead of resetting to the starting
+    # balance every run (and every daily rollover). Live sizes off the wallet.
+    ledger = None
+    if config.mode != "live" and initial_balance > 0:
+        ledger = Ledger(
+            os.path.join(config.data_dir, "_global", "paper_ledger.json"),
+            initial_balance=initial_balance,
+        )
+        if abs(ledger.cumulative_pnl) > 1e-9:
+            reporter.progress(
+                f"LEDGER  resuming paper equity ${ledger.equity:.2f} "
+                f"(start ${ledger.initial_balance:.2f}, "
+                f"cumulative PnL {ledger.cumulative_pnl:+.2f}) "
+                f"-> {ledger.path}"
+            )
+        initial_balance = ledger.initial_balance
+    risk = RiskManager(config, initial_balance=initial_balance, ledger=ledger)
     # Wallet-balance tracker: live polls the real USDC balance (adaptive cadence)
     # and drives percentage sizing off actual capital; paper stays synthetic.
     balance = build_balance_tracker(config, risk, initial_balance, live_client)
@@ -721,6 +875,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Forecast feed pollers first, so the supervisor can inject each city's
     # collector into its worker.
     feed_workers, feed_collectors = build_forecast_workers(config, reporter, city_ids)
+    # Resolver cross-check: guards gate entries, pollers keep their side fresh.
+    resolver_guards, resolver_workers, resolver_blocks = build_resolver_guards(
+        config, reporter, risk, city_ids
+    )
     supervisor = build_supervisor(
         config,
         reporter,
@@ -732,6 +890,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         use_twc=args.twc,
         feed_collectors=feed_collectors,
         balance=balance,
+        resolver_guards=resolver_guards,
+        resolver_blocks=resolver_blocks,
     )
     # LFS calibration collectors (Shenzhen): --calibrate or LFS_CALIBRATION=1.
     cal_workers = (
@@ -765,6 +925,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"kelly={config.kelly_fraction}  min_edge={config.forecast_min_edge}  "
             f"[{gate}]"
         )
+    if config.resolver_check:
+        reporter.progress(
+            f"RESOLVER cross-check ON: {len(resolver_workers)}/{len(city_ids)} "
+            f"cities have a resolver table; a city trades only after "
+            f"{config.resolver_window_hours:.0f}h of agreement. "
+            f"Blocked now: {','.join(sorted(resolver_blocks.all_blocks())) or '(none)'}"
+        )
+    else:
+        reporter.progress(
+            "RESOLVER cross-check DISABLED (resolver_check=0) — the Seoul "
+            "false-dead guard is OFF"
+        )
     reporter.progress(
         f"START   mode={config.mode}  cities={','.join(city_ids)}  "
         + (f"no-trade={','.join(no_trade_cities)}  " if no_trade_cities else "")
@@ -774,6 +946,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         w.start()
     for w in cal_workers:
         w.start()
+    for w in resolver_workers:
+        w.start()
     try:
         supervisor.run_forever()
     except KeyboardInterrupt:
@@ -782,6 +956,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         for w in feed_workers:
             w.stop()
         for w in cal_workers:
+            w.stop()
+        for w in resolver_workers:
             w.stop()
     return 0
 

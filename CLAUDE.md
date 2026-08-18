@@ -23,6 +23,26 @@ paths, one order pipeline:
    wins the day) → any settled loss pauses the whole forecast path (sticky).
    YES-side / day-max betting remains a **non-goal**.
 
+## STOP — read this before touching live trading (2026-08-18)
+The bot **wiped the live wallet on 2026-07-19** (Seoul, ~$170 -> $0.90). RKSI's
+METAR printed `27/22`; Weather Underground's row for that same instant read
+26 °C (its RKSI pipeline carries tenths — 79 °F = 26.1 °C — where the METAR
+encodes whole degrees). Our running max went to 27, the 26 °C bracket was
+marked dead, and the whole bankroll bought a NO that settled to $0 because WU's
+daily High never left 26. **The Shenzhen "WU table ≠ our source" failure class
+was never city-specific — it applies to every WU-resolved city.**
+
+Consequences now in the code:
+- **Live mode is LOCKED.** `--live` refuses unless `DEAD_BRACKET_ALLOW_LIVE=1`.
+  Paper until the resolver cross-check has a clean soak behind it.
+- **`resolver_guard.py` gates every entry** (see the invariants below).
+- **No more all-in.** `max_bracket_pct` (25%) caps one bracket's share of
+  equity; `max_deployed_pct` (90%) caps total exposure and every cap is clamped
+  to capital actually available. One false-dead can no longer be a total loss.
+- **The bankroll compounds.** Cumulative realised PnL survives daily rollovers
+  and restarts (`risk.py::Ledger` -> `data/_global/paper_ledger.json`); the
+  daily figure still resets for the loss breaker.
+
 ## Read these first
 - **[FINDINGS.md](FINDINGS.md)** — the dead-NO edge is **real in thin markets**
   (Moscow, now Shenzhen): a week of daily winners, **+$49.72**, zero losers. It is
@@ -44,12 +64,15 @@ paths, one order pipeline:
 . .venv/bin/activate                       # use the project venv (macOS: python3)
 python -m dead_bracket.main                # paper, ALL cities (the default)
 python -m dead_bracket.main --check        # live preflight: creds/balance, no orders
-python -m dead_bracket.main --live --bankroll 40   # 40% of wallet balance; needs POLY_PRIVATE_KEY + POLY_FUNDER
+python -m dead_bracket.main --balance 100          # paper with a real bankroll (equity compounds via the ledger)
+DEAD_BRACKET_ALLOW_LIVE=1 python -m dead_bracket.main --live --bankroll 40  # LOCKED by default — see the STOP section
 python -m dead_bracket.main --forecast --balance 100   # + forecast path, paper (Kelly needs a balance)
 python -m dead_bracket.main --live --bankroll 40 --forecast                 # live dead path; forecast SIGNALS ONLY
 python -m dead_bracket.main --live --bankroll 40 --forecast --forecast-live # forecast live orders (human go/no-go!)
 TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate  # + Shenzhen calibration collectors
 python -m dead_bracket.main --twc --no-trade shenzhen --calibrate  # Shenzhen L1 shadow: running max from the resolver's CLOSED rows + L2 lock-ahead shadow (key via .env)
+python -m dead_bracket.tools.resolver_status    # per-city: may it trade, and why not?
+python -m dead_bracket.tools.resolver_clear <city>  # lift a sticky divergence block (human decision)
 python -m dead_bracket.tools.lfs_calibrate      # offline K1/K2/K3/ε report + L1 stability + L2 hold rate
 python -m dead_bracket.tools.forecast_calibrate # offline sensor-σ/Brier/hold-rate report (the go/no-go input)
 python -m pytest                           # 372 tests; NO live network in tests
@@ -70,7 +93,11 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feed
   ~33 cities don't trip the CLOB rate limit. A failed batch raises
   `TransientBookError` → the tick is skipped, NOT reported as market-unavailable).
 - `strategy.py` — pure: entry sizing + the 99.9¢ exit. `risk.py` — caps + halts
-  (+ the forecast exposure cap and the sticky forecast pause).
+  (+ the forecast exposure cap, the sticky forecast pause, sticky resolver
+  blocks, and the `Ledger` that persists cumulative equity).
+- `resolver_guard.py` — the post-Seoul failsafe: `ResolverCrossCheck` (pure
+  24 h agreement logic), `ResolverRowCollector` + `ResolverPollerWorker` (one
+  daemon thread per city), `ResolverBlockStore` (sticky divergence on disk).
 - `executor.py` — `PaperExecutor` (default sim) / `LiveExecutor`. `worker.py` —
   the per-city cycle. `reporter.py` — stdout=trades, stderr=progress, per-day logs.
 - **Forecast path**: `forecast.py` (pure — `p_trust` model, Kelly sizing,
@@ -84,6 +111,21 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feed
   `tools/forecast_calibrate.py` = the offline gate report.
 
 ## Non-negotiable invariants (each has tests + a memory note — don't regress)
+- **No city trades without 24 h of resolver agreement** (`resolver_guard.py`).
+  A per-city poller reads the resolver's OWN published table (TWC/WU location
+  id in `CityConfig.resolver_location`, one verified entry per city in
+  `config.RESOLVER_LOCATIONS`) into `data/<city>/wu_rows.jsonl`, pairs it with
+  our observations by timestamp, and allows entries only in state `ok`: every
+  paired ob in the trailing 24 h matched exactly, coverage spans the window
+  with no long hole, the resolver's rows are fresh, and the local-day running
+  maxima agree. `unverified` (thin/stale data, or a city with no resolver table
+  — Istanbul's LTFM serves none) withholds entries and self-clears.
+  `divergent` is **sticky**: it survives ticks, rollovers and restarts
+  (`data/_global/resolver_blocks.json`) and only
+  `python -m dead_bracket.tools.resolver_clear <city>` lifts it. Fail closed is
+  the point — no key, no rows, no trading. `resolver_confirm_dead` (off) adds
+  the strict rule that the resolver's table must itself reach the running max,
+  closing the 25–65 min publish-lag window at the cost of the speed edge.
 - **METAR/resolver-only for RESOLUTION TRUTH.** Only the resolution-grade METAR
   running max may mark a bracket dead; decimal temps are rejected from
   `MetarFeed` (non-resolution). The sub-hourly national feeds (forecast path)
@@ -140,14 +182,20 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feed
 ## Conventions
 - All behaviour is config (`config.py`); scalar knobs override via UPPERCASE env
   vars. `--bankroll` is a **percentage of current balance** (`config.bankroll_pct`):
-  every cap (total = per-city = per-bracket) is that % of the sizing base, so bet
-  sizes grow as the bot wins (all-in on a single dead bracket). The base is the
+  the total and per-city caps are that % of the sizing base, so bet sizes grow as
+  the bot wins. The per-bracket cap is additionally held to `max_bracket_pct`
+  (25%) of equity and every cap is clamped to available capital — the old
+  all-in-on-one-bracket sizing is what made the Seoul false-dead total. The base is the
   **live wallet equity** (`balance.py::LiveBalanceTracker` — real USDC cash + open
   exposure, polled with an adaptive cadence: fast while a buy is being attempted,
   cooling down when consecutive reads are unchanged) in live mode, and the
-  synthetic `initial_balance + realized_pnl` in paper (`RiskManager.set_equity_source`
-  installs the live source; `BALANCE_POLL_*` knobs tune the cadence). Paper needs
-  `--balance`. With `--bankroll 0` the static dollar caps (`MAX_EXPOSURE_*`) apply.
+  synthetic `initial_balance + CUMULATIVE realized_pnl` in paper
+  (`RiskManager.set_equity_source` installs the live source; `BALANCE_POLL_*`
+  knobs tune the cadence). Cumulative — not daily — is the fix for the bankroll
+  resetting to its starting value at every rollover; `roll_day` still zeroes the
+  daily PnL the loss breaker reads. Paper needs `--balance`. With `--bankroll 0`
+  the static dollar caps (`MAX_EXPOSURE_*`) apply, but once a balance is known
+  they are still clamped to it — a $100 paper balance can no longer "buy" $1000.
 - Forecast sizing/caps (all config): `kelly_fraction` (≤0.5 enforced),
   `forecast_min_edge`, `forecast_min_margin_c` (≥0.4 °C — METAR rounds),
   `forecast_p_cap` 0.99, the 17–21h local evening cutoff, same-ob cap 25% of

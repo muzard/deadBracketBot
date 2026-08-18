@@ -52,6 +52,8 @@ class CityWorker:
         forecast: Optional[ForecastStrategy] = None,
         feed_reader=None,  # Callable[[], Optional[FeedReading]] from FeedCollector.latest
         balance=None,  # BalanceTracker (live) / PaperBalanceTracker; refreshed before buys
+        resolver=None,  # ResolverCrossCheck: our source vs the resolver's table
+        resolver_blocks=None,  # ResolverBlockStore: persists sticky divergence
         monotonic=time.monotonic,
         wall_clock=None,  # () -> aware UTC datetime; injectable for tests
     ) -> None:
@@ -77,6 +79,13 @@ class CityWorker:
         self._forecast = forecast
         self._feed_reader = feed_reader
         self._feed_stale_notified = False
+        # Resolver cross-check: no entries unless our resolution source has
+        # agreed with the resolver's own published table across the trailing
+        # 24 h (resolver_guard.py). ``_resolver_state`` remembers the last
+        # verdict state so the notice prints on change, not every tick.
+        self._resolver = resolver
+        self._resolver_blocks = resolver_blocks
+        self._resolver_state: Optional[str] = None
         self._wall = wall_clock or (lambda: datetime.now(timezone.utc))
         self._stop = threading.Event()
         # Tolerant crossed-book tracking (paper mode, spec §9).
@@ -147,6 +156,12 @@ class CityWorker:
         # Only log/print when the reading actually changes — with 1s hot polling
         # the same observation is re-served every tick and would flood the output.
         if obs is not None:
+            # Feed the resolver cross-check every observation that drives the
+            # running max (idempotent, keyed by observation time), so a
+            # divergence is detectable the moment the resolver publishes its
+            # own row for the same instant.
+            if self._resolver is not None:
+                self._resolver.note_ours(obs.obs_time, obs.temp_c)
             key = (obs.obs_time, obs.temp_c, obs.is_correction)
             if key != self._last_metar_key:
                 self._last_metar_key = key
@@ -286,6 +301,14 @@ class CityWorker:
         if self._risk.is_city_blocked(self.city):
             return
 
+        # 3a. Resolver cross-check. Our source must have agreed with the table
+        #     the market actually settles on for the whole trailing window;
+        #     anything else (including simply not enough data to prove it) means
+        #     no entries. Runs after the exits above so a blocked city still
+        #     maintains and fills its resting sells and keeps collecting data.
+        if not self._check_resolver(rmax):
+            return
+
         # Refresh the wallet balance before sizing: poll fast while a buy is
         # liftable (a dead bracket with a cheap NO in the book), and cool the
         # cadence down otherwise — so percentage sizing bases off the real
@@ -365,6 +388,67 @@ class CityWorker:
             self._maintain_recycle_sells(snapshot, frozenset(acted), blocked_this_tick)
         else:
             self._ensure_exits(snapshot)
+
+    def _check_resolver(self, rmax: Optional[int] = None) -> bool:
+        """Evaluate the resolver cross-check. Returns True if entries may proceed.
+
+        A DIVERGENT verdict is escalated to a sticky risk block and persisted to
+        disk, so it survives the daily rollover and process restarts and can only
+        be lifted by ``tools/resolver_clear``. An UNVERIFIED verdict (not enough
+        resolver history yet, or a city with no resolver table at all) simply
+        withholds entries and clears itself once coverage arrives.
+        """
+
+        if self._resolver is None:
+            return True
+        verdict = self._resolver.evaluate()
+        changed = verdict.state != self._resolver_state
+        self._resolver_state = verdict.state
+
+        if verdict.ok:
+            if changed:
+                self._reporter.event(self.city, "resolver_ok", pairs=verdict.pairs,
+                                     span_hours=round(verdict.span_hours, 1),
+                                     station=verdict.station)
+                self._reporter.notice(
+                    self.city,
+                    f"resolver cross-check OK: {verdict.reason}"
+                    + (f" (station {verdict.station})" if verdict.station else ""))
+            # Strict mode: also wait for the resolver's own table to reach the
+            # running max, closing the publish-lag window the 24h check leaves.
+            if (self._cfg.resolver_confirm_dead
+                    and not self._resolver.confirms_max(rmax)):
+                self._reporter.event(self.city, "resolver_max_unconfirmed",
+                                     running_max=rmax)
+                return False
+            return True
+
+        if verdict.sticky:
+            newly = self._risk.block_city_sticky(self.city, verdict.reason)
+            if self._resolver_blocks is not None:
+                self._resolver_blocks.block(
+                    self.city, reason="resolver divergence", detail=verdict.reason)
+            if newly or changed:
+                self._reporter.event(
+                    self.city, "resolver_divergence", reason=verdict.reason,
+                    station=verdict.station, ours_max=verdict.ours_max,
+                    theirs_max=verdict.theirs_max,
+                    mismatches=[m.describe() for m in verdict.mismatches[:10]])
+                # Divergence means our "certainty" is fiction — the one failure
+                # that has actually cost real money, so it gets a loud notice.
+                self._reporter.notice(
+                    self.city,
+                    f"TRADING BLOCKED — resolver divergence: {verdict.reason}. "
+                    "Investigate, then clear with: python -m "
+                    f"dead_bracket.tools.resolver_clear {self.city}")
+            return False
+
+        if changed:
+            self._reporter.event(self.city, "resolver_unverified",
+                                 reason=verdict.reason, pairs=verdict.pairs)
+            self._reporter.notice(
+                self.city, f"no entries — resolver cross-check unverified: {verdict.reason}")
+        return False
 
     def _evaluate_forecast(self, snapshot: MarketSnapshot, rmax: Optional[int],
                            skip_temps: frozenset[int]) -> list:

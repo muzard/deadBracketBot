@@ -1,8 +1,53 @@
 # Live trading runbook (Phase 2)
 
+> **LIVE IS LOCKED (2026-08-18).** `--live` refuses to start unless
+> `DEAD_BRACKET_ALLOW_LIVE=1` is set. On 2026-07-19 the bot emptied the wallet
+> on Seoul: RKSI's METAR printed 27 °C, Weather Underground's row for the same
+> instant read 26 °C (tenths pipeline: 79 °F = 26.1 °C), the 26 °C bracket was
+> marked dead, and the entire bankroll bought a NO that settled to $0. Nothing
+> was cross-checking our source against the table the market settles on.
+>
+> The failsafe now exists (`resolver_guard.py`, §0.0 below) but has **no soak
+> behind it**. Before unlocking, run paper until
+> `python -m dead_bracket.tools.resolver_status` shows the cities you intend to
+> trade sitting in `ok` for several consecutive days with zero divergences.
+
 > Live places **real signed orders** with **real funds**. Default mode is paper;
 > nothing below happens unless you pass `--live` with a non-zero `--bankroll`.
 > Validate with tiny caps on one market before scaling.
+
+## 0.0 The resolver cross-check (the gate that replaces the old assumption)
+
+Every city now polls the resolver's **own** published table (the TWC/WU location
+id in `config.RESOLVER_LOCATIONS`) into `data/<city>/wu_rows.jsonl`, and trades
+only when our source has matched it on **every paired observation across the
+trailing 24 h**. States:
+
+| state | meaning | trades? | clears |
+|---|---|---|---|
+| `ok` | full 24 h agreement, fresh rows, running maxima agree | yes | — |
+| `unverified` | thin/stale data, or no resolver table (Istanbul's LTFM serves none) | no | itself, once coverage arrives |
+| `divergent` | a paired ob or the day's running max disagreed | no | **only** `tools/resolver_clear <city>` |
+
+Divergence is sticky across ticks, daily rollovers and restarts
+(`data/_global/resolver_blocks.json`). Investigate before clearing — it means
+our source and the resolver are different instruments, so every "certain" dead
+bracket in that city is a guess.
+
+```bash
+python -m dead_bracket.tools.resolver_status -v      # who may trade, and why not
+python -m dead_bracket.tools.resolver_clear --list   # what is blocked
+```
+
+No `TWC_API_KEY` means nothing can be verified, so **no city trades**. That is
+deliberate: fail closed.
+
+Optional strict mode `RESOLVER_CONFIRM_DEAD=1` also requires the resolver's own
+table to have reached the running max before any bracket below it counts as
+dead. That closes the residual window (the resolver publishes 25–65 min late, so
+the freshest print — the only one worth trading — has nothing to disagree with
+yet), at the cost of the speed edge the strategy is built on. Measure it in
+paper before deciding.
 
 ## 0. Prerequisites — verify before any real order
 
@@ -85,20 +130,30 @@ API credentials automatically — `POLY_SIGNATURE_TYPE` is no longer needed.
 In live mode, [`apply_bankroll_pct`](src/dead_bracket/main.py) makes `--bankroll`
 a **percentage (0-100) of your current balance**, not a dollar amount. The
 balance starts from the wallet's USDC (read once at startup) and grows by
-realized PnL, so every cap — all three are equal, all-in on a single
-high-conviction dead bracket — grows as the bot wins and shrinks as it loses.
+realized PnL, so the caps grow as the bot wins and shrink as it loses.
+
+Sizing is **no longer all-in on one bracket** — that is precisely what turned
+the 2026-07-19 Seoul false-dead into a total loss rather than a bad day.
 
 | Cap | Live value (for `--bankroll P`) | Env to override |
 |-----|-------------:|-----------------|
-| Total exposure | `P% × balance` | `MAX_TOTAL_EXPOSURE` (only when `--bankroll 0`) |
-| Per-city exposure | `P% × balance` | `MAX_EXPOSURE_PER_CITY` (only when `--bankroll 0`) |
-| **Per-bracket exposure** | **`P% × balance`** (all-in) | `MAX_EXPOSURE_PER_BRACKET` (only when `--bankroll 0`) |
+| Total exposure | `min(P%, 90%) × balance` | `MAX_TOTAL_EXPOSURE` (only when `--bankroll 0`) |
+| Per-city exposure | `min(P%, 90%) × balance` | `MAX_EXPOSURE_PER_CITY` (only when `--bankroll 0`) |
+| **Per-bracket exposure** | **`min(P%, 25%) × balance`** | `MAX_BRACKET_PCT` / `MAX_EXPOSURE_PER_BRACKET` |
+| Deployable ceiling | `90% × balance`, minus open exposure | `MAX_DEPLOYED_PCT` |
 | Shares per bracket | 500 (hard ceiling) | `MAX_SHARES_PER_BRACKET` |
 
-e.g. with a $30 wallet, `--bankroll 50` → max bet $15; after a $5 win the
-balance is $35 so the next bet may be up to $17.50. Use `--balance` to override
-the starting balance (required in paper mode, where there is no wallet to read).
-When `--bankroll 0`, sizing falls back to the static `MAX_EXPOSURE_*` dollar caps.
+e.g. with a $30 wallet, `--bankroll 50` → $15 across the book but at most $7.50
+on any one bracket; after a $5 win the balance is $35 so those become $17.50 and
+$8.75. Use `--balance` to override the starting balance (required in paper mode,
+where there is no wallet to read). When `--bankroll 0`, sizing falls back to the
+static `MAX_EXPOSURE_*` dollar caps — but once a balance is known those are
+still clamped to it, so a $100 balance can never authorise a $1000 bet.
+
+**Paper equity compounds and persists.** Cumulative realised PnL is written to
+`data/_global/paper_ledger.json` and reloaded on restart, so a long soak shows a
+real equity curve; `roll_day` resets only the *daily* PnL the loss breaker
+reads. Delete that file to start a fresh soak.
 
 The kill-switch is **strict** in live: any crossed/invalid book trips a global,
 sticky `HALT` (you don't trade against a venue emitting broken books).

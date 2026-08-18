@@ -71,12 +71,20 @@ class CityConfig:
     # Calibrated feed-vs-METAR sensor noise (degC). None -> the inflated
     # config default until tools/forecast_calibrate.py measures it.
     sensor_sigma: Optional[float] = None
+    # The resolver's own observation table for this city (TWC/Weather
+    # Underground location id, e.g. "RKSI:9:KR"). The resolver_guard polls it
+    # and refuses to trade the city unless it has agreed with our resolution
+    # source across the trailing 24 h — the check that was missing when the
+    # 2026-07-19 Seoul false-dead (our METAR 27C vs WU 26.1C for the same
+    # instant) emptied the wallet. None -> the city can never be verified and
+    # therefore never trades. Populated from RESOLVER_LOCATIONS below.
+    resolver_location: Optional[str] = None
 
 
 # Paris -> LFPB, London -> EGLC (spec §10), plus additional European cities.
 # All (icao, tz) pairs are confirmed against the live markets; all of it is
 # config and trivially overridable if a market's resolution source changes.
-DEFAULT_CITIES: tuple[CityConfig, ...] = (
+_BASE_CITIES: tuple[CityConfig, ...] = (
     # Forecast feeds (feed_* fields): Tier-1 sub-hourly sources verified
     # 2026-07-08 (docs/subhourly_feed_openings_2026-07-02.md + live probes).
     # Station ids: MF 95088001 = "LE BOURGET AEROPORT" (RADOME, is_minutely,
@@ -271,6 +279,65 @@ DEFAULT_CITIES: tuple[CityConfig, ...] = (
 )
 
 
+# The resolver's own observation table per city — the literal rows Weather
+# Underground publishes and settles on, addressed by TWC location id. Every one
+# below was probed live on 2026-08-18 and returned a full day of rows for the
+# expected station; the ``obs_name`` each payload carries is recorded by the
+# collector so the station identity keeps being re-verified at runtime rather
+# than trusted from this table.
+#
+# Two entries are deliberately not a plain airport mapping:
+#   * shenzhen  ZGSZ:9:CN resolves to "Lau Fau Shan" (HKO 45035), NOT the ZGSZ
+#     airport — the resolver naming the different instrument in its own payload.
+#   * istanbul  LTFM serves ZERO rows, so the city cannot be cross-checked and
+#     therefore never trades (fail closed). Moscow and Tel Aviv, the other two
+#     WUNDERGROUND_EXEMPT cities, resolve off weather.gov rather than WU; their
+#     TWC table is still cross-checked as corroboration, and since weather.gov
+#     serves the same METARs it should agree — a disagreement there is a real
+#     signal, not noise.
+RESOLVER_LOCATIONS: dict[str, Optional[str]] = {
+    "paris": "LFPB:9:FR",
+    "london": "EGLC:9:GB",
+    "moscow": "UUWW:9:RU",
+    "milan": "LIMC:9:IT",
+    "madrid": "LEMD:9:ES",
+    "ankara": "LTAC:9:TR",
+    "istanbul": None,  # LTFM returns no rows — unverifiable, so untradeable
+    "helsinki": "EFHK:9:FI",
+    "amsterdam": "EHAM:9:NL",
+    "warsaw": "EPWA:9:PL",
+    "munich": "EDDM:9:DE",
+    "seoul": "RKSI:9:KR",
+    "tokyo": "RJTT:9:JP",
+    "shanghai": "ZSPD:9:CN",
+    "beijing": "ZBAA:9:CN",
+    "taipei": "RCSS:9:TW",
+    "guangzhou": "ZGGG:9:CN",
+    "busan": "RKPK:9:KR",
+    "singapore": "WSSS:9:SG",
+    "chongqing": "ZUCK:9:CN",
+    "qingdao": "ZSQD:9:CN",
+    "chengdu": "ZUUU:9:CN",
+    "wellington": "NZWN:9:NZ",
+    "kuala_lumpur": "WMKK:9:MY",
+    "lucknow": "VILK:9:IN",
+    "shenzhen": "ZGSZ:9:CN",  # -> "Lau Fau Shan", not the airport
+    "manila": "RPLL:9:PH",
+    "wuhan": "ZHHH:9:CN",
+    "karachi": "OPKC:9:PK",
+    "jeddah": "OEJN:9:SA",
+    "cape_town": "FACT:9:ZA",
+    "tel_aviv": "LLBG:9:IL",
+    "panama_city": "MPMG:9:PA",
+    "sao_paulo": "SBGR:9:BR",
+    "toronto": "CYYZ:9:CA",
+}
+
+DEFAULT_CITIES: tuple[CityConfig, ...] = tuple(
+    replace(c, resolver_location=RESOLVER_LOCATIONS.get(c.id)) for c in _BASE_CITIES
+)
+
+
 @dataclass(frozen=True)
 class Config:
     """Global strategy / risk / execution configuration (spec §10)."""
@@ -294,6 +361,17 @@ class Config:
     # instead: e.g. bankroll_pct=50 with a $30 balance caps a bet at $15, and as
     # wins grow the balance the cap grows with it. 0 keeps the static caps.
     bankroll_pct: float = 0.0
+    # Concentration limit (added after the 2026-07-19 Seoul wipe). Sizing used
+    # to make per-bracket = per-city = total, i.e. deliberately all-in on one
+    # dead bracket — which turned a SINGLE false-dead into a total loss. No one
+    # bracket may now hold more than this % of current equity, whichever sizing
+    # mode is active. 100 restores the old all-in behaviour.
+    max_bracket_pct: float = 25.0
+    # Hard solvency clamp: never commit more than this % of current equity in
+    # total open exposure, and never size a bet above the capital actually
+    # available (equity - open exposure). Guards the paper book too, where the
+    # static dollar caps used to let a $100 balance "buy" $1000 of NO.
+    max_deployed_pct: float = 90.0
     # Anti-sweep cap: the most of a bracket's displayed depth (<= CAP) a single
     # take may lift. 1.0 = take the whole displayed book; lower leaves a buffer
     # so we never sweep the entire offer at once. Thin markets (Shenzhen) are
@@ -437,6 +515,31 @@ class Config:
     forecast_sensor_sigma_default: float = 0.3
     mf_api_key: str = ""  # MF_API_KEY — Météo-France portail-api (paris)
     knmi_api_key: str = ""  # KNMI_API_KEY — KNMI Data Platform (amsterdam)
+    # --- Resolver cross-check (resolver_guard.py). The failsafe the 2026-07-19
+    # Seoul wipe proved missing: our resolution source and the resolver's own
+    # published table must agree across the trailing 24 h or the city does not
+    # trade. On by default and NOT something to disable casually — a city with
+    # no resolver_location (Istanbul) simply never verifies, and a proven
+    # divergence is sticky until a human clears it with
+    # ``python -m dead_bracket.tools.resolver_clear <city>``.
+    resolver_check: bool = True
+    resolver_window_hours: float = 24.0  # the "last 24h must match" window
+    resolver_min_pairs: int = 20  # matched obs required inside the window
+    resolver_min_span_hours: float = 23.0  # they must span ~the whole window
+    resolver_max_gap_hours: float = 3.0  # no long unpaired hole in the middle
+    resolver_max_lag_hours: float = 3.0  # resolver rows newer than this
+    # The resolver publishes ~an hour behind, so the running-max comparison
+    # only counts observations at least this old on both sides.
+    resolver_settle_lag_min: float = 90.0
+    resolver_tolerance_c: int = 0  # exact agreement; 1 would have allowed Seoul
+    resolver_poll_sec: float = 600.0  # table poll cadence (5-min CDN cache)
+    # Strict mode: additionally require the resolver's OWN table to have reached
+    # the running max before any bracket below it counts as dead. Closes the
+    # residual window the 24 h check cannot cover (the resolver publishes 25-65
+    # min late, so the newest print has nothing to disagree with yet) — at the
+    # cost of the speed edge the whole strategy is built on. Off by default;
+    # turn it on in paper to measure the trade-off.
+    resolver_confirm_dead: bool = False
     # Daily rollover: re-arm risk and settle positions at this tz's midnight so
     # the bot runs unattended across days. daily_rearm=False disables it.
     rollover_tz: str = "UTC"
@@ -455,6 +558,14 @@ class Config:
             raise ValueError("max_frac_of_depth must be in (0, 1]")
         if not (0.0 <= self.bankroll_pct <= 100.0):
             raise ValueError("bankroll_pct must be in [0, 100]")
+        if not (0.0 < self.max_bracket_pct <= 100.0):
+            raise ValueError("max_bracket_pct must be in (0, 100]")
+        if not (0.0 < self.max_deployed_pct <= 100.0):
+            raise ValueError("max_deployed_pct must be in (0, 100]")
+        if self.resolver_tolerance_c < 0:
+            raise ValueError("resolver_tolerance_c must be >= 0")
+        if self.resolver_window_hours <= 0:
+            raise ValueError("resolver_window_hours must be > 0")
         if self.lfs_predict_rounding not in ("half_up", "half_even", "floor"):
             raise ValueError("lfs_predict_rounding must be half_up, half_even or floor")
         if not (0.0 < self.kelly_fraction <= 0.5):
@@ -543,6 +654,18 @@ class Config:
             "forecast_sensor_sigma_default": float,
             "mf_api_key": str,
             "knmi_api_key": str,
+            "max_bracket_pct": float,
+            "max_deployed_pct": float,
+            "resolver_check": _as_bool,
+            "resolver_window_hours": float,
+            "resolver_min_pairs": int,
+            "resolver_min_span_hours": float,
+            "resolver_max_gap_hours": float,
+            "resolver_max_lag_hours": float,
+            "resolver_settle_lag_min": float,
+            "resolver_tolerance_c": int,
+            "resolver_poll_sec": float,
+            "resolver_confirm_dead": _as_bool,
             "rollover_tz": str,
         }
         for name, cast in casters.items():

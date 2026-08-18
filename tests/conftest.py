@@ -91,6 +91,8 @@ def build_worker(
     forecast=None,
     feed_reader=None,
     wall_clock=None,
+    resolver=None,
+    resolver_blocks=None,
 ) -> tuple[CityWorker, PaperExecutor, MetarFeed]:
     city_cfg = city_cfg or CityConfig(id=city, metar_icao=icao, tz=tz, market_terms=(city,))
     metar = MetarFeed(icao, fetch_fn=lambda _i: metar_raw, log_path=None)
@@ -101,5 +103,6 @@ def build_worker(
         city_cfg, config, metar=metar, market=market, executor=executor,
         strategy=strategy, risk=risk, reporter=reporter,
         forecast=forecast, feed_reader=feed_reader, wall_clock=wall_clock,
+        resolver=resolver, resolver_blocks=resolver_blocks,
     )
     return worker, executor, metar

@@ -598,3 +598,134 @@ def test_opportunity_counter_distinct_brackets(config, risk):
     worker.process_book(make_snapshot("paris", [
         make_bracket(22, asks=[(0.95, 1)]), make_bracket(23, asks=[(0.96, 1)])]))
     assert worker.opportunities_today == 2  # two distinct cheap dead brackets
+
+
+# ---------------------------------------------------------------------------
+# Resolver cross-check gating (the Seoul false-dead failsafe)
+# ---------------------------------------------------------------------------
+def _dead_no_snapshot(city="paris", temp=21):
+    """A dead bracket with a cheap NO — the setup that always buys."""
+
+    return make_snapshot(city, [make_bracket(temp, asks=[(0.90, 500)])])
+
+
+class _StubGuard:
+    """Minimal ResolverCrossCheck stand-in returning a fixed verdict."""
+
+    def __init__(self, verdict):
+        self.verdict = verdict
+        self.noted = []
+
+    def note_ours(self, obs_time, temp_c):
+        self.noted.append((obs_time, temp_c))
+
+    def evaluate(self, now=None):
+        return self.verdict
+
+
+def test_resolver_divergence_blocks_buys_and_sticks(config, risk, reporter):
+    from dead_bracket.resolver_guard import DIVERGENT, Mismatch, Verdict
+
+    verdict = Verdict(state=DIVERGENT, reason="ours=27C resolver=26C", pairs=40,
+                      mismatches=(Mismatch(1_752_890_400, 27, 26),))
+    worker, executor, metar = build_worker(
+        config=config, risk=risk, reporter=reporter,
+        resolver=_StubGuard(verdict))
+    metar._tracker._running_max = 22  # 21C bracket is dead
+
+    worker.process_book(_dead_no_snapshot())
+
+    assert ('paris', 21) not in executor.positions  # nothing bought
+    assert risk.is_city_blocked("paris") is True
+    assert "27C" in risk.sticky_block_reason("paris")
+    assert any("TRADING BLOCKED" in ln for ln in reporter.progress_lines)
+    # Sticky: it must still be blocked on the next trading day.
+    risk.roll_day("2026-07-20")
+    assert risk.is_city_blocked("paris") is True
+
+
+def test_resolver_divergence_is_persisted_for_the_next_process(config, risk,
+                                                              reporter, tmp_path):
+    from dead_bracket.resolver_guard import DIVERGENT, ResolverBlockStore, Verdict
+
+    store = ResolverBlockStore(str(tmp_path / "blocks.json"))
+    worker, _executor, metar = build_worker(
+        config=config, risk=risk, reporter=reporter,
+        resolver=_StubGuard(Verdict(state=DIVERGENT, reason="ours=27C resolver=26C")),
+        resolver_blocks=store)
+    metar._tracker._running_max = 22
+    worker.process_book(_dead_no_snapshot())
+
+    assert ResolverBlockStore(str(tmp_path / "blocks.json")).blocked("paris")
+
+
+def test_unverified_resolver_withholds_buys_without_a_sticky_block(config, risk,
+                                                                   reporter):
+    from dead_bracket.resolver_guard import UNVERIFIED, Verdict
+
+    worker, executor, metar = build_worker(
+        config=config, risk=risk, reporter=reporter,
+        resolver=_StubGuard(Verdict(state=UNVERIFIED, reason="no resolver rows yet")))
+    metar._tracker._running_max = 22
+    worker.process_book(_dead_no_snapshot())
+
+    assert ('paris', 21) not in executor.positions
+    # Not sticky: coverage arriving later must re-enable the city by itself.
+    assert risk.sticky_block_reason("paris") is None
+    assert risk.is_city_blocked("paris") is False
+
+
+def test_verified_resolver_allows_the_buy(config, risk, reporter):
+    from dead_bracket.resolver_guard import OK, Verdict
+
+    worker, executor, metar = build_worker(
+        config=config, risk=risk, reporter=reporter,
+        resolver=_StubGuard(Verdict(state=OK, reason="48 obs matched over 23.5h",
+                                    pairs=48, span_hours=23.5)))
+    metar._tracker._running_max = 22
+    worker.process_book(_dead_no_snapshot())
+
+    assert executor.positions[("paris", 21)].shares > 0
+
+
+def test_worker_without_a_resolver_is_unchanged(config, risk, reporter):
+    # The guard is opt-in at construction; existing wiring must not change.
+    worker, executor, metar = build_worker(config=config, risk=risk, reporter=reporter)
+    metar._tracker._running_max = 22
+    worker.process_book(_dead_no_snapshot())
+    assert executor.positions[("paris", 21)].shares > 0
+
+
+def test_strict_mode_waits_for_resolver_to_confirm_the_running_max(config, risk,
+                                                                   reporter):
+    from dataclasses import replace as _replace
+
+    from dead_bracket.resolver_guard import OK, Verdict
+
+    class _Guard(_StubGuard):
+        def __init__(self, verdict, confirms):
+            super().__init__(verdict)
+            self._confirms = confirms
+
+        def confirms_max(self, rmax, now=None):
+            return self._confirms
+
+    strict = _replace(config, resolver_confirm_dead=True)
+    ok = Verdict(state=OK, reason="matched", pairs=48, span_hours=23.5)
+
+    # Resolver has not caught up: agreement alone must not authorise the buy.
+    worker, executor, metar = build_worker(
+        config=strict, risk=risk, reporter=reporter,
+        resolver=_Guard(ok, confirms=False))
+    metar._tracker._running_max = 22
+    worker.process_book(_dead_no_snapshot())
+    assert ("paris", 21) not in executor.positions
+
+    # Once its own table reaches the running max, the entry proceeds.
+    risk2 = RiskManager(strict)
+    worker2, executor2, metar2 = build_worker(
+        config=strict, risk=risk2, reporter=reporter,
+        resolver=_Guard(ok, confirms=True))
+    metar2._tracker._running_max = 22
+    worker2.process_book(_dead_no_snapshot())
+    assert executor2.positions[("paris", 21)].shares > 0

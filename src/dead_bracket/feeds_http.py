@@ -797,6 +797,59 @@ def make_twc_historical_fetch(
     return fetch
 
 
+def make_twc_range_fetch(
+    *,
+    api_key: str,
+    location: str,
+    session=None,
+    user_agent: str = _DEFAULT_UA,
+    timeout: float = 20.0,
+) -> Callable[[str, str], Optional[dict]]:
+    """Fetch callable for a DATE RANGE of the resolver's observation table.
+
+    The resolver cross-check (``resolver_guard.py``) needs a rolling 24 h, which
+    straddles a local-day boundary, so it asks for ``[yesterday, today]``. The
+    timeseries endpoint cannot serve this: its ``hours`` parameter is capped
+    (>= 24 returns zero rows) and it truncates to 24 rows ~ 12 h, verified live
+    2026-08-18. The historical endpoint takes ``startDate``/``endDate`` as
+    ``yyyyMMdd`` interpreted in the STATION's local frame — the same day
+    boundary the market resolves on — and returns ~90 rows for a two-day span.
+
+    No cache-bust param (api.weather.com 400s on unknown params); the date range
+    varies the cache key and the poll cadence is far longer than the 5-minute
+    CDN TTL.
+    """
+
+    sess = session or (requests.Session() if requests else None)
+
+    def fetch(start_yyyymmdd: str, end_yyyymmdd: str) -> Optional[dict]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        try:
+            resp = sess.get(
+                TWC_HISTORICAL_URL.format(location=location),
+                params={
+                    "apiKey": api_key,
+                    "units": "m",
+                    "startDate": start_yyyymmdd,
+                    "endDate": end_yyyymmdd,
+                },
+                headers={"User-Agent": user_agent},
+                timeout=timeout,
+            )
+        except Exception:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    return fetch
+
+
 def make_tgftp_fetch(
     *, user_agent: str = _DEFAULT_UA, timeout: float = 5.0, session=None
 ) -> Callable[[str], Optional[str]]:

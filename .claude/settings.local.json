@@ -72,7 +72,17 @@
       "Bash(pkill -f \"droneplanner serve\")",
       "Bash(curl -s -o /dev/null -w \"port 8799 now: HTTP %{http_code}\\\\n\" --max-time 2 http://127.0.0.1:8799/)",
       "Bash(git init *)",
-      "Bash(cp \"/Users/arttu/Library/Application Support/Claude/local-agent-mode-sessions/74f121a9-d4a9-4ee5-bb8a-6f6d10bc6006/c0fd509b-9c3f-4cf8-a505-fde2fe5521b7/local_53d6a45f-88e9-47a8-bfe8-76631ec30783/outputs/arb-scanner-plan.md\" /Users/arttu/Projects/hustle/arbScanner/docs/arb-scanner-plan.md)"
+      "Bash(cp \"/Users/arttu/Library/Application Support/Claude/local-agent-mode-sessions/74f121a9-d4a9-4ee5-bb8a-6f6d10bc6006/c0fd509b-9c3f-4cf8-a505-fde2fe5521b7/local_53d6a45f-88e9-47a8-bfe8-76631ec30783/outputs/arb-scanner-plan.md\" /Users/arttu/Projects/hustle/arbScanner/docs/arb-scanner-plan.md)",
+      "Bash(python3 -m venv /Users/arttu/Projects/hustle/arbScanner/.venv)",
+      "Bash(/Users/arttu/Projects/hustle/arbScanner/.venv/bin/pip install *)",
+      "Bash(.venv/bin/arb-scan replay *)",
+      "Bash(.venv/bin/arb-scan budget *)",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"python -\")",
+      "Bash(echo \"--- exit $? ---\")",
+      "Bash(ps -p 3974 -o pid,stat,command)",
+      "Bash(ps -p 66262 -o pid,stat,command)",
+      "Bash(sed 's|^|  |')"
     ]
   }
 }

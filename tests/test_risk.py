@@ -42,15 +42,17 @@ def test_bankroll_pct_caps_track_balance(config):
     cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000)
     r = RiskManager(cfg, initial_balance=30.0)
     assert r.current_balance == pytest.approx(30.0)
-    # All three caps track the same $15 budget (all-in on a single bracket).
+    # City/total track the $15 bankroll budget; the per-bracket cap is
+    # additionally held to max_bracket_pct (25%) of equity = $7.50, so one
+    # bracket can no longer be the whole account (post-Seoul concentration cap).
     assert r.total_cap_remaining() == pytest.approx(15.0 / cfg.cap)
     assert r.per_city_cap_remaining("paris") == pytest.approx(15.0 / cfg.cap)
-    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(15.0 / cfg.cap)
+    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(7.5 / cfg.cap)
 
     r.record_sell_fill(sell("paris", 22, 1.0, 5), cost_released=0.0)  # realise +$5
     assert r.current_balance == pytest.approx(35.0)
     assert r.total_cap_remaining() == pytest.approx(17.5 / cfg.cap)
-    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(17.5 / cfg.cap)
+    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(8.75 / cfg.cap)
 
 
 def test_bankroll_pct_shrinks_on_loss(config):
@@ -63,7 +65,8 @@ def test_bankroll_pct_shrinks_on_loss(config):
 
 
 def test_bankroll_pct_subtracts_open_exposure(config):
-    cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000)
+    cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000,
+                  max_bracket_pct=100.0)  # isolate from the concentration cap
     r = RiskManager(cfg, initial_balance=100.0)  # $50 budget
     r.record_buy_fill(buy("paris", 22, 0.50, 40))  # $20 open exposure
     # Equity unchanged by an open buy; remaining budget = $50 - $20 = $30.
@@ -212,3 +215,110 @@ def test_non_recoverable_city_halt_is_sticky(config):
     r.halt_city("paris", "downward revision")  # recoverable defaults False
     assert r.recover_city("paris") is False
     assert r.is_city_blocked("paris") is True
+
+
+# ---------------------------------------------------------------------------
+# Bankroll tracks results (post-Seoul): cumulative equity, solvency,
+# concentration, and the sticky resolver block.
+# ---------------------------------------------------------------------------
+def test_equity_compounds_across_daily_rollovers(config):
+    # roll_day used to zero the realised PnL that the sizing base was computed
+    # from, so every midnight the bankroll snapped back to the starting balance
+    # and results never compounded. The DAILY figure still resets (the loss
+    # breaker needs it); the equity base must not.
+    cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000)
+    r = RiskManager(cfg, initial_balance=100.0)
+    r.record_sell_fill(sell("paris", 22, 1.0, 20), cost_released=0.0)  # +$20
+    assert r.current_balance == pytest.approx(120.0)
+
+    r.roll_day("2026-07-20")
+    assert r.realized_pnl == 0.0  # daily figure resets
+    assert r.cumulative_pnl == pytest.approx(20.0)
+    assert r.current_balance == pytest.approx(120.0)  # equity carried over
+
+    r.record_settlement(city="paris", temp=21, shares=10, cost_basis=10.0, payout=0.0)
+    r.roll_day("2026-07-21")
+    assert r.cumulative_pnl == pytest.approx(10.0)  # a loss shrinks it too
+    assert r.current_balance == pytest.approx(110.0)
+
+
+def test_ledger_resumes_the_equity_curve_after_a_restart(config, tmp_path):
+    from dead_bracket.risk import Ledger
+
+    cfg = replace(config, bankroll_pct=50.0, max_shares_per_bracket=100_000)
+    path = str(tmp_path / "paper_ledger.json")
+    ledger = Ledger(path, initial_balance=100.0)
+    r = RiskManager(cfg, initial_balance=100.0, ledger=ledger)
+    r.record_sell_fill(sell("paris", 22, 1.0, 30), cost_released=0.0)  # +$30
+
+    resumed = Ledger(path, initial_balance=999.0)  # a later --balance must not rebase
+    assert resumed.initial_balance == pytest.approx(100.0)
+    assert resumed.cumulative_pnl == pytest.approx(30.0)
+    assert resumed.equity == pytest.approx(130.0)
+    r2 = RiskManager(cfg, initial_balance=resumed.initial_balance, ledger=resumed)
+    assert r2.current_balance == pytest.approx(130.0)
+
+
+def test_ledger_write_failure_never_breaks_settlement(config, tmp_path):
+    class Boom:
+        cumulative_pnl = 0.0
+
+        def save(self, value):
+            raise OSError("disk full")
+
+    r = RiskManager(config, initial_balance=100.0, ledger=Boom())
+    r.record_sell_fill(sell("paris", 22, 1.0, 10), cost_released=0.0)
+    assert r.cumulative_pnl == pytest.approx(10.0)  # accounting still correct
+
+
+def test_caps_never_exceed_available_capital(config):
+    # The paper book used to let a $100 balance "buy" $1000 of NO, because the
+    # static dollar caps never consulted the balance at all.
+    r = RiskManager(config, initial_balance=100.0)  # static caps, known equity
+    assert config.max_exposure_per_bracket == 1000.0  # the old flat cap
+    budget = config.max_deployed_pct / 100.0 * 100.0
+    assert r.total_cap_remaining() == pytest.approx(budget / config.cap)
+    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(
+        min(budget, config.max_bracket_pct / 100.0 * 100.0) / config.cap)
+
+    r.record_buy_fill(buy("paris", 22, 0.90, 100))  # $90 committed
+    assert r.total_cap_remaining() == pytest.approx(0.0)  # nothing left to spend
+
+
+def test_static_caps_survive_when_equity_is_unknown(config):
+    # No wallet source and no starting balance (the historical default): there
+    # is nothing to clamp against, so the static caps must apply unchanged
+    # rather than being silently zeroed.
+    r = RiskManager(config)
+    assert r.current_balance == 0.0
+    assert r.total_cap_remaining() == pytest.approx(
+        config.max_total_exposure / config.cap)
+
+
+def test_concentration_cap_stops_one_bracket_taking_the_account(config):
+    # The Seoul wipe was a single bracket funded with the entire bankroll.
+    cfg = replace(config, bankroll_pct=100.0, max_shares_per_bracket=100_000,
+                  max_bracket_pct=25.0)
+    r = RiskManager(cfg, initial_balance=200.0)
+    # Even at bankroll_pct=100 the city cap stops at the 90% solvency ceiling,
+    # and one bracket stops at 25% of equity.
+    assert r.per_city_cap_remaining("paris") == pytest.approx(180.0 / cfg.cap)
+    assert r.per_bracket_cap_remaining("paris", 22) == pytest.approx(50.0 / cfg.cap)
+
+
+def test_sticky_block_survives_the_daily_rollover(config):
+    # Resolver divergence means the source is wrong, which is still true
+    # tomorrow — unlike every other per-city halt, roll_day must not clear it.
+    r = RiskManager(config)
+    assert r.block_city_sticky("seoul", "resolver divergence: 27C vs 26C") is True
+    assert r.block_city_sticky("seoul", "again") is False
+    assert r.is_city_blocked("seoul") is True
+
+    r.roll_day("2026-07-20")
+    assert r.is_city_blocked("seoul") is True
+    assert "27C" in r.sticky_block_reason("seoul")
+    assert r.recover_city("seoul") is False  # not clearable as a normal halt
+
+    assert r.clear_sticky_block("seoul") is True  # only the manual tool does it
+    assert r.is_city_blocked("seoul") is False
+    assert r.clear_sticky_block("seoul") is False

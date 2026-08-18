@@ -79,7 +79,11 @@ src/dead_bracket/
   reporter.py    # strict console policy + telemetry files (§8, §11)
   worker.py      # CityWorker: one city's cycle, restart-safe (§5)
   supervisor.py  # runs cities concurrently, isolated (§5)
+  resolver_guard.py   # THE post-Seoul failsafe: 24h agreement between our source
+                      # and the resolver's own table, or the city does not trade
   lfs_calibration.py  # Shenzhen/Lau Fau Shan calibration collectors + WU-prediction shadow
+  tools/resolver_status.py # per-city: may it trade, and why not?
+  tools/resolver_clear.py  # lift a sticky divergence block (human decision)
   tools/lfs_calibrate.py  # offline K1/K2/K3/ε analysis -> calibration report
   tools/forecast_calibrate.py  # offline forecast report: sensor σ, Brier, hold rate, paper PnL
   main.py        # CLI entry point
@@ -272,6 +276,18 @@ decision.**
 
 ## Safety (spec §9)
 
+- **Resolver cross-check (the gate everything else sits behind).** A city trades
+  only after our resolution source and the resolver's **own published table**
+  have matched on every paired observation across the trailing 24 h. Anything
+  less — thin data, stale rows, no resolver table, no API key — withholds
+  entries; a proven mismatch is a **sticky block** that survives rollovers and
+  restarts until `python -m dead_bracket.tools.resolver_clear <city>`. This
+  exists because on 2026-07-19 nothing checked it: RKSI's METAR said 27 °C,
+  Weather Underground's row for the same instant said 26 °C, and the bot spent
+  the entire wallet on a "certain" NO that settled to $0. Check status with
+  `python -m dead_bracket.tools.resolver_status`.
+- **Live mode is locked** behind `DEAD_BRACKET_ALLOW_LIVE=1` until that guard
+  has a clean paper soak behind it.
 - Trades a bracket only when `temp < running_max` from the **resolution METAR**.
 - **Downward-revision guard:** a `COR` that lowers the max never un-deads an
   acted bracket but halts new entries for that city.
@@ -279,10 +295,14 @@ decision.**
   per-city / total dollar exposure, `MAX_FRAC_OF_DEPTH` (max share of displayed
   depth ≤CAP one take lifts; default **1.0** = take the whole book, lower leaves a buffer),
   `MAX_DAILY_LOSS` → kill-switch. `--bankroll` is a **percent of current balance**
-  (`bankroll_pct`): total = per-city = per-bracket = that % of `balance +
-  realized_pnl` (all-in on conviction), so bets grow as the bot wins. `--bankroll
-  0` falls back to the static `MAX_EXPOSURE_*` dollar caps. Exposure frees on
-  every sell fill and resets at the daily rollover.
+  (`bankroll_pct`): total and per-city are that % of `balance + cumulative
+  realized_pnl`, so bets grow as the bot wins. **No single bracket may exceed
+  `MAX_BRACKET_PCT` (25%) of equity** and nothing may exceed `MAX_DEPLOYED_PCT`
+  (90%) or the capital actually available — the old all-in-on-one-bracket sizing
+  is what made one false-dead a total loss. `--bankroll 0` falls back to the
+  static `MAX_EXPOSURE_*` dollar caps, themselves clamped to a known balance.
+  Exposure frees on every sell fill and resets at the daily rollover; the
+  **equity** does not reset — it persists in `data/_global/paper_ledger.json`.
 - **SPECIs:** off-cycle special reports are included by default.
 - **Kill-switch** on stale METAR, repeated order errors, crossed/invalid book,
   or a daily-loss breach.

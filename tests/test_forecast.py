@@ -262,15 +262,34 @@ def test_paused_guard_or_blocked_city_stops_entries():
 
 
 def test_kelly_sizing_scales_with_balance_and_fraction():
-    intents_small = make_strategy(balance=50.0)[0].evaluate(
+    # Isolate Kelly: max_bracket_pct would otherwise clip both sizes to the same
+    # concentration ceiling and hide the doubling (see the concentration tests
+    # in test_risk.py for that limit's own coverage).
+    base = replace(Config(), max_bracket_pct=100.0)
+    intents_small = make_strategy(config=base, balance=50.0)[0].evaluate(
         snap_alive_30(), 30, reading(31.6), NOW)
-    intents_big = make_strategy(balance=200.0)[0].evaluate(
+    intents_big = make_strategy(config=base, balance=200.0)[0].evaluate(
         snap_alive_30(), 30, reading(31.6), NOW)
     assert intents_big[0].size > intents_small[0].size
-    half = replace(Config(), kelly_fraction=0.5)
+    half = replace(base, kelly_fraction=0.5)
     intents_half = make_strategy(config=half, balance=50.0)[0].evaluate(
         snap_alive_30(), 30, reading(31.6), NOW)
     assert intents_half[0].size == pytest.approx(2 * intents_small[0].size, abs=1)
+
+
+def test_concentration_cap_clips_forecast_kelly_size():
+    # The forecast path sizes through the same per-bracket cap, so the post-Seoul
+    # concentration limit applies to it too. Quarter-Kelly already stakes only
+    # ~14% of balance here, so the 25% default does not bind — a tighter limit
+    # shows the clamp is genuinely in the path rather than dead config.
+    tight = replace(Config(), max_bracket_pct=5.0)
+    loose = replace(Config(), max_bracket_pct=100.0)
+    clipped = make_strategy(config=tight, balance=100.0)[0].evaluate(
+        snap_alive_30(), 30, reading(31.6), NOW)
+    free = make_strategy(config=loose, balance=100.0)[0].evaluate(
+        snap_alive_30(), 30, reading(31.6), NOW)
+    assert clipped[0].size < free[0].size
+    assert clipped[0].size * clipped[0].limit_px <= 5.0 + 1e-9
 
 
 def test_zero_balance_means_no_forecast_trades():
