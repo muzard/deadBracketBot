@@ -128,3 +128,29 @@ def test_bankroll_pct_out_of_range_rejected():
     from dataclasses import replace
     with pytest.raises(ValueError):
         replace(Config(), bankroll_pct=150.0)
+
+
+# ---------------------------------------------------------------------------
+# Resolution source per city (measured 2026-08-18; see RESOLVER_LOCATIONS)
+# ---------------------------------------------------------------------------
+def test_resolver_locations_cover_every_city_except_istanbul():
+    from dead_bracket.config import RESOLVER_LOCATIONS, Config
+
+    for c in Config().cities:
+        assert c.id in RESOLVER_LOCATIONS, f"{c.id} has no resolver entry"
+    # Istanbul's LTFM serves no rows, so it can never be verified -> never trades.
+    assert RESOLVER_LOCATIONS["istanbul"] is None
+    assert next(c for c in Config().cities if c.id == "istanbul").resolver_location is None
+
+
+def test_only_the_measured_cities_read_from_the_resolver_table():
+    # The METAR agreed with the resolver 100% on 31 of 34 cities, so only the
+    # two that provably diverge give up the speed edge.
+    from dead_bracket.config import Config
+
+    sourced = {c.id for c in Config().cities if c.resolution_source == "resolver"}
+    assert sourced == {"seoul", "shenzhen"}
+    for c in Config().cities:
+        assert c.resolution_source in ("metar", "resolver")
+        if c.resolution_source == "resolver":
+            assert c.resolver_location, f"{c.id} needs a table to read"

@@ -25,12 +25,25 @@ paths, one order pipeline:
 
 ## STOP — read this before touching live trading (2026-08-18)
 The bot **wiped the live wallet on 2026-07-19** (Seoul, ~$170 -> $0.90). RKSI's
-METAR printed `27/22`; Weather Underground's row for that same instant read
-26 °C (its RKSI pipeline carries tenths — 79 °F = 26.1 °C — where the METAR
-encodes whole degrees). Our running max went to 27, the 26 °C bracket was
-marked dead, and the whole bankroll bought a NO that settled to $0 because WU's
-daily High never left 26. **The Shenzhen "WU table ≠ our source" failure class
-was never city-specific — it applies to every WU-resolved city.**
+METAR printed `27/22`; the resolver's row for that same instant held 26 °C. Our
+running max went to 27, the 26 °C bracket was marked dead, and the whole
+bankroll bought a NO that settled to $0 because WU's daily High never left 26.
+
+**Which cities this actually affects — measured, not assumed** (2 months of
+resolver rows vs our METAR logs, 2026-08-18; the numbers live in
+`config.RESOLVER_LOCATIONS`):
+- **31 of 34 checkable cities agree 100.0%** with zero false-dead days. For
+  them the METAR *is* the resolver's data; nothing needs to change.
+- **seoul 99.1%** — 1 false-dead day in 21 (the wipe). Same station, aligned
+  timestamps, and every resolver row is an exact whole-°C→°F conversion, so it
+  is neither a lag nor a tenths artifact: the table just holds a different
+  whole degree ~0.9% of the time. Irreducible from the METAR.
+- **shenzhen 15.0%** — 5 false-dead days in 14; a different station entirely
+  (Lau Fau Shan). No transform recovers it.
+
+Both now read the resolver's own closed rows instead of their METAR
+(`resolution_source="resolver"`); verified live to reproduce the resolver's
+daily max exactly.
 
 Consequences now in the code:
 - **Live mode is LOCKED.** `--live` refuses unless `DEAD_BRACKET_ALLOW_LIVE=1`.
@@ -111,14 +124,27 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feed
   `tools/forecast_calibrate.py` = the offline gate report.
 
 ## Non-negotiable invariants (each has tests + a memory note — don't regress)
+- **The running max must come from the source the market resolves on.**
+  `CityConfig.resolution_source` is `metar` for the 31 cities measured to agree
+  with the resolver 100%, and `resolver` for **seoul + shenzhen**
+  (`config.RESOLVER_SOURCED_CITIES`), whose METAR provably does not track it —
+  they read the resolver's OWN closed rows (`wu_rows.jsonl` ->
+  `TwcResolverFetcher` -> `metar_resolver.jsonl`). A resolver-sourced city with
+  no key/table has NO valid source and idles rather than falling back to the
+  METAR we know is wrong. Cost is the 26-66 min publish lag, affordable because
+  sub-CAP dead-NO offers persist much longer in the thin markets (shenzhen
+  median 108 min liftable, 57% >= 60 min).
 - **No city trades without 24 h of resolver agreement** (`resolver_guard.py`).
   A per-city poller reads the resolver's OWN published table (TWC/WU location
   id in `CityConfig.resolver_location`, one verified entry per city in
   `config.RESOLVER_LOCATIONS`) into `data/<city>/wu_rows.jsonl`, pairs it with
   our observations by timestamp, and allows entries only in state `ok`: every
-  paired ob in the trailing 24 h matched exactly, coverage spans the window
-  with no long hole, the resolver's rows are fresh, and the local-day running
-  maxima agree. `unverified` (thin/stale data, or a city with no resolver table
+  paired ob in the trailing 24 h matched exactly, the matched history REACHES
+  BACK `resolver_min_reach_hours` (23 h) and is fresh within
+  `resolver_max_lag_hours` with no hole over `resolver_max_gap_hours`, and the
+  local-day running maxima agree. Coverage is reach-back + freshness, never a
+  *span*: the resolver publishes 26-96 min late, so a 23 h span inside a 24 h
+  window is arithmetically unreachable and made every city flap. `unverified` (thin/stale data, or a city with no resolver table
   — Istanbul's LTFM serves none) withholds entries and self-clears.
   `divergent` is **sticky**: it survives ticks, rollovers and restarts
   (`data/_global/resolver_blocks.json`) and only

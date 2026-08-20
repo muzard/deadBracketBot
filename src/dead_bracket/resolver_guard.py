@@ -197,19 +197,26 @@ class ResolverCrossCheck:
         tz: Optional[ZoneInfo] = None,
         window_hours: float = 24.0,
         min_pairs: int = 20,
-        min_span_hours: float = 23.0,
+        min_reach_hours: float = 23.0,
         max_gap_hours: float = 3.0,
         max_lag_hours: float = 3.0,
         settle_lag_min: float = 90.0,
         tolerance_c: int = 0,
         configured: bool = True,
+        self_sourced: bool = False,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self.city = city
         self._tz = tz
         self._window = float(window_hours) * 3600.0
         self._min_pairs = int(min_pairs)
-        self._min_span = float(min_span_hours) * 3600.0
+        # How far BACK the verified history must reach. Deliberately not a
+        # "span" (newest - oldest): the resolver publishes 26-96 min late, so
+        # the achievable span is only ``window - lag`` and a 23h span inside a
+        # 24h window is arithmetically unreachable — it made every city flap on
+        # how fresh the resolver happened to be. Reach-back is lag-independent;
+        # freshness at the near end is enforced separately by ``max_lag_hours``.
+        self._min_reach = float(min_reach_hours) * 3600.0
         self._max_gap = float(max_gap_hours) * 3600.0
         self._max_lag = float(max_lag_hours) * 3600.0
         self._settle_lag = float(settle_lag_min) * 60.0
@@ -218,6 +225,16 @@ class ResolverCrossCheck:
         # which the resolver API serves no rows for) can never be verified, so
         # it stays permanently ``unverified`` -> never trades. Fail closed.
         self._configured = bool(configured)
+        # ``self_sourced``: this city's running max already comes FROM the
+        # resolver's own rows (resolution_source="resolver" — seoul, shenzhen).
+        # There is then nothing to cross-check: the two sides are the same data
+        # by construction, and they cannot even be paired, because the feed
+        # labels a closed row at slot+50min while the row itself is keyed at the
+        # slot start. Comparing them would leave the city permanently
+        # "unverified" and silently untradeable. What still matters — and is
+        # what this mode checks — is that the resolver's rows are actually
+        # arriving, fresh, and covering the window.
+        self._self_sourced = bool(self_sourced)
         self._clock = clock
         self._lock = threading.Lock()
         self._ours: dict[int, int] = {}
@@ -321,6 +338,13 @@ class ResolverCrossCheck:
 
             now_ts = now.timestamp()
             cutoff = now_ts - self._window
+
+            # Self-sourced city: the running max already IS the resolver's own
+            # table, so gate on the health of that table rather than on an
+            # agreement that is true by construction and unpairable in practice.
+            if self._self_sourced:
+                return self._evaluate_self_sourced(now_ts, cutoff)
+
             pairs: list[tuple[int, int, int]] = []
             for epoch in sorted(self._ours):
                 if epoch < cutoff or epoch > now_ts:
@@ -365,8 +389,8 @@ class ResolverCrossCheck:
                     station=self._station,
                 )
 
-            # 3. Coverage: enough pairs, spanning the required window, with no
-            #    long unpaired hole in the middle.
+            # 3. Coverage: enough pairs, reaching back far enough, fresh at the
+            #    near end, with no long unpaired hole in between.
             if len(pairs) < self._min_pairs:
                 return Verdict(
                     state=UNVERIFIED,
@@ -376,11 +400,22 @@ class ResolverCrossCheck:
                     station=self._station,
                 )
             span = pairs[-1][0] - pairs[0][0]
-            if span < self._min_span:
+            reach = now_ts - pairs[0][0]
+            if reach < self._min_reach:
                 return Verdict(
                     state=UNVERIFIED,
-                    reason=f"matched obs span only {span / 3600:.1f}h "
-                           f"(need {self._min_span / 3600:.0f}h)",
+                    reason=f"verified history only reaches back {reach / 3600:.1f}h "
+                           f"(need {self._min_reach / 3600:.0f}h)",
+                    pairs=len(pairs),
+                    span_hours=span / 3600.0,
+                    station=self._station,
+                )
+            fresh = now_ts - pairs[-1][0]
+            if fresh > self._max_lag:
+                return Verdict(
+                    state=UNVERIFIED,
+                    reason=f"newest matched ob is {fresh / 3600:.1f}h old "
+                           f"(max {self._max_lag / 3600:.0f}h)",
                     pairs=len(pairs),
                     span_hours=span / 3600.0,
                     station=self._station,
@@ -428,6 +463,52 @@ class ResolverCrossCheck:
                 ours_max=ours_max,
                 theirs_max=theirs_max,
             )
+
+    def _evaluate_self_sourced(self, now_ts: float, cutoff: float) -> Verdict:
+        """Coverage/freshness gate for a city reading the resolver directly.
+
+        Same fail-closed shape as the comparison path — no rows, stale rows,
+        thin coverage or a long hole all withhold entries — minus the pairwise
+        agreement, which cannot diverge when there is only one source.
+        Caller holds the lock.
+        """
+
+        rows = sorted(e for e in self._theirs if cutoff <= e <= now_ts)
+        if not self._theirs:
+            return Verdict(state=UNVERIFIED, reason="no resolver rows yet",
+                           station=self._station)
+        lag = now_ts - max(self._theirs)
+        if lag > self._max_lag:
+            return Verdict(
+                state=UNVERIFIED,
+                reason=f"resolver rows stale ({lag / 3600:.1f}h old)",
+                pairs=len(rows), station=self._station)
+        if len(rows) < self._min_pairs:
+            return Verdict(
+                state=UNVERIFIED,
+                reason=f"only {len(rows)} resolver rows in the last "
+                       f"{self._window / 3600:.0f}h (need {self._min_pairs})",
+                pairs=len(rows), station=self._station)
+        span = rows[-1] - rows[0]
+        reach = now_ts - rows[0]
+        if reach < self._min_reach:
+            return Verdict(
+                state=UNVERIFIED,
+                reason=f"resolver rows only reach back {reach / 3600:.1f}h "
+                       f"(need {self._min_reach / 3600:.0f}h)",
+                pairs=len(rows), span_hours=span / 3600.0, station=self._station)
+        gap = max((b - a for a, b in zip(rows, rows[1:])), default=0)
+        if gap > self._max_gap:
+            return Verdict(
+                state=UNVERIFIED,
+                reason=f"{gap / 3600:.1f}h hole in the resolver's rows "
+                       f"(max {self._max_gap / 3600:.0f}h)",
+                pairs=len(rows), span_hours=span / 3600.0, station=self._station)
+        return Verdict(
+            state=OK,
+            reason=f"reading the resolver directly: {len(rows)} rows over "
+                   f"{span / 3600:.1f}h (nothing to cross-check)",
+            pairs=len(rows), span_hours=span / 3600.0, station=self._station)
 
     def confirms_max(self, running_max: Optional[int],
                      now: Optional[datetime] = None) -> bool:

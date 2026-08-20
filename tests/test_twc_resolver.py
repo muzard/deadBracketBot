@@ -372,3 +372,29 @@ def test_build_supervisor_twc_resolver_feed_for_shenzhen(tmp_path):
     # the file-driven resolver fetcher (no HKO/ZGSZ in the trading path).
     assert worker._metar._log_path.endswith("metar_twc.jsonl")
     assert isinstance(worker._metar._fetch_fn.__self__, TwcResolverFetcher)
+
+
+def test_resolver_fetcher_reads_the_general_wu_rows_schema(tmp_path):
+    """wu_rows.jsonl (ResolverRowCollector) stamps 'ts'; twc_rows.jsonl
+    (calibration TwcRowCollector) stamps 'first_seen_ts'. The fetcher serves
+    both, so resolver-sourced cities can run off the general poller."""
+
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from dead_bracket.feeds_http import TwcResolverFetcher
+
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    slot = now - timedelta(hours=2)  # closed
+    path = tmp_path / "wu_rows.jsonl"
+    path.write_text(json.dumps({
+        "ts": (now - timedelta(minutes=5)).isoformat(),
+        "valid_time_gmt": int(slot.timestamp()),
+        "temp": 26,
+        "obs_name": "Seoul",
+    }) + "\n", encoding="utf-8")
+
+    f = TwcResolverFetcher(path=str(path), icao="RKSI", location="RKSI:9:KR",
+                           utc_clock=lambda: now)
+    raw = f.raw_for("RKSI")
+    assert raw is not None and "RKSI" in raw and "26/" in raw

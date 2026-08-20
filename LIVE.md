@@ -18,10 +18,10 @@
 
 ## 0.0 The resolver cross-check (the gate that replaces the old assumption)
 
-Every city now polls the resolver's **own** published table (the TWC/WU location
-id in `config.RESOLVER_LOCATIONS`) into `data/<city>/wu_rows.jsonl`, and trades
-only when our source has matched it on **every paired observation across the
-trailing 24 h**. States:
+Every city polls the resolver's **own** published table (the TWC/WU location id
+in `config.RESOLVER_LOCATIONS`) into `data/<city>/wu_rows.jsonl`, and trades only
+when our source has matched it on **every paired observation across the trailing
+24 h**. States:
 
 | state | meaning | trades? | clears |
 |---|---|---|---|
@@ -37,17 +37,38 @@ bracket in that city is a guess.
 ```bash
 python -m dead_bracket.tools.resolver_status -v      # who may trade, and why not
 python -m dead_bracket.tools.resolver_clear --list   # what is blocked
+python -m dead_bracket.tools.resolver_clear <city> [<city> ...]
 ```
+
+**Coverage is measured as reach-back, not span.** The resolver publishes 26–96
+min behind, so the newest ~1 h of our observations legitimately has nothing to
+compare against. A city verifies when its matched history *reaches back*
+`RESOLVER_MIN_REACH_HOURS` (23 h), is *fresh* within `RESOLVER_MAX_LAG_HOURS`
+(3 h), and has no hole over `RESOLVER_MAX_GAP_HOURS` (3 h). Requiring a 23 h
+*span* inside a 24 h window — the original rule — is arithmetically unreachable
+once you subtract the publish lag, and made every city flap on how fresh the
+resolver happened to be at that instant.
 
 No `TWC_API_KEY` means nothing can be verified, so **no city trades**. That is
 deliberate: fail closed.
 
+**Two cities read the resolver instead of their METAR.** Seoul and Shenzhen
+carry `resolution_source="resolver"` (`config.RESOLVER_SOURCED_CITIES`): their
+running max comes from the resolver's own closed rows, because their METAR
+provably does not track it — Seoul disagrees on ~0.9 % of observations (one
+false-dead day in 21, the wipe), Shenzhen is a different station entirely
+(Lau Fau Shan, 15 % agreement). For these the cross-check is a coverage/
+freshness gate rather than a comparison: there is only one source, so there is
+nothing to diverge. The other 31 measured cities agree with the resolver 100 %
+and stay on METAR. A resolver-sourced city with no key or table has **no valid
+source** and idles rather than falling back to a METAR known to be wrong.
+
 Optional strict mode `RESOLVER_CONFIRM_DEAD=1` also requires the resolver's own
 table to have reached the running max before any bracket below it counts as
-dead. That closes the residual window (the resolver publishes 25–65 min late, so
-the freshest print — the only one worth trading — has nothing to disagree with
-yet), at the cost of the speed edge the strategy is built on. Measure it in
-paper before deciding.
+dead. That closes the residual window (the resolver publishes late, so the
+freshest print — the only one worth trading — has nothing to disagree with yet),
+at the cost of the speed edge the strategy is built on. Measure it in paper
+before deciding.
 
 ## 0. Prerequisites — verify before any real order
 

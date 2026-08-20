@@ -636,10 +636,13 @@ def test_shared_fetcher_busts_cache_only_when_hot():
     clock = {"t": 0.0}
     f = SharedMetarFetcher(["LFPB"], session=sess, ttl=60.0, clock=lambda: clock["t"])
     f.raw_for("LFPB")  # normal cadence -> plain URL, CDN cache is fine
-    assert "_" not in sess.params_seen[0]
+    assert sess.params_seen[0]["hours"] == 2
     clock["t"] += 61
     f.raw_for("LFPB", max_age=1.0)  # hot -> cache-busted
-    assert "_" in sess.params_seen[1]
+    # Busting must rotate the LEGAL `hours` param, never add an unknown one:
+    # the API 400s on unrecognised parameters (see the regression test below).
+    assert sess.params_seen[1]["hours"] != 2
+    assert "_" not in sess.params_seen[1]
 
 
 def test_shared_fetcher_station_fast_path_newer_wins():
@@ -776,3 +779,45 @@ def test_shared_fetcher_serves_last_good_through_blip_then_ages_out():
     assert f.raw_for("LFPB") is not None  # transient blip -> last-good served
     clock["t"] = 700  # beyond max_age since last success
     assert f.raw_for("LFPB") is None  # ages out -> feed correctly goes stale
+
+
+# ---------------------------------------------------------------------------
+# Batched METAR cache-busting (2026-08-20 regression)
+# ---------------------------------------------------------------------------
+def test_hot_window_bust_never_adds_an_unknown_query_param():
+    """aviationweather.gov answers HTTP 400 "Unexpected query parameter
+    provided" for ANY parameter it does not recognise, so the old `_=<millis>`
+    cache-bust made every hot-window batch fail — silently, because _refresh
+    swallows exceptions. Stations with the per-station tgftp fast path masked
+    it; the routine-only ICAOs that deliberately skip tgftp (Moscow, Istanbul,
+    Tel Aviv) were left with no source and collected ~2 obs/day.
+    """
+
+    from dead_bracket.feeds_http import AWC_HOURS_ROTATION, SharedMetarFetcher
+
+    seen = []
+
+    class Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return []
+
+    class Session:
+        def get(self, url, params=None, headers=None, timeout=None):
+            seen.append(dict(params or {}))
+            return Resp()
+
+    f = SharedMetarFetcher(["UUWW"], session=Session(), ttl=60.0)
+    for _ in range(4):
+        f._refresh(0.0, bust=True)
+
+    allowed = {"ids", "format", "hours"}
+    for params in seen:
+        assert set(params) <= allowed, f"unknown param would 400: {set(params) - allowed}"
+    # And the bust must actually vary the cache key.
+    assert len({p["hours"] for p in seen}) > 1
+    assert {p["hours"] for p in seen} <= set(AWC_HOURS_ROTATION)

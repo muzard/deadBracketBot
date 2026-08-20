@@ -159,14 +159,41 @@ def test_too_few_matched_obs_means_no_trading():
     assert "8 matched obs" in v.reason
 
 
-def test_short_span_means_no_trading():
-    # 40 obs at 5-minute spacing clears min_pairs but covers only ~3h.
+def test_history_that_does_not_reach_back_far_enough_means_no_trading():
+    # 40 obs at 5-minute spacing clears min_pairs but only covers the last ~3h.
     g = guard(min_pairs=20)
     ours = half_hourly(NOW - timedelta(hours=3, minutes=20), [20] * 40, step_min=5)
     g.seed_ours(ours)
     g.note_theirs([(int(t.timestamp()), v) for t, v in ours])
     v = g.evaluate(NOW)
-    assert v.state == UNVERIFIED and "span only" in v.reason
+    assert v.state == UNVERIFIED and "reaches back" in v.reason
+
+
+def test_publish_lag_alone_does_not_block_a_fully_covered_city():
+    """REGRESSION: the coverage rule used to demand a 23h SPAN inside a 24h
+    window. The resolver publishes 26-96 min late, so the achievable span is
+    only ``window - lag`` — 23h was unreachable and every city flapped on how
+    fresh the resolver happened to be. Reach-back must be lag-independent."""
+
+    g = guard()
+    # A full day of history whose newest ob is 1.6h old: the worst lag measured.
+    ours, theirs = agreeing_history(end=NOW - timedelta(hours=1, minutes=36))
+    g.seed_ours(ours)
+    g.note_theirs(theirs)
+    v = g.evaluate(NOW)
+    assert v.state == OK, v.reason
+    assert v.span_hours < 23.0  # the span rule would have rejected this
+
+
+def test_a_stale_near_end_still_blocks():
+    # Reach-back alone is not enough: if nothing recent pairs, the newest
+    # observation we would actually trade on is unverified.
+    g = guard(max_lag_hours=3.0)
+    ours, theirs = agreeing_history(end=NOW - timedelta(hours=5))
+    g.seed_ours(ours)
+    g.note_theirs(theirs)
+    v = g.evaluate(NOW)
+    assert v.state == UNVERIFIED and "stale" in v.reason
 
 
 def test_hole_in_the_middle_means_no_trading():
@@ -373,3 +400,48 @@ def test_confirms_max_is_false_when_the_resolver_has_no_rows_today():
     g = guard(tz=ZoneInfo("Asia/Seoul"))
     g.note_theirs([(int((NOW - timedelta(days=3)).timestamp()), 30)])
     assert g.confirms_max(25) is False
+
+
+# ---------------------------------------------------------------------------
+# Self-sourced cities (seoul/shenzhen read the resolver's table directly)
+# ---------------------------------------------------------------------------
+def test_self_sourced_city_is_ok_without_any_pairing():
+    # The feed labels a closed row at slot+50min while the row is keyed at the
+    # slot start, so the two sides NEVER pair. Comparing them would leave the
+    # city permanently unverified and silently untradeable; there is also
+    # nothing to compare, since both sides are the same data.
+    g = guard(self_sourced=True)
+    _ours, theirs = agreeing_history()
+    g.note_theirs(theirs, station="Seoul")
+    g.seed_ours([])  # nothing pairs, deliberately
+    v = g.evaluate(NOW)
+    assert v.state == OK and v.ok
+    assert "nothing to cross-check" in v.reason
+    assert v.pairs == 48
+
+
+def test_self_sourced_city_still_fails_closed_on_a_dead_table():
+    _ours, theirs = agreeing_history()
+
+    empty = guard(self_sourced=True)
+    assert empty.evaluate(NOW).state == UNVERIFIED
+
+    stale = guard(self_sourced=True)
+    stale.note_theirs(agreeing_history(end=NOW - timedelta(hours=6))[1])
+    assert "stale" in stale.evaluate(NOW).reason
+
+    thin = guard(self_sourced=True)
+    thin.note_theirs(agreeing_history(n=6)[1])
+    assert "need" in thin.evaluate(NOW).reason
+
+    holed = guard(self_sourced=True)
+    holed.note_theirs([(e, v) for e, v in theirs
+                       if not (NOW.timestamp() - 14*3600 < e < NOW.timestamp() - 6*3600)])
+    assert "hole" in holed.evaluate(NOW).reason
+
+
+def test_self_sourced_city_still_honours_an_adopted_block():
+    g = guard(self_sourced=True)
+    g.note_theirs(agreeing_history()[1])
+    g.adopt_block("divergence recorded before the source was switched")
+    assert g.evaluate(NOW).state == DIVERGENT

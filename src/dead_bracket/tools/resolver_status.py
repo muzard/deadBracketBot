@@ -30,7 +30,8 @@ from ..resolver_guard import (
     seed_records_from_metar_log,
 )
 
-_METAR_LOGS = ("metar.jsonl", "metar_twc.jsonl", "metar_hko.jsonl")
+_METAR_LOGS = ("metar_resolver.jsonl", "metar_twc.jsonl", "metar_hko.jsonl",
+               "metar.jsonl")
 
 
 def _load_wu_rows(path: str) -> tuple[list[tuple[int, int]], str | None]:
@@ -67,12 +68,14 @@ def build_guard(config: Config, city_cfg, *, now: datetime) -> ResolverCrossChec
         tz=tz,
         window_hours=config.resolver_window_hours,
         min_pairs=config.resolver_min_pairs,
-        min_span_hours=config.resolver_min_span_hours,
+        min_reach_hours=config.resolver_min_reach_hours,
         max_gap_hours=config.resolver_max_gap_hours,
         max_lag_hours=config.resolver_max_lag_hours,
         settle_lag_min=config.resolver_settle_lag_min,
         tolerance_c=config.resolver_tolerance_c,
         configured=bool(city_cfg.resolver_location),
+        self_sourced=(city_cfg.resolution_source == "resolver"
+                      and bool(city_cfg.resolver_location)),
         clock=lambda: now,
     )
     city_dir = os.path.join(config.data_dir, city_cfg.id)
@@ -109,10 +112,13 @@ def main(argv: list[str] | None = None) -> int:
     cities = select_cities(
         config, [args.city] if args.city else [c.id for c in config.cities])
     print(f"Resolver cross-check — {now.isoformat(timespec='seconds')}")
-    print(f"window {config.resolver_window_hours:.0f}h, "
-          f"need {config.resolver_min_pairs} matched obs spanning "
-          f"{config.resolver_min_span_hours:.0f}h, tolerance "
-          f"{config.resolver_tolerance_c}C\n")
+    print(f"window {config.resolver_window_hours:.0f}h, need "
+          f"{config.resolver_min_pairs} matched obs reaching back "
+          f"{config.resolver_min_reach_hours:.0f}h and fresh within "
+          f"{config.resolver_max_lag_hours:.0f}h, tolerance "
+          f"{config.resolver_tolerance_c}C")
+    print("(the resolver publishes 26-96 min late, so the newest ~1h is "
+          "legitimately unverifiable)\n")
     print(f"{'city':<14} {'state':<11} {'pairs':>5} {'span':>6}  detail")
     print("-" * 100)
 

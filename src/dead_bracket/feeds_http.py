@@ -61,6 +61,11 @@ class TransientBookError(Exception):
 
 _DEFAULT_UA = "dead-bracket-bot/0.1 (METAR resolution feed; contact: ops@example.com)"
 AVIATIONWEATHER_URL = "https://aviationweather.gov/api/data/metar"
+# Hot-window cache-bust for the batched METAR fetch. The API 400s on ANY
+# unrecognised query parameter, so the cache key must be varied through a legal
+# one; `hours` works and its extra rows are deduped by the caller. Six values at
+# a >=60 s floor means each cache entry has expired before it comes round again.
+AWC_HOURS_ROTATION = (2, 3, 4, 5, 6, 7)
 TAF_URL = "https://aviationweather.gov/api/data/taf"
 TGFTP_URL = "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{icao}.TXT"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
@@ -616,7 +621,10 @@ class TwcResolverFetcher:
         if not isinstance(rec, dict):
             return
         vt, temp = rec.get("valid_time_gmt"), rec.get("temp")
-        ts_raw = rec.get("first_seen_ts")
+        # "first_seen_ts" is the calibration TwcRowCollector's field; "ts" is the
+        # general ResolverRowCollector's (wu_rows.jsonl). Accept either so the
+        # same fetcher can serve both files.
+        ts_raw = rec.get("first_seen_ts") or rec.get("ts")
         if ts_raw:
             try:
                 seen = datetime.fromisoformat(str(ts_raw))
@@ -1009,6 +1017,7 @@ class SharedMetarFetcher:
         self._last_success: Optional[float] = None
         self._last_attempt: Optional[float] = None
         self._station_last: dict[str, float] = {}
+        self._bust_i = 0  # rotates AWC_HOURS_ROTATION for hot-window cache-busting
         self._lock = threading.Lock()
 
     def raw_for(self, icao: str, max_age: Optional[float] = None) -> Optional[str]:
@@ -1120,9 +1129,21 @@ class SharedMetarFetcher:
         # not), so we can report the publish/receipt split.
         params = {"ids": ",".join(self._icaos), "format": "json", "hours": 2}
         if bust:
-            # Unique param -> CDN cache miss -> origin-fresh data. Only while
-            # hot; the cached (max-age=60) response is fine at the slow cadence.
-            params["_"] = str(int(time.time() * 1000))
+            # Cache-bust by rotating a LEGAL parameter, never by adding one:
+            # aviationweather.gov answers "Unexpected query parameter provided"
+            # with HTTP 400 for anything it does not recognise (verified live
+            # 2026-08-20), exactly like api.weather.com. The old `_=<millis>`
+            # bust therefore made EVERY hot-window batch fail — silently, since
+            # _refresh swallows exceptions to keep the last-good cache. Stations
+            # with the per-station tgftp fast path masked it; the routine-only
+            # ICAOs (Moscow/Istanbul/Tel Aviv), which deliberately skip tgftp,
+            # were left with no source at all and collected ~2 obs/day.
+            # Rotating `hours` gives each poll its own cache key; the extra
+            # history rows are deduped by _store for free.
+            self._bust_i += 1
+            params["hours"] = AWC_HOURS_ROTATION[
+                self._bust_i % len(AWC_HOURS_ROTATION)
+            ]
         for _ in range(self._retries + 1):
             try:
                 resp = self._session.get(

@@ -75,10 +75,22 @@ class CityConfig:
     # Underground location id, e.g. "RKSI:9:KR"). The resolver_guard polls it
     # and refuses to trade the city unless it has agreed with our resolution
     # source across the trailing 24 h — the check that was missing when the
-    # 2026-07-19 Seoul false-dead (our METAR 27C vs WU 26.1C for the same
-    # instant) emptied the wallet. None -> the city can never be verified and
-    # therefore never trades. Populated from RESOLVER_LOCATIONS below.
+    # 2026-07-19 Seoul false-dead (our METAR 27C vs the resolver's 26C for the
+    # same instant) emptied the wallet. None -> the city can never be verified
+    # and therefore never trades. Populated from RESOLVER_LOCATIONS below.
     resolver_location: Optional[str] = None
+    # Which source feeds this city's RUNNING MAX — the number that marks
+    # brackets dead:
+    #   "metar"     the station's resolution-grade METAR (default; measured
+    #               2026-08-18 to agree with the resolver on 100.0% of paired
+    #               observations for 31 of the 34 checkable cities).
+    #   "resolver"  the resolver's OWN published rows, closed hours only, read
+    #               from wu_rows.jsonl. For the cities where the METAR does not
+    #               track the resolver this trades the speed edge for being
+    #               right — the only trade worth making here. Requires
+    #               resolver_location + TWC_API_KEY; without them the city has
+    #               no source at all and idles.
+    resolution_source: str = "metar"
 
 
 # Paris -> LFPB, London -> EGLC (spec §10), plus additional European cities.
@@ -295,6 +307,30 @@ _BASE_CITIES: tuple[CityConfig, ...] = (
 #     TWC table is still cross-checked as corroboration, and since weather.gov
 #     serves the same METARs it should agree — a disagreement there is a real
 #     signal, not noise.
+#
+# MEASURED 2026-08-18 — two months of resolver rows vs our own METAR logs,
+# paired by observation time (the analysis behind resolution_source):
+#
+#   31 of 34 checkable cities   100.0% agreement, ZERO days where our running
+#                               max exceeded the resolver's daily high.
+#   seoul     99.1% (9/1005)    ONE false-dead day in 21 — 2026-07-19, the day
+#                               of the wipe. Same station (obs_id RKSI) and the
+#                               timestamps align (agreement collapses to 66% at
+#                               any +/-30 min shift, so it is not a lag), and
+#                               every resolver row is an exact whole-degC->F
+#                               conversion, so it is NOT a tenths-rounding
+#                               artifact either: the resolver simply holds a
+#                               different whole-degree value ~0.9% of the time.
+#                               Mechanism unconfirmed; irreducible from METAR.
+#   shenzhen  15.0% (57/380)    5 false-dead days in 14, errors spanning -4..+5.
+#                               A different station, not a transformation.
+#   lucknow   99.2%             mismatches, but none at a daily high (watch).
+#   tel_aviv  99.8%             ditto.
+#
+# Cost of reading the resolver instead: its rows publish 26-66 min late, but
+# sub-CAP dead-NO offers persist far longer in the thin markets that carry the
+# edge (shenzhen median 108 min liftable, 57% >= 60 min; paris 78 min; london
+# 73 min), so the majority of the opportunity survives the delay.
 RESOLVER_LOCATIONS: dict[str, Optional[str]] = {
     "paris": "LFPB:9:FR",
     "london": "EGLC:9:GB",
@@ -333,8 +369,17 @@ RESOLVER_LOCATIONS: dict[str, Optional[str]] = {
     "toronto": "CYYZ:9:CA",
 }
 
+# The cities whose METAR does NOT track the resolver (see the measurements
+# above): their running max is read from the resolver's own closed rows instead.
+RESOLVER_SOURCED_CITIES: frozenset[str] = frozenset({"seoul", "shenzhen"})
+
 DEFAULT_CITIES: tuple[CityConfig, ...] = tuple(
-    replace(c, resolver_location=RESOLVER_LOCATIONS.get(c.id)) for c in _BASE_CITIES
+    replace(
+        c,
+        resolver_location=RESOLVER_LOCATIONS.get(c.id),
+        resolution_source=("resolver" if c.id in RESOLVER_SOURCED_CITIES else "metar"),
+    )
+    for c in _BASE_CITIES
 )
 
 
@@ -525,7 +570,11 @@ class Config:
     resolver_check: bool = True
     resolver_window_hours: float = 24.0  # the "last 24h must match" window
     resolver_min_pairs: int = 20  # matched obs required inside the window
-    resolver_min_span_hours: float = 23.0  # they must span ~the whole window
+    # How far back the verified history must REACH (not newest-minus-oldest:
+    # the resolver publishes 26-96 min late, so a 23h span inside a 24h
+    # window is unreachable and made every city flap). Freshness at the near
+    # end is enforced separately by resolver_max_lag_hours.
+    resolver_min_reach_hours: float = 23.0
     resolver_max_gap_hours: float = 3.0  # no long unpaired hole in the middle
     resolver_max_lag_hours: float = 3.0  # resolver rows newer than this
     # The resolver publishes ~an hour behind, so the running-max comparison
@@ -659,7 +708,7 @@ class Config:
             "resolver_check": _as_bool,
             "resolver_window_hours": float,
             "resolver_min_pairs": int,
-            "resolver_min_span_hours": float,
+            "resolver_min_reach_hours": float,
             "resolver_max_gap_hours": float,
             "resolver_max_lag_hours": float,
             "resolver_settle_lag_min": float,

@@ -82,7 +82,13 @@
       "Bash(echo \"--- exit $? ---\")",
       "Bash(ps -p 3974 -o pid,stat,command)",
       "Bash(ps -p 66262 -o pid,stat,command)",
-      "Bash(sed 's|^|  |')"
+      "Bash(sed 's|^|  |')",
+      "Bash(ps -o lstart= -p 91807)",
+      "Bash(kill 91807)",
+      "Bash(ps -p 91807 -o pid=)",
+      "Bash(ps -p 91808 -o pid=)",
+      "Bash(grep -qE \"METAR   seoul .* delay [0-9]{1,4}s\" /Users/arttu/Projects/hustle/deadBracketBot/soak.log)",
+      "Bash(curl -s \"https://aviationweather.gov/api/data/metar?ids=UUWW,LLBG,LTFM,LFPB,EGLC&format=json&hours=6\")"
     ]
   }
 }
