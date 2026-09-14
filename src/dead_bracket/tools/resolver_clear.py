@@ -26,7 +26,7 @@ from ..resolver_guard import ResolverBlockStore
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("city", nargs="?", help="city id to unblock")
+    ap.add_argument("city", nargs="*", help="city id(s) to unblock")
     ap.add_argument("--all", action="store_true", help="clear every block")
     ap.add_argument("--list", action="store_true", help="list blocks and exit")
     ap.add_argument("--reason", default="", help="note why it is safe to clear")
@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nClear one with: python -m dead_bracket.tools.resolver_clear <city>")
         return 0
 
-    targets = sorted(blocks) if args.all else [args.city]
+    targets = sorted(blocks) if args.all else list(args.city)
     cleared = []
     for city in targets:
         if store.clear(city):

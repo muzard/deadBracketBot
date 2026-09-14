@@ -23,14 +23,59 @@ paths, one order pipeline:
    wins the day) → any settled loss pauses the whole forecast path (sticky).
    YES-side / day-max betting remains a **non-goal**.
 
+## 2026-09-12: THE RESOLVER MOVED — WU -> NOAA (read with the STOP section)
+Polymarket re-pointed every daily-temperature market (except Taipei) from
+Weather Underground to **NOAA**, naming
+`https://www.weather.gov/wrh/timeseries?site=<ICAO>` as the resolution source
+and demoting WU to a fallback. That page reads **Synoptic/MesoWest** for the
+station, and measured 2026-09-14 that series is the station's **METAR**:
+34 of 35 cities, ~2,700 paired obs, **100.0% agreement**, identical counts,
+window, daily max, SPECIs included. Consequences, in full in
+**[docs/resolution_source_migration_2026-09-14.md](docs/resolution_source_migration_2026-09-14.md)**:
+- **Seoul and Shenzhen are no longer divergent.** Both failures were *WU*
+  artifacts (WU's RKSI row; WU resolving Shenzhen off HKO Lau Fau Shan). NOAA's
+  `site=rksi` / `site=zgsz` matched our METAR 96/96 and 48/48. Their
+  `resolution_source="resolver"` setting now reads the WRONG table at a
+  26-564 min publish lag — revert it once the new cross-check has soaked.
+- **The cross-check now reads NOAA too** (`CityConfig.resolver_provider`:
+  `synoptic` for 34 cities, `twc` for Taipei only). Rows land in
+  `resolver_rows.jsonl`; no API key needed; one poll backfills 48 h, and startup
+  also seeds the guard's own side from the station's trailing METAR
+  (cross-check only — never the running max). Istanbul is verifiable for the
+  first time (WU served LTFM zero rows). Measured: Paris `ok` ~90 s after
+  startup, **34/35 cities verified**, only `lucknow` still blocked.
+- **Taipei (RCSS) stays on WU**: Synoptic carries only its SPECIs (6 obs/48 h vs
+  our 90), so it cannot migrate.
+- `WUNDERGROUND_EXEMPT_ICAOS` is no longer a special case — every city but
+  Taipei now resolves the way UUWW/LTFM/LLBG already did. The premise behind
+  their `include_speci=False` ("weather.gov is routine-only") is **false** — the
+  NOAA series carries SPECIs — but keeping the flag off is conservative (it can
+  only lower our running max), so it is safe as-is, just no longer true as
+  documented.
+- `source_confirmed` now accepts either source and is STRICTER for NOAA markets:
+  the `site=` in the resolution URL must be our station and only ours.
+
 ## STOP — read this before touching live trading (2026-08-18)
 The bot **wiped the live wallet on 2026-07-19** (Seoul, ~$170 -> $0.90). RKSI's
-METAR printed `27/22`; Weather Underground's row for that same instant read
-26 °C (its RKSI pipeline carries tenths — 79 °F = 26.1 °C — where the METAR
-encodes whole degrees). Our running max went to 27, the 26 °C bracket was
-marked dead, and the whole bankroll bought a NO that settled to $0 because WU's
-daily High never left 26. **The Shenzhen "WU table ≠ our source" failure class
-was never city-specific — it applies to every WU-resolved city.**
+METAR printed `27/22`; the resolver's row for that same instant held 26 °C. Our
+running max went to 27, the 26 °C bracket was marked dead, and the whole
+bankroll bought a NO that settled to $0 because WU's daily High never left 26.
+
+**Which cities this actually affects — measured, not assumed** (2 months of
+resolver rows vs our METAR logs, 2026-08-18; the numbers live in
+`config.RESOLVER_LOCATIONS`):
+- **31 of 34 checkable cities agree 100.0%** with zero false-dead days. For
+  them the METAR *is* the resolver's data; nothing needs to change.
+- **seoul 99.1%** — 1 false-dead day in 21 (the wipe). Same station, aligned
+  timestamps, and every resolver row is an exact whole-°C→°F conversion, so it
+  is neither a lag nor a tenths artifact: the table just holds a different
+  whole degree ~0.9% of the time. Irreducible from the METAR.
+- **shenzhen 15.0%** — 5 false-dead days in 14; a different station entirely
+  (Lau Fau Shan). No transform recovers it.
+
+Both now read the resolver's own closed rows instead of their METAR
+(`resolution_source="resolver"`); verified live to reproduce the resolver's
+daily max exactly.
 
 Consequences now in the code:
 - **Live mode is LOCKED.** `--live` refuses unless `DEAD_BRACKET_ALLOW_LIVE=1`.
@@ -44,6 +89,11 @@ Consequences now in the code:
   daily figure still resets for the loss breaker.
 
 ## Read these first
+- **[STRATEGY.md](STRATEGY.md)** — the 2026-09-14 measured verdict: across 7,014
+  bracket deaths the dead-NO was already at 0.999 (p1 0.996) when our source
+  confirmed death, and 41 of the 43 liftable deaths were Shenzhen (wrong source
+  at the time). Read it before assuming the edge in FINDINGS generalises.
+  NOTE: every number in it predates the NOAA migration above and needs re-measuring.
 - **[FINDINGS.md](FINDINGS.md)** — the dead-NO edge is **real in thin markets**
   (Moscow, now Shenzhen): a week of daily winners, **+$49.72**, zero losers. It is
   **absent in liquid markets** (Paris: dead NO pre-priced to ~$1 before our METAR
@@ -71,7 +121,8 @@ python -m dead_bracket.main --live --bankroll 40 --forecast                 # li
 python -m dead_bracket.main --live --bankroll 40 --forecast --forecast-live # forecast live orders (human go/no-go!)
 TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate  # + Shenzhen calibration collectors
 python -m dead_bracket.main --twc --no-trade shenzhen --calibrate  # Shenzhen L1 shadow: running max from the resolver's CLOSED rows + L2 lock-ahead shadow (key via .env)
-python -m dead_bracket.tools.resolver_status    # per-city: may it trade, and why not?
+python -m dead_bracket.tools.resolver_status --seed-history  # per-city: may it trade, and why not?
+python -m dead_bracket.tools.resolver_status --at 2026-08-22T12:02Z  # replay a past verdict (why did that block fire?)
 python -m dead_bracket.tools.resolver_clear <city>  # lift a sticky divergence block (human decision)
 python -m dead_bracket.tools.lfs_calibrate      # offline K1/K2/K3/ε report + L1 stability + L2 hold rate
 python -m dead_bracket.tools.forecast_calibrate # offline sensor-σ/Brier/hold-rate report (the go/no-go input)
@@ -111,14 +162,36 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feed
   `tools/forecast_calibrate.py` = the offline gate report.
 
 ## Non-negotiable invariants (each has tests + a memory note — don't regress)
+- **The running max must come from the source the market resolves on.**
+  `CityConfig.resolution_source` is `metar` for the 31 cities measured to agree
+  with the resolver 100%, and `resolver` for **seoul + shenzhen**
+  (`config.RESOLVER_SOURCED_CITIES`), whose METAR provably does not track it —
+  they read the resolver's OWN closed rows (`wu_rows.jsonl` ->
+  `TwcResolverFetcher` -> `metar_resolver.jsonl`). A resolver-sourced city with
+  no key/table has NO valid source and idles rather than falling back to the
+  METAR we know is wrong. Cost is the 26-66 min publish lag, affordable because
+  sub-CAP dead-NO offers persist much longer in the thin markets (shenzhen
+  median 108 min liftable, 57% >= 60 min).
 - **No city trades without 24 h of resolver agreement** (`resolver_guard.py`).
+  The max check audits a **CLOSED, fully-published local day**, not the day in
+  progress: the old live comparison pitted our complete feed against the
+  resolver's incomplete one and sticky-blocked 25 of 34 cities on false evidence
+  in August (17 because the resolver had not published yet — measured lag p50
+  51 min, p75 73 min, tail to 564 min; 8 because our own feed had holes). Only
+  `ours > theirs` is unsafe and sticky: a bracket is dead iff `temp < ours_max`,
+  so `ours_max <= theirs_max` means it is below the resolver's high too. `ours <
+  theirs` is logged as a gap in our collection and never blocks. Replay any past
+  verdict with `resolver_status --at <ISO8601>`.
   A per-city poller reads the resolver's OWN published table (TWC/WU location
   id in `CityConfig.resolver_location`, one verified entry per city in
   `config.RESOLVER_LOCATIONS`) into `data/<city>/wu_rows.jsonl`, pairs it with
   our observations by timestamp, and allows entries only in state `ok`: every
-  paired ob in the trailing 24 h matched exactly, coverage spans the window
-  with no long hole, the resolver's rows are fresh, and the local-day running
-  maxima agree. `unverified` (thin/stale data, or a city with no resolver table
+  paired ob in the trailing 24 h matched exactly, the matched history REACHES
+  BACK `resolver_min_reach_hours` (23 h) and is fresh within
+  `resolver_max_lag_hours` with no hole over `resolver_max_gap_hours`, and the
+  local-day running maxima agree. Coverage is reach-back + freshness, never a
+  *span*: the resolver publishes 26-96 min late, so a 23 h span inside a 24 h
+  window is arithmetically unreachable and made every city flap. `unverified` (thin/stale data, or a city with no resolver table
   — Istanbul's LTFM serves none) withholds entries and self-clears.
   `divergent` is **sticky**: it survives ticks, rollovers and restarts
   (`data/_global/resolver_blocks.json`) and only

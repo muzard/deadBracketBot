@@ -209,6 +209,56 @@ def test_wunderground_exempt_icaos_still_require_station():
     assert source_confirmed(bare, None) is True
 
 
+def _noaa_ev(slug, icao, site=None, **kw):
+    """An event carrying the post-2026-09-12 NOAA resolution text."""
+
+    ev = _ev(slug, **kw)
+    ev["description"] = (
+        "This market will resolve to the temperature range that contains the "
+        f"highest temperature recorded by NOAA at the {icao} Airport Station in "
+        "degrees Celsius. The resolution source for this market will be "
+        "information from NOAA, specifically the highest reading under the "
+        '"Temp" column for all times on this day, available here: '
+        f"https://www.weather.gov/wrh/timeseries?site={site or icao}\n\n"
+        "If NOAA data for the observation date is unavailable by 11:59 PM ET on "
+        "the day following the observation date, the Weather Underground Daily "
+        "Observations table will be used as the resolution source."
+    )
+    ev["markets"] = []
+    return ev
+
+
+def test_source_confirmed_accepts_the_noaa_timeseries_for_our_station():
+    # 2026-09-12: the markets moved from Weather Underground to NOAA's
+    # weather.gov timeseries, which is the station's own METAR. Rejecting those
+    # left every city idling with "no market data".
+    from dead_bracket.feeds_http import source_confirmed
+    ev = _noaa_ev("highest-temperature-in-paris-on-september-14-2026", "LFPB")
+    assert source_confirmed(ev, "LFPB") is True
+    # The site parameter is lowercase in the live descriptions.
+    assert source_confirmed(
+        _noaa_ev("x", "LFPB", site="lfpb"), "LFPB") is True
+
+
+def test_source_confirmed_rejects_a_noaa_timeseries_for_a_different_station():
+    # Stricter than the old substring test: naming our station somewhere in the
+    # text is not enough if the resolution URL points at someone else's site.
+    from dead_bracket.feeds_http import source_confirmed
+    ev = _noaa_ev("x", "LFPB", site="EGLC")
+    assert "lfpb" in (ev["description"] or "").lower()  # our station IS named
+    assert source_confirmed(ev, "LFPB") is False        # ...but it resolves on EGLC
+
+
+def test_noaa_market_does_not_need_the_wunderground_term():
+    # WU survives in the text only as a fallback clause; requiring it as the
+    # source would be reading the wrong table.
+    from dead_bracket.feeds_http import source_confirmed
+    ev = _noaa_ev("x", "ZGSZ")
+    ev["description"] = ev["description"].split("If NOAA data")[0]
+    assert "wunderground" not in ev["description"].lower()
+    assert source_confirmed(ev, "ZGSZ") is True
+
+
 def test_choose_event_filters_on_unconfirmed_source():
     from datetime import date
     good = _src_ev("highest-temperature-in-london-on-june-8-2026", icao="EGLC", wu=True)
@@ -636,10 +686,13 @@ def test_shared_fetcher_busts_cache_only_when_hot():
     clock = {"t": 0.0}
     f = SharedMetarFetcher(["LFPB"], session=sess, ttl=60.0, clock=lambda: clock["t"])
     f.raw_for("LFPB")  # normal cadence -> plain URL, CDN cache is fine
-    assert "_" not in sess.params_seen[0]
+    assert sess.params_seen[0]["hours"] == 2
     clock["t"] += 61
     f.raw_for("LFPB", max_age=1.0)  # hot -> cache-busted
-    assert "_" in sess.params_seen[1]
+    # Busting must rotate the LEGAL `hours` param, never add an unknown one:
+    # the API 400s on unrecognised parameters (see the regression test below).
+    assert sess.params_seen[1]["hours"] != 2
+    assert "_" not in sess.params_seen[1]
 
 
 def test_shared_fetcher_station_fast_path_newer_wins():
@@ -776,3 +829,150 @@ def test_shared_fetcher_serves_last_good_through_blip_then_ages_out():
     assert f.raw_for("LFPB") is not None  # transient blip -> last-good served
     clock["t"] = 700  # beyond max_age since last success
     assert f.raw_for("LFPB") is None  # ages out -> feed correctly goes stale
+
+
+# ---------------------------------------------------------------------------
+# Batched METAR cache-busting (2026-08-20 regression)
+# ---------------------------------------------------------------------------
+def test_hot_window_bust_never_adds_an_unknown_query_param():
+    """aviationweather.gov answers HTTP 400 "Unexpected query parameter
+    provided" for ANY parameter it does not recognise, so the old `_=<millis>`
+    cache-bust made every hot-window batch fail — silently, because _refresh
+    swallows exceptions. Stations with the per-station tgftp fast path masked
+    it; the routine-only ICAOs that deliberately skip tgftp (Moscow, Istanbul,
+    Tel Aviv) were left with no source and collected ~2 obs/day.
+    """
+
+    from dead_bracket.feeds_http import AWC_HOURS_ROTATION, SharedMetarFetcher
+
+    seen = []
+
+    class Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return []
+
+    class Session:
+        def get(self, url, params=None, headers=None, timeout=None):
+            seen.append(dict(params or {}))
+            return Resp()
+
+    f = SharedMetarFetcher(["UUWW"], session=Session(), ttl=60.0)
+    for _ in range(4):
+        f._refresh(0.0, bust=True)
+
+    allowed = {"ids", "format", "hours"}
+    for params in seen:
+        assert set(params) <= allowed, f"unknown param would 400: {set(params) - allowed}"
+    # And the bust must actually vary the cache key.
+    assert len({p["hours"] for p in seen}) > 1
+    assert {p["hours"] for p in seen} <= set(AWC_HOURS_ROTATION)
+
+
+# ---------------------------------------------------------------------------
+# Synoptic / NOAA — the resolver's own table since the 2026-09-12 migration
+
+
+def _syn_payload(times, temps, name="Paris-Le Bourget Airport", stid="LFPB"):
+    return {"STATION": [{"NAME": name, "STID": stid,
+                         "OBSERVATIONS": {"date_time": list(times),
+                                          "air_temp_set_1": list(temps)}}]}
+
+
+def test_parse_synoptic_token_reads_the_weather_gov_key():
+    from dead_bracket.feeds_http import parse_synoptic_token
+    js = ("// This Synoptic API key is for weather.gov websites/queries\n"
+          "var mesoToken='7c76618b66c74aee913bdbae4b448bdd';\n")
+    assert parse_synoptic_token(js) == "7c76618b66c74aee913bdbae4b448bdd"
+    assert parse_synoptic_token("nothing here") is None
+    assert parse_synoptic_token("") is None
+
+
+def test_parse_synoptic_timeseries_emits_the_twc_row_shape():
+    # The collector, the guard and the on-disk format stay provider-agnostic:
+    # swapping the resolver swaps the fetcher and nothing else.
+    from dead_bracket.feeds_http import parse_synoptic_timeseries
+    out = parse_synoptic_timeseries(_syn_payload(
+        ["2026-09-14T16:30:00Z", "2026-09-14T17:00:00Z"], [29.0, 28.0]))
+    rows = out["observations"]
+    assert [r["temp"] for r in rows] == [29, 28]
+    assert rows[0]["valid_time_gmt"] == 1789403400
+    assert rows[0]["obs_name"] == "Paris-Le Bourget Airport"
+    assert rows[0]["obs_id"] == "LFPB"
+    assert rows[0]["max_temp"] is None
+    assert out["fractional"] == 0
+
+
+def test_parse_synoptic_timeseries_rounds_to_the_resolving_precision():
+    # The market resolves on whole degrees Celsius; a fractional reading is
+    # counted so a change in that regime is visible, not silently rounded away.
+    from dead_bracket.feeds_http import parse_synoptic_timeseries
+    out = parse_synoptic_timeseries(_syn_payload(
+        ["2026-09-14T16:30:00Z", "2026-09-14T17:00:00Z"], [28.6, 27.4]))
+    assert [r["temp"] for r in out["observations"]] == [29, 27]
+    assert out["fractional"] == 2
+
+
+def test_parse_synoptic_timeseries_skips_holes_and_bad_payloads():
+    from dead_bracket.feeds_http import parse_synoptic_timeseries
+    out = parse_synoptic_timeseries(_syn_payload(
+        ["2026-09-14T16:30:00Z", "2026-09-14T17:00:00Z", "2026-09-14T17:30:00Z"],
+        [29.0, None, "x"]))
+    assert len(out["observations"]) == 1
+    # Anything malformed yields None so the collector counts a failure rather
+    # than treating an empty table as agreement.
+    assert parse_synoptic_timeseries(None) is None
+    assert parse_synoptic_timeseries({}) is None
+    assert parse_synoptic_timeseries({"STATION": []}) is None
+    assert parse_synoptic_timeseries({"STATION": [{"OBSERVATIONS": {}}]}) is None
+    assert parse_synoptic_timeseries(_syn_payload([], [])) is None
+
+
+def test_synoptic_rows_feed_the_guard_through_the_existing_collector():
+    # End-to-end on the pure pieces: a Synoptic payload must verify a city via
+    # ResolverRowCollector + ResolverCrossCheck with no provider-specific code.
+    from datetime import datetime, timedelta, timezone
+    from dead_bracket.feeds_http import parse_synoptic_timeseries
+    from dead_bracket.resolver_guard import (
+        OK, ResolverCrossCheck, ResolverRowCollector)
+    import tempfile, os as _os
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
+    stamps = [now - timedelta(minutes=30 * i) for i in range(96)]
+    times = [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in stamps]
+    temps = [20.0] * len(stamps)
+
+    guard = ResolverCrossCheck("paris", clock=lambda: now)
+    guard.seed_ours([(t, 20) for t in stamps])
+    with tempfile.TemporaryDirectory() as d:
+        collector = ResolverRowCollector(
+            city="paris", guard=guard,
+            fetch=lambda a, b: parse_synoptic_timeseries(
+                _syn_payload(times, temps)),
+            path=_os.path.join(d, "resolver_rows.jsonl"),
+            clock=lambda: now)
+        assert len(collector.poll_once()) == 96
+    assert guard.evaluate(now).state == OK
+
+
+def test_parse_metar_history_honours_the_speci_policy_and_rejects_decimals():
+    # Seeds the cross-check's own side; must mirror exactly what the running max
+    # would have seen, or the comparison compares the wrong things.
+    from dead_bracket.feeds_http import parse_metar_history
+    recs = [
+        {"obsTime": 1789403400, "temp": 29, "rawOb": "LFPB 141630Z AUTO 29/12"},
+        {"obsTime": 1789405200, "temp": 28, "rawOb": "SPECI LFPB 141700Z 28/12"},
+        {"obsTime": 1789407000, "temp": 27.4, "rawOb": "LFPB 141730Z AUTO"},
+        {"obsTime": 1789408800, "temp": None, "rawOb": "LFPB 141800Z AUTO"},
+        "not a dict",
+    ]
+    both = parse_metar_history(recs)
+    assert [t for _, t in both] == [29, 28]           # decimal + templess skipped
+    routine = parse_metar_history(recs, include_speci=False)
+    assert [t for _, t in routine] == [29]            # SPECI excluded
+    assert parse_metar_history(None) == []
+    assert parse_metar_history("nope") == []

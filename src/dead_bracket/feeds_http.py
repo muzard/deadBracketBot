@@ -61,6 +61,11 @@ class TransientBookError(Exception):
 
 _DEFAULT_UA = "dead-bracket-bot/0.1 (METAR resolution feed; contact: ops@example.com)"
 AVIATIONWEATHER_URL = "https://aviationweather.gov/api/data/metar"
+# Hot-window cache-bust for the batched METAR fetch. The API 400s on ANY
+# unrecognised query parameter, so the cache key must be varied through a legal
+# one; `hours` works and its extra rows are deduped by the caller. Six values at
+# a >=60 s floor means each cache entry has expired before it comes round again.
+AWC_HOURS_ROTATION = (2, 3, 4, 5, 6, 7)
 TAF_URL = "https://aviationweather.gov/api/data/taf"
 TGFTP_URL = "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{icao}.TXT"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
@@ -91,6 +96,23 @@ FORBIDDEN_EVENT_TERMS = ("lowest", "minimum")
 # the running max matches the market, so it is never waived.
 WUNDERGROUND_TERM = "wunderground"
 WUNDERGROUND_EXEMPT_ICAOS = frozenset({"UUWW", "LTFM", "LLBG"})
+
+# 2026-09-12: Polymarket re-pointed the daily-temperature markets from Weather
+# Underground to NOAA. The description now names
+# ``https://www.weather.gov/wrh/timeseries?site=<ICAO>`` as THE resolution
+# source, with WU demoted to a fallback "if NOAA data ... is unavailable".
+# Measured the same day: that series (weather.gov's WRH page reads Synoptic /
+# MesoWest for the station) is observation-for-observation identical to the
+# station's METAR — 34 of 35 cities, ~2,700 paired obs, 100.0% agreement, same
+# counts, same window, same daily max, SPECIs included. So for a NOAA-resolved
+# market our own METAR *is* the resolution source.
+#
+# This pattern is what confirms it, and it is STRICTER than the old substring
+# test: the site parameter must be the city's own station, so a market pointing
+# at some other station can never pass.
+NOAA_TIMESERIES_RE = re.compile(
+    r"weather\.gov/wrh/timeseries\?site=([a-z0-9]+)", re.IGNORECASE
+)
 
 _TEMP_IN_QUESTION = re.compile(r"(-?\d+)\s*°?\s*[cC]\b")
 # Open-ended top bracket: "... or higher/above/more/over/greater", or a trailing
@@ -237,14 +259,24 @@ def event_text(ev: dict) -> str:
 
 
 def source_confirmed(ev: dict, icao: Optional[str]) -> bool:
-    """True iff ``ev`` is confirmed to resolve on ``icao`` (and, by default, WU).
+    """True iff ``ev`` is confirmed to resolve on ``icao``, from a source we track.
 
     The resolution-source cross-check: the event text MUST name the station code
     — that is what guarantees the running max matches the market, so it is never
-    waived. By default it must ALSO name "wunderground". A WU-exempt ICAO
-    (UUWW/LTFM) skips ONLY the Weather-Underground half (its market resolves off a
-    non-WU source) but still has to name its station. An unset ``icao`` skips the
-    check entirely (keeps the pure picker usable). See ``WUNDERGROUND_EXEMPT_ICAOS``.
+    waived. It must ALSO name a resolution source we actually follow, which is
+    now one of two:
+
+    * **NOAA** (since 2026-09-12, 34 of 35 cities): the description carries
+      ``weather.gov/wrh/timeseries?site=<ICAO>``, and that site must be THIS
+      city's station. Measured identical to the station's METAR, so our running
+      max is the resolver's series by construction.
+    * **Weather Underground** (now only Taipei/RCSS): the legacy source, named
+      by the ``wunderground`` term.
+
+    A WU-exempt ICAO (UUWW/LTFM/LLBG) skips the source half — those markets were
+    already on weather.gov before the migration — but still has to name its
+    station. An unset ``icao`` skips the check entirely (keeps the pure picker
+    usable). See ``WUNDERGROUND_EXEMPT_ICAOS`` and ``NOAA_TIMESERIES_RE``.
     """
 
     if not icao:
@@ -252,8 +284,14 @@ def source_confirmed(ev: dict, icao: Optional[str]) -> bool:
     text = event_text(ev)
     if icao.lower() not in text:
         return False  # wrong/unnamed station -> never trade (false-dead risk)
+    sites = {m.lower() for m in NOAA_TIMESERIES_RE.findall(text)}
+    if sites:
+        # NOAA-resolved: the timeseries must point at OUR station, and only
+        # ours. A description naming someone else's site is a mismatch, which
+        # is the exact failure class that emptied the wallet on Seoul.
+        return sites == {icao.lower()}
     if icao.upper() in WUNDERGROUND_EXEMPT_ICAOS:
-        return True  # station confirmed; this market resolves off Weather Underground
+        return True  # station confirmed; resolves off weather.gov, no URL given
     return WUNDERGROUND_TERM in text
 
 
@@ -497,6 +535,28 @@ TWC_HISTORICAL_URL = (
     "https://api.weather.com/v1/location/{location}/observations/historical.json"
 )
 
+# --- The resolver, since 2026-09-12 -----------------------------------------
+# The market descriptions name https://www.weather.gov/wrh/timeseries?site=<ICAO>
+# as THE resolution source. That page holds no data: it loads NOAA's own
+# Synoptic/MesoWest token from ``apiKey.js`` and renders this endpoint. So this
+# is the literal table the market settles on, keyed by the station's ICAO.
+#
+# The API answers 403 without a browser User-Agent and a weather.gov Referer —
+# it is serving weather.gov's own front-end, and we ask for exactly what that
+# front-end asks for.
+SYNOPTIC_TIMESERIES_URL = "https://api.synopticdata.com/v2/stations/timeseries"
+SYNOPTIC_TOKEN_URL = "https://www.weather.gov/source/wrh/apiKey.js"
+# Read from apiKey.js at startup so we track whatever token weather.gov itself
+# is publishing; this is the value measured on 2026-09-14, used only if that
+# fetch fails.
+SYNOPTIC_FALLBACK_TOKEN = "7c76618b66c74aee913bdbae4b448bdd"
+_SYNOPTIC_TOKEN_RE = re.compile(r"mesoToken\s*=\s*['\"]([A-Za-z0-9]+)['\"]")
+_SYNOPTIC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "Referer": "https://www.weather.gov/",
+    "Origin": "https://www.weather.gov",
+}
+
 
 def _cache_bust() -> str:
     return str(int(time.time() * 1000))
@@ -616,7 +676,10 @@ class TwcResolverFetcher:
         if not isinstance(rec, dict):
             return
         vt, temp = rec.get("valid_time_gmt"), rec.get("temp")
-        ts_raw = rec.get("first_seen_ts")
+        # "first_seen_ts" is the calibration TwcRowCollector's field; "ts" is the
+        # general ResolverRowCollector's (wu_rows.jsonl). Accept either so the
+        # same fetcher can serve both files.
+        ts_raw = rec.get("first_seen_ts") or rec.get("ts")
         if ts_raw:
             try:
                 seen = datetime.fromisoformat(str(ts_raw))
@@ -850,6 +913,219 @@ def make_twc_range_fetch(
     return fetch
 
 
+def parse_synoptic_token(js: str) -> Optional[str]:
+    """Pull the Synoptic token out of weather.gov's ``apiKey.js``. Pure."""
+
+    m = _SYNOPTIC_TOKEN_RE.search(js or "")
+    return m.group(1) if m else None
+
+
+def parse_synoptic_timeseries(payload) -> Optional[dict]:
+    """Synoptic timeseries -> the TWC-shaped payload the collector already reads.
+
+    Deliberately re-emits ``{"observations": [{"valid_time_gmt", "temp",
+    "obs_name", "obs_id", "max_temp"}]}`` so ``ResolverRowCollector``,
+    ``ResolverCrossCheck`` and the on-disk row format are provider-agnostic:
+    swapping the resolver changes which fetcher is wired in, nothing else.
+
+    Temperatures are rounded to whole degrees because that is the precision the
+    market resolves at — "The resolution source for this market measures
+    temperatures to whole degrees Celsius ... this is the level of precision
+    that will be used when resolving the market". Measured 2026-09-14 the feed
+    already returns whole values for every station we track; ``fractional`` is
+    reported so a change in that regime is visible rather than silently rounded
+    away.
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    stations = payload.get("STATION")
+    if not isinstance(stations, list) or not stations:
+        return None
+    st = stations[0]
+    if not isinstance(st, dict):
+        return None
+    obs = st.get("OBSERVATIONS")
+    if not isinstance(obs, dict):
+        return None
+    times = obs.get("date_time") or []
+    temps = obs.get("air_temp_set_1") or []
+    name = st.get("NAME")
+    stid = st.get("STID")
+    rows: list[dict] = []
+    fractional = 0
+    for raw_t, raw_v in zip(times, temps):
+        if raw_v is None or not raw_t:
+            continue
+        try:
+            when = datetime.fromisoformat(str(raw_t).replace("Z", "+00:00"))
+            value = float(raw_v)
+        except (TypeError, ValueError):
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if abs(value - round(value)) > 1e-6:
+            fractional += 1
+        rows.append({
+            "valid_time_gmt": int(when.timestamp()),
+            "temp": int(round(value)),
+            "obs_name": name,
+            "obs_id": stid,
+            "max_temp": None,
+        })
+    if not rows:
+        return None
+    return {"observations": rows, "fractional": fractional}
+
+
+def fetch_synoptic_token(
+    *, session=None, timeout: float = 15.0
+) -> str:  # pragma: no cover - network
+    """weather.gov's own published Synoptic token, or the measured fallback."""
+
+    sess = session or (requests.Session() if requests else None)
+    if sess is not None:
+        try:
+            resp = sess.get(SYNOPTIC_TOKEN_URL, headers=_SYNOPTIC_HEADERS,
+                            timeout=timeout)
+            if resp.status_code == 200:
+                tok = parse_synoptic_token(resp.text)
+                if tok:
+                    return tok
+        except Exception:
+            pass
+    return SYNOPTIC_FALLBACK_TOKEN
+
+
+def make_synoptic_range_fetch(
+    *,
+    station: str,
+    token: str,
+    session=None,
+    recent_minutes: int = 2880,
+    timeout: float = 30.0,
+) -> Callable[[str, str], Optional[dict]]:
+    """Fetch callable for the resolver's own series, TWC-shaped (see above).
+
+    Signature matches :func:`make_twc_range_fetch` so the collector is unchanged,
+    but the day tokens are ignored: Synoptic takes a rolling ``recent`` window,
+    which is strictly better here. The TWC path had to ask for two *local* days
+    because its ``hours`` parameter truncated; ``recent=2880`` (48 h) covers the
+    24 h agreement window and yesterday's full local day in every timezone, in
+    ONE call, with no publish lag — the difference between a city verifying
+    minutes after startup and a city waiting a day for reach-back to rebuild.
+    """
+
+    sess = session or (requests.Session() if requests else None)
+
+    def fetch(start_yyyymmdd: str, end_yyyymmdd: str) -> Optional[dict]:  # pragma: no cover - network
+        if sess is None:
+            return None
+        try:
+            resp = sess.get(
+                SYNOPTIC_TIMESERIES_URL,
+                params={
+                    "stid": station,
+                    "recent": int(recent_minutes),
+                    "token": token,
+                    "units": "metric",
+                    "obtimezone": "utc",
+                },
+                headers=_SYNOPTIC_HEADERS,
+                timeout=timeout,
+            )
+        except Exception:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+        return parse_synoptic_timeseries(payload)
+
+    return fetch
+
+
+def parse_metar_history(records, *, include_speci: bool = True):
+    """``(obs_time, temp_c)`` pairs from an aviationweather JSON batch. Pure.
+
+    Honours the city's SPECI policy exactly as ``seed_records_from_metar_log``
+    does: on a routine-only city a SPECI never fed the running max, so it must
+    not feed the comparison either. Decimal temperatures are rejected — they are
+    the 6-minute non-resolution reports, which the running max never sees.
+    """
+
+    out: list[tuple[datetime, int]] = []
+    if not isinstance(records, list):
+        return out
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        raw = str(rec.get("rawOb") or "")
+        if not include_speci and raw.strip().startswith("SPECI"):
+            continue
+        temp = rec.get("temp")
+        obs = rec.get("obsTime")
+        if temp is None or obs is None:
+            continue
+        try:
+            value = float(temp)
+            when = datetime.fromtimestamp(int(obs), timezone.utc)
+        except (TypeError, ValueError, OSError):
+            continue
+        if abs(value - round(value)) > 1e-6:
+            continue  # non-resolution decimal report
+        out.append((when, int(round(value))))
+    return out
+
+
+def fetch_metar_history(
+    icao: str,
+    *,
+    hours: int = 48,
+    session=None,
+    include_speci: bool = True,
+    user_agent: str = _DEFAULT_UA,
+    timeout: float = 30.0,
+):  # pragma: no cover - network
+    """The station's trailing METAR history, for seeding the guard's own side.
+
+    Startup otherwise leaves a city ``unverified`` for a day whenever
+    ``metar.jsonl`` has a hole (a restart after downtime, a new city, a fetcher
+    outage) — the resolver's side backfills 48 h in one Synoptic call while ours
+    crawls forward in real time. This levels the two.
+
+    Seeds the CROSS-CHECK only: it never touches ``MetarFeed``, the running max,
+    or ``metar.jsonl``. It is verification history, not a trading input.
+
+    Queried ONE station at a time on purpose — a batched ``ids`` request
+    silently truncates the record set (12 stations came back with ~34 obs each
+    instead of 96, measured 2026-09-14), and a truncated history is
+    indistinguishable from a feed hole.
+    """
+
+    sess = session or (requests.Session() if requests else None)
+    if sess is None:
+        return []
+    try:
+        resp = sess.get(
+            AVIATIONWEATHER_URL,
+            params={"ids": icao, "format": "json", "hours": int(hours)},
+            headers={"User-Agent": user_agent},
+            timeout=timeout,
+        )
+    except Exception:
+        return []
+    if resp.status_code != 200:
+        return []
+    try:
+        payload = resp.json()
+    except ValueError:
+        return []
+    return parse_metar_history(payload, include_speci=include_speci)
+
+
 def make_tgftp_fetch(
     *, user_agent: str = _DEFAULT_UA, timeout: float = 5.0, session=None
 ) -> Callable[[str], Optional[str]]:
@@ -1009,6 +1285,7 @@ class SharedMetarFetcher:
         self._last_success: Optional[float] = None
         self._last_attempt: Optional[float] = None
         self._station_last: dict[str, float] = {}
+        self._bust_i = 0  # rotates AWC_HOURS_ROTATION for hot-window cache-busting
         self._lock = threading.Lock()
 
     def raw_for(self, icao: str, max_age: Optional[float] = None) -> Optional[str]:
@@ -1120,9 +1397,21 @@ class SharedMetarFetcher:
         # not), so we can report the publish/receipt split.
         params = {"ids": ",".join(self._icaos), "format": "json", "hours": 2}
         if bust:
-            # Unique param -> CDN cache miss -> origin-fresh data. Only while
-            # hot; the cached (max-age=60) response is fine at the slow cadence.
-            params["_"] = str(int(time.time() * 1000))
+            # Cache-bust by rotating a LEGAL parameter, never by adding one:
+            # aviationweather.gov answers "Unexpected query parameter provided"
+            # with HTTP 400 for anything it does not recognise (verified live
+            # 2026-08-20), exactly like api.weather.com. The old `_=<millis>`
+            # bust therefore made EVERY hot-window batch fail — silently, since
+            # _refresh swallows exceptions to keep the last-good cache. Stations
+            # with the per-station tgftp fast path masked it; the routine-only
+            # ICAOs (Moscow/Istanbul/Tel Aviv), which deliberately skip tgftp,
+            # were left with no source at all and collected ~2 obs/day.
+            # Rotating `hours` gives each poll its own cache key; the extra
+            # history rows are deduped by _store for free.
+            self._bust_i += 1
+            params["hours"] = AWC_HOURS_ROTATION[
+                self._bust_i % len(AWC_HOURS_ROTATION)
+            ]
         for _ in range(self._retries + 1):
             try:
                 resp = self._session.get(

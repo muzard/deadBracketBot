@@ -285,7 +285,14 @@ decision.**
   exists because on 2026-07-19 nothing checked it: RKSI's METAR said 27 °C,
   Weather Underground's row for the same instant said 26 °C, and the bot spent
   the entire wallet on a "certain" NO that settled to $0. Check status with
-  `python -m dead_bracket.tools.resolver_status`.
+  `python -m dead_bracket.tools.resolver_status`. Coverage is measured as
+  **reach-back plus freshness**, not span: the resolver publishes 26–96 min
+  late, so demanding a 23 h span inside a 24 h window can never be satisfied.
+- **Two cities read the resolver directly.** Seoul and Shenzhen use
+  `resolution_source="resolver"` — their running max comes from the resolver's
+  own closed rows, because their METAR measurably does not track it (Seoul
+  ~0.9 % of observations, Shenzhen a different station). The other 31 measured
+  cities agree with the resolver 100 % and stay on METAR.
 - **Live mode is locked** behind `DEAD_BRACKET_ALLOW_LIVE=1` until that guard
   has a clean paper soak behind it.
 - Trades a bracket only when `temp < running_max` from the **resolution METAR**.

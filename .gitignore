@@ -22,3 +22,6 @@ data/
 # Secrets — wallet keys live only in the environment (spec §9), never committed
 .env
 *.key
+soak.log
+soak*.log
+soak*.log.*

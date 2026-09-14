@@ -25,9 +25,11 @@ from .feeds_http import (
     TwcResolverFetcher,
     build_feed_fetcher,
     make_hko_1min_fetch,
+    fetch_metar_history,
     make_metar_fetch,
     make_tgftp_fetch,
     make_twc_historical_fetch,
+    make_synoptic_range_fetch,
     make_twc_range_fetch,
     make_twc_timeseries_fetch,
 )
@@ -55,6 +57,19 @@ from .risk import Ledger, RiskManager
 from .strategy import Strategy
 from .supervisor import Supervisor
 from .worker import CityWorker
+
+
+_SYNOPTIC_TOKEN: list = []
+
+
+def _synoptic_token() -> str:  # pragma: no cover - trivial network helper
+    """weather.gov's published Synoptic token, fetched once per process."""
+
+    if not _SYNOPTIC_TOKEN:
+        from .feeds_http import fetch_synoptic_token
+
+        _SYNOPTIC_TOKEN.append(fetch_synoptic_token(session=_new_session()))
+    return _SYNOPTIC_TOKEN[0]
 
 
 def _new_session():  # pragma: no cover - trivial network helper
@@ -427,22 +442,34 @@ def build_resolver_guards(
             tz = ZoneInfo(city_cfg.tz)
         except Exception:
             pass
-        configured = bool(city_cfg.resolver_location and config.twc_api_key)
+        # Synoptic needs no API key — only the station the market names. That
+        # also makes Istanbul verifiable for the first time: WU served LTFM no
+        # rows at all, NOAA serves 96 in 48h.
+        if city_cfg.resolver_provider == "synoptic":
+            configured = bool(city_cfg.metar_icao)
+        else:
+            configured = bool(city_cfg.resolver_location and config.twc_api_key)
         guard = ResolverCrossCheck(
             city_cfg.id,
             tz=tz,
             window_hours=config.resolver_window_hours,
             min_pairs=config.resolver_min_pairs,
-            min_span_hours=config.resolver_min_span_hours,
+            min_reach_hours=config.resolver_min_reach_hours,
             max_gap_hours=config.resolver_max_gap_hours,
             max_lag_hours=config.resolver_max_lag_hours,
             settle_lag_min=config.resolver_settle_lag_min,
+            min_day_obs=config.resolver_min_day_obs,
             tolerance_c=config.resolver_tolerance_c,
             configured=configured,
+            # seoul/shenzhen read the resolver's table AS their running max, so
+            # there are no two sides to compare — gate on the table's health.
+            self_sourced=(city_cfg.resolution_source == "resolver" and configured),
         )
         city_dir = os.path.join(config.data_dir, city_cfg.id)
-        # Seed our side from whichever log this city's running max is fed by.
-        for log_name in ("metar.jsonl", "metar_twc.jsonl", "metar_hko.jsonl"):
+        # Seed our side from whichever log this city's running max is fed by
+        # (resolver-sourced cities first — that IS their trading path).
+        for log_name in ("metar_resolver.jsonl", "metar_twc.jsonl",
+                         "metar_hko.jsonl", "metar.jsonl"):
             path = os.path.join(city_dir, log_name)
             if os.path.exists(path):
                 guard.seed_ours(seed_records_from_metar_log(
@@ -451,6 +478,25 @@ def build_resolver_guards(
                     include_speci=city_cfg.include_speci,
                 ))
                 break
+        # Our log can have holes the resolver's table does not (a restart after
+        # downtime, a new city, a fetcher outage). The Synoptic side backfills
+        # 48h in its first poll, so without this the city sits unverified for a
+        # day waiting on reach-back while the comparison itself is ready. Seeds
+        # the CROSS-CHECK only — never the running max.
+        if configured and city_cfg.resolution_source == "metar":
+            try:
+                history = fetch_metar_history(
+                    city_cfg.metar_icao,
+                    hours=int(config.resolver_window_hours * 2),
+                    session=_new_session(),
+                    include_speci=city_cfg.include_speci,
+                )
+            except Exception:
+                history = []
+            if history:
+                guard.seed_ours(history)
+                reporter.event(city_cfg.id, "resolver_seed_history",
+                               obs=len(history))
         # Re-arm a divergence recorded by an earlier run.
         prior = blocks.blocked(city_cfg.id)
         if prior:
@@ -472,15 +518,28 @@ def build_resolver_guards(
                     "and will NOT trade (data collection continues)",
                 )
             continue
-        collector = ResolverRowCollector(
-            city=city_cfg.id,
-            guard=guard,
-            fetch=make_twc_range_fetch(
+        if city_cfg.resolver_provider == "synoptic":
+            fetch = make_synoptic_range_fetch(
+                station=city_cfg.metar_icao,
+                token=_synoptic_token(),
+                session=_new_session(),
+                recent_minutes=config.resolver_recent_minutes,
+            )
+            rows_path = os.path.join(city_dir, "resolver_rows.jsonl")
+            source_label = f"noaa/synoptic {city_cfg.metar_icao}"
+        else:
+            fetch = make_twc_range_fetch(
                 api_key=config.twc_api_key,
                 location=city_cfg.resolver_location,
                 session=_new_session(),
-            ),
-            path=os.path.join(city_dir, "wu_rows.jsonl"),
+            )
+            rows_path = os.path.join(city_dir, "wu_rows.jsonl")
+            source_label = f"twc/wu {city_cfg.resolver_location}"
+        collector = ResolverRowCollector(
+            city=city_cfg.id,
+            guard=guard,
+            fetch=fetch,
+            path=rows_path,
             tz=tz,
         )
         pollers.append(
@@ -491,7 +550,7 @@ def build_resolver_guards(
                 poll_sec=config.resolver_poll_sec,
             )
         )
-        reporter.event(city_cfg.id, "resolver_start",
+        reporter.event(city_cfg.id, "resolver_start", source=source_label,
                        location=city_cfg.resolver_location)
     return guards, pollers, blocks
 
@@ -539,7 +598,55 @@ def build_supervisor(
         hko_place = (
             city_cfg.resolution_hko_place if (use_hko and not twc_resolver) else None
         )
-        if twc_resolver:
+        # Cities whose METAR provably does not track the resolver (seoul,
+        # shenzhen — see config.RESOLVER_LOCATIONS for the measurements) read
+        # their running max from the resolver's OWN closed rows, collected by
+        # the resolver poller into wu_rows.jsonl. --twc keeps precedence so the
+        # Shenzhen calibration workflow is unchanged.
+        use_resolver_src = (
+            not twc_resolver
+            and city_cfg.resolution_source == "resolver"
+            and config.resolver_check
+            and bool(city_cfg.resolver_location and config.twc_api_key)
+        )
+        if city_cfg.resolution_source == "resolver" and not (
+            twc_resolver or use_resolver_src
+        ):
+            # No key / no table: this city has NO valid source at all. Idle it
+            # rather than silently falling back to the METAR we know is wrong.
+            reporter.event(city_cfg.id, "resolver_source_unavailable")
+            reporter.notice(
+                city_cfg.id,
+                "resolution source is the resolver table but it is unavailable "
+                "(needs TWC_API_KEY + resolver_check) — city will NOT trade; "
+                "its METAR is known not to track the resolver",
+            )
+        if use_resolver_src:
+            fetcher = TwcResolverFetcher(
+                path=os.path.join(config.data_dir, city_cfg.id, "wu_rows.jsonl"),
+                icao=city_cfg.metar_icao,
+                location=city_cfg.resolver_location,
+                stale_sec=config.twc_resolver_stale_sec,
+            )
+            metar = MetarFeed(
+                city_cfg.metar_icao,
+                fetch_fn=fetcher.raw_for,
+                log_path=os.path.join(
+                    config.data_dir, city_cfg.id, "metar_resolver.jsonl"
+                ),
+                tz=ZoneInfo(city_cfg.tz),
+                include_speci=city_cfg.include_speci,
+            )
+            reporter.event(city_cfg.id, "resolver_source",
+                           location=city_cfg.resolver_location)
+            reporter.notice(
+                city_cfg.id,
+                f"resolution source: the RESOLVER's own closed rows "
+                f"({city_cfg.resolver_location} -> metar_resolver.jsonl); "
+                f"{city_cfg.metar_icao} METAR is OUT of the trading path "
+                "(it does not track the resolver)",
+            )
+        elif twc_resolver:
             fetcher = TwcResolverFetcher(
                 path=os.path.join(config.data_dir, city_cfg.id, "twc_rows.jsonl"),
                 icao=city_cfg.metar_icao,
