@@ -460,15 +460,32 @@ class Config:
     # bankroll-limited, not liquidity-limited, so 1.0 deploys the available edge.
     max_frac_of_depth: float = 1.0
     max_daily_loss: float = 50.0
-    # Capital recycling policy. A dead NO is certain to pay $1, so resting a
-    # 99.9c maker sell only pays off when the 0.1c given up frees capital for a
-    # NEW <=CAP opportunity worth more. When True (default), the bot HOLDS every
-    # dead NO to $1 and posts a recycle sell only when a would-be buy this tick
-    # was blocked purely by the bankroll caps (strategy.last_blocked_value > 0),
-    # sized to cover just that shortfall; when the block clears the unfilled
-    # recycle sells are cancelled (revert to hold). False restores the old
-    # always-rest-after-every-buy behaviour.
-    recycle_on_opportunity: bool = True
+    # Capital recycling policy. When False (the default since 2026-09-14) every
+    # buy is immediately backed by a resting 99.9c maker sell. When True the bot
+    # instead HOLDS each dead NO to $1 and posts a recycle sell only when a
+    # would-be buy this tick was blocked purely by the bankroll caps
+    # (strategy.last_blocked_value > 0), sized to cover just that shortfall,
+    # cancelling it when the block clears.
+    #
+    # Holding looks free — a dead NO "certainly" pays $1, so why give up 0.1c?
+    # The trade history says otherwise. Across the whole project every dollar
+    # ever REALISED came from a 99.9c maker fill (9 of 9 filled, 0.7-234 min,
+    # median ~30 min), and every dollar ever lost came from a position held to
+    # settlement in a city whose source turned out not to be the resolver's.
+    # Resting the sell buys three things for 0.1c: it converts an uncertain
+    # settlement claim into cash, it frees capital while the opportunity is
+    # still open (we are bankroll-limited, not liquidity-limited, whenever an
+    # opportunity does appear), and a sell that does NOT fill is a free
+    # false-dead alarm — nobody bids ~$1 for a NO that is not actually certain.
+    # See STRATEGY.md section 2, and recycle_alarm_min below for the alarm.
+    recycle_on_opportunity: bool = False
+    # Minutes a 99.9c recycle sell may rest unfilled before the city is halted
+    # and a human paged. A genuinely dead NO attracts a ~$1 bid; one that never
+    # does is the signature of a false dead, which is the failure that emptied
+    # the wallet on 2026-07-19. Measured fill times were 0.7-234 min with a
+    # ~30 min median, so this is deliberately well past the tail rather than at
+    # it. 0 disables the alarm.
+    recycle_alarm_min: float = 240.0
     # Live wallet-balance polling cadence (seconds). The balance tracker reads
     # the real USDC balance fast while a buy is being attempted, and cools the
     # cadence (doubling up to slow) once ``balance_poll_cool_after`` consecutive
@@ -703,6 +720,7 @@ class Config:
             "max_frac_of_depth": float,
             "max_daily_loss": float,
             "recycle_on_opportunity": _as_bool,
+            "recycle_alarm_min": float,
             "balance_poll_fast_sec": float,
             "balance_poll_slow_sec": float,
             "balance_poll_cool_after": int,

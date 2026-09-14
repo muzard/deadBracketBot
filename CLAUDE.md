@@ -7,10 +7,15 @@ paths, one order pipeline:
 1. **Dead path (certainty).** Once the resolution-grade METAR's running max
    passes a bracket, that bracket can never be the high, so its NO is certain
    → buy the NO if offered <98¢ (IOC). By default the NO is then **held to $1**;
-   the 99.9¢ maker recycle sell is posted only when a *new* dead-NO buy this tick
-   is blocked purely by the bankroll caps (`strategy.last_blocked_value > 0`),
-   sized to cover just that shortfall, and cancelled when the block clears
-   (`recycle_on_opportunity`, default on; set False for the legacy always-rest).
+   **every buy is immediately backed by a resting 99.9¢ maker sell**
+   (`recycle_on_opportunity`, default **False** since 2026-09-14). Holding to $1
+   earns 0.1¢ more and risks 100¢: every dollar ever realised came from a 99.9¢
+   fill (9/9 filled, 0.7-234 min), every dollar ever lost came from a position
+   held to settlement on a wrong source. Set it True for the opportunity-gated
+   hold-to-$1 policy, which posts a recycle sell only when a new dead-NO buy is
+   blocked purely by the bankroll caps. An unfilled recycle sell halts the city
+   after `recycle_alarm_min` (240): nobody bids ~$1 for a NO that is not
+   certain, so it is our only independent check on a live position.
    Forecast entries keep their immediate 99.9¢ de-risk exit (see path 2).
 2. **Forecast path (probabilistic, 2026-07-08 — a deliberate mandate widening,
    NO-side only).** Sub-hourly national-met feeds (same/co-located sensors as

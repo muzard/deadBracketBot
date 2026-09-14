@@ -87,7 +87,7 @@ def test_later_bracket_plays_while_earlier_still_held():
 
 
 def test_capped_out_city_replays_after_funds_freed():
-    """Gated recycling (default): an earlier bracket consumes the whole budget and
+    """Gated recycling (opt-in): an earlier bracket consumes the whole budget and
     is held to $1; when a later dead bracket appears but is blocked by the caps,
     the held bracket is recycled (99.9c sell posted) to free capital; once a 0.999
     bid lifts that sell the freed funds buy the later bracket.
@@ -96,7 +96,7 @@ def test_capped_out_city_replays_after_funds_freed():
     # Tight caps so a single bracket exhausts the budget; full-depth taking and a
     # venue minimum on the later bracket so the conservative residual can't trade.
     config = replace(Config(), max_total_exposure=48.0, max_exposure_per_city=48.0,
-                     max_frac_of_depth=1.0)
+                     max_frac_of_depth=1.0, recycle_on_opportunity=True)
     risk = RiskManager(config)
     rep = StubReporter()
     worker, ex, metar = build_worker(

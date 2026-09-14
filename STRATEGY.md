@@ -254,12 +254,17 @@ away or a false-dead in disguise.
 2. **Fix the guard before anything else** (§3). Until then the bot is a data
    collector with 26 cities switched off.
 3. **Always rest the 99.9¢ maker sell. Make holding-to-$1 the exception.**
-   Set `recycle_on_opportunity=False`. Cost 0.1¢/share; buys source-independent
-   realisation, capital recycling, and a false-dead alarm.
-4. **Alarm on an unfilled recycle.** A resting 0.999 sell with no fill after
-   ~90 minutes (3× the observed median) means no one will pay ~$1 for a NO we
-   believe is certain. Halt the city and page a human. Cheap, and it is the only
-   independent check we have on a live position.
+   `recycle_on_opportunity=False` — **shipped 2026-09-14, now the default.**
+   Cost 0.1¢/share; buys source-independent realisation, capital recycling, and
+   a false-dead alarm.
+4. **Alarm on an unfilled recycle.** **Shipped 2026-09-14** as
+   `recycle_alarm_min` (default 240 min — well past the 234 min observed tail,
+   rather than at the 30 min median, so it fires on evidence and not on a slow
+   day). A resting 0.999 sell that never fills means no one will pay ~$1 for a
+   NO we believe is certain; the city is halted for the day and the notice names
+   the bracket. It is the only independent check we have on a live position,
+   and it is the check the Seoul wipe never got: that position simply settled to
+   $0 hours later with nothing in between.
 5. **Keep the concentration caps exactly as they are** (`max_bracket_pct 25`,
    `max_deployed_pct 90`, clamped to available capital). At ~1 event/week they
    cost little; they are what makes rule 1's residual failure survivable.

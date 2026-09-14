@@ -118,6 +118,10 @@ class CityWorker:
         self._last_price_sample: Optional[float] = None
         # Peak $ of liftable dead-NO blocked by the bankroll caps today.
         self._capped_peak = 0.0
+        # When each bracket's 99.9c recycle sell first started resting unfilled
+        # (monotonic). A genuinely dead NO attracts a ~$1 bid; one that never
+        # does is the signature of a false dead. See _check_recycle_alarm.
+        self._resting_since: dict[int, float] = {}
         # Seed the METAR-output dedup from the feed's log so a restart doesn't
         # re-announce a report already recorded (it appeared as an inflated
         # "+my" latency on every restart).
@@ -380,14 +384,18 @@ class CityWorker:
                 # defer to step 6 and are held to $1 unless capital is blocked.
                 self._place_exit_for(fill.temp, fill.size, bracket)
 
-        # 6. Capital recycling. Default (opportunity-gated): hold every dead NO to
-        #    $1 and post recycle sells only to cover a bankroll-blocked buy this
-        #    tick, cancelling them when the block clears. Legacy: guarantee every
-        #    held share rests (spec §4 as originally written).
+        # 6. Capital recycling. Default: guarantee every held share rests at
+        #    99.9c (spec §4 as originally written). Opportunity-gated (opt-in):
+        #    hold every dead NO to $1 and post recycle sells only to cover a
+        #    bankroll-blocked buy this tick, cancelling them when the block
+        #    clears.
         if self._cfg.recycle_on_opportunity:
             self._maintain_recycle_sells(snapshot, frozenset(acted), blocked_this_tick)
         else:
             self._ensure_exits(snapshot)
+
+        # 7. False-dead alarm: a recycle sell that never fills.
+        self._check_recycle_alarm()
 
     def _check_resolver(self, rmax: Optional[int] = None) -> bool:
         """Evaluate the resolver cross-check. Returns True if entries may proceed.
@@ -514,6 +522,56 @@ class CityWorker:
             if bracket is None:
                 continue  # bracket not in the current book; will retry next tick
             self._place_exit_for(pos.temp, uncovered, bracket)
+
+    def _check_recycle_alarm(self) -> None:
+        """Halt the city if a 99.9c recycle sell has rested unfilled too long.
+
+        This is the one independent check we have on a live position. Our own
+        reasoning says a dead bracket's NO is certain to pay $1 — but that
+        reasoning is exactly what fails when the running max came from the wrong
+        source, and it fails silently: the position simply settles to $0 hours
+        later. The market disagrees much sooner. A genuinely certain NO attracts
+        a ~$1 bid (9 of 9 historical recycle sells filled, 0.7-234 min, median
+        ~30); a false-dead NO never will, because it is not worth $1 and the
+        other side knows it.
+
+        So an unfilled sell is treated as evidence against our own deadness
+        call, not as a liquidity inconvenience. The halt stops new entries for
+        the day (not sticky — this is suspicion, not the proof that
+        resolver divergence provides) and the notice names the bracket so a
+        human can check the source before anything else is bought.
+        """
+
+        limit = float(self._cfg.recycle_alarm_min) * 60.0
+        if limit <= 0:
+            return
+        now = self._mono()
+        positions = getattr(self._executor, "positions", {})
+        live = {p.temp for p in positions.values()
+                if p.city == self.city and p.resting_sell > 0}
+        for temp in list(self._resting_since):
+            if temp not in live:
+                del self._resting_since[temp]  # filled or cancelled -> clock resets
+        for temp in live:
+            started = self._resting_since.setdefault(temp, now)
+            waited = now - started
+            if waited < limit:
+                continue
+            if self._risk.halt_city(
+                self.city, "unfilled recycle sell",
+                recoverable=False,
+            ):
+                self._reporter.event(self.city, "recycle_unfilled",
+                                     temp=temp, minutes=round(waited / 60.0, 1))
+                self._reporter.notice(
+                    self.city,
+                    f"HALTED: the 99.9c sell on bracket {temp} has rested "
+                    f"{waited / 60.0:.0f} min unfilled. Nobody is bidding ~$1 "
+                    f"for a NO we believe is certain — check that this city's "
+                    f"running max really matches its resolver before trading it "
+                    f"again.",
+                )
+            return
 
     def _cancel_exit_for(self, temp: int) -> None:
         """Retract the resting recycle sell for one bracket (revert to hold-$1)."""

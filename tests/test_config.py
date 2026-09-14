@@ -78,15 +78,20 @@ def test_from_env_overrides():
 
 def test_recycle_and_balance_defaults_and_env():
     c = Config()
-    assert c.recycle_on_opportunity is True  # hold-to-$1 gated recycling by default
+    # Always-rest is the default: the 0.1c given up buys realisation, capital
+    # recycling, and a false-dead alarm (STRATEGY.md section 2).
+    assert c.recycle_on_opportunity is False
+    assert c.recycle_alarm_min == 240.0
     assert c.balance_poll_fast_sec == 2.0
     assert c.balance_poll_slow_sec == 60.0
     assert c.balance_poll_cool_after == 3
-    over = Config.from_env({"RECYCLE_ON_OPPORTUNITY": "false",
+    over = Config.from_env({"RECYCLE_ON_OPPORTUNITY": "true",
+                            "RECYCLE_ALARM_MIN": "45",
                             "BALANCE_POLL_FAST_SEC": "1.5",
                             "BALANCE_POLL_SLOW_SEC": "90",
                             "BALANCE_POLL_COOL_AFTER": "5"})
-    assert over.recycle_on_opportunity is False
+    assert over.recycle_on_opportunity is True
+    assert over.recycle_alarm_min == 45.0
     assert over.balance_poll_fast_sec == 1.5
     assert over.balance_poll_slow_sec == 90.0
     assert over.balance_poll_cool_after == 5

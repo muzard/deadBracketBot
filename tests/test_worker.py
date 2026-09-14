@@ -20,17 +20,25 @@ NOW = datetime(2026, 6, 3, 16, 0, tzinfo=timezone.utc)
 @pytest.fixture
 def risk_capped():
     """Tight caps so a single bracket exhausts the budget — the setup where a
-    second dead bracket is capital-blocked and recycling is triggered."""
+    second dead bracket is capital-blocked and recycling is triggered.
+
+    Opts INTO the hold-to-$1 policy, which is no longer the default (see
+    ``test_dead_no_rests_a_recycle_sell_by_default``)."""
 
     from dataclasses import replace
     cfg = replace(Config(), max_total_exposure=48.0, max_exposure_per_city=48.0,
-                  max_frac_of_depth=1.0)
+                  max_frac_of_depth=1.0, recycle_on_opportunity=True)
     return RiskManager(cfg), cfg
 
 
-def test_dead_no_held_to_dollar_by_default(config, risk):
-    """Default policy: a lone dead-NO buy is NOT recycled — it is held to $1, so
-    no resting 99.9c sell is posted when there is no capital-blocked opportunity."""
+def test_dead_no_rests_a_recycle_sell_by_default(config, risk):
+    """Default policy since 2026-09-14: every dead-NO buy is immediately backed by
+    a resting 99.9c maker sell.
+
+    Holding to $1 earns 0.1c more per share and risks 100c. Every dollar the
+    project ever REALISED came from a 99.9c fill; every dollar it ever lost came
+    from a position held to settlement in a city whose source was not the
+    resolver's. See STRATEGY.md section 2."""
 
     rep = StubReporter()
     worker, ex, metar = build_worker(
@@ -39,6 +47,21 @@ def test_dead_no_held_to_dollar_by_default(config, risk):
     worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
     pos = ex.positions[("paris", 22)]
     assert pos.shares == 100
+    assert pos.resting_sell == 100  # covered on open, not held to $1
+
+
+def test_dead_no_held_to_dollar_when_opportunity_gated(risk_capped):
+    """The opt-in policy: a lone dead-NO buy is NOT recycled — it is held to $1,
+    so no resting 99.9c sell is posted with no capital-blocked opportunity."""
+
+    risk, config = risk_capped
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=config, risk=risk, reporter=rep, metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    pos = ex.positions[("paris", 22)]
+    assert pos.shares > 0
     assert pos.resting_sell == 0  # held to $1, no recycle sell posted
 
     # A later tick with no new opportunity keeps it held (still no sell).
@@ -729,3 +752,71 @@ def test_strict_mode_waits_for_resolver_to_confirm_the_running_max(config, risk,
     metar2._tracker._running_max = 22
     worker2.process_book(_dead_no_snapshot())
     assert executor2.positions[("paris", 21)].shares > 0
+
+
+# ---------------------------------------------------------------------------
+# False-dead alarm: a 99.9c recycle sell that never fills
+
+
+def _alarm_worker(minutes, clock):
+    """A worker whose recycle alarm fires after ``minutes``, on a fake clock."""
+
+    from dataclasses import replace
+    cfg = replace(Config(), recycle_alarm_min=minutes)
+    risk = RiskManager(cfg)
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=cfg, risk=risk, reporter=rep,
+        metar_raw="LFPB 031530Z 24/10 Q1018", monotonic=clock)
+    metar.poll_once()
+    return worker, ex, metar, risk, rep
+
+
+def test_unfilled_recycle_sell_halts_the_city():
+    """The one independent check on a live position: nobody bids ~$1 for a NO
+    that is not actually certain, so a sell that never fills is evidence our
+    deadness call — and therefore our source — is wrong."""
+
+    t = [0.0]
+    worker, ex, metar, risk, rep = _alarm_worker(90.0, lambda: t[0])
+
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    assert ex.positions[("paris", 22)].resting_sell == 100  # resting, unfilled
+    assert risk.city_halt_reason("paris") is None
+
+    t[0] = 89 * 60                       # just inside the limit
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert risk.city_halt_reason("paris") is None
+
+    t[0] = 91 * 60                       # past it
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert risk.city_halt_reason("paris") == "unfilled recycle sell"
+    assert any("bracket 22" in n and "unfilled" in n for n in rep.progress_lines)
+
+
+def test_recycle_alarm_clock_resets_when_the_sell_fills():
+    """A fill is the good outcome — it must clear the clock, not leave a city
+    one slow fill away from a spurious halt later in the day."""
+
+    t = [0.0]
+    worker, ex, metar, risk, rep = _alarm_worker(90.0, lambda: t[0])
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+
+    t[0] = 60 * 60
+    # A 0.999 bid lifts the resting sell.
+    worker.process_book(make_snapshot("paris", [make_bracket(22, bids=[(0.999, 100)])]))
+    assert ex.positions[("paris", 22)].resting_sell == 0
+    assert any(line.startswith("SOLD") for line in rep.console)
+
+    t[0] = 200 * 60                      # long past the limit, but nothing rests
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert risk.city_halt_reason("paris") is None
+
+
+def test_recycle_alarm_can_be_disabled():
+    t = [0.0]
+    worker, ex, metar, risk, rep = _alarm_worker(0.0, lambda: t[0])
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    t[0] = 10_000 * 60
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert risk.city_halt_reason("paris") is None
