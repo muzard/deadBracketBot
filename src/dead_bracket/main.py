@@ -437,6 +437,7 @@ def build_resolver_guards(
             max_gap_hours=config.resolver_max_gap_hours,
             max_lag_hours=config.resolver_max_lag_hours,
             settle_lag_min=config.resolver_settle_lag_min,
+            min_day_obs=config.resolver_min_day_obs,
             tolerance_c=config.resolver_tolerance_c,
             configured=configured,
             # seoul/shenzhen read the resolver's table AS their running max, so

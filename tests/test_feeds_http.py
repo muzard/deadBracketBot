@@ -209,6 +209,56 @@ def test_wunderground_exempt_icaos_still_require_station():
     assert source_confirmed(bare, None) is True
 
 
+def _noaa_ev(slug, icao, site=None, **kw):
+    """An event carrying the post-2026-09-12 NOAA resolution text."""
+
+    ev = _ev(slug, **kw)
+    ev["description"] = (
+        "This market will resolve to the temperature range that contains the "
+        f"highest temperature recorded by NOAA at the {icao} Airport Station in "
+        "degrees Celsius. The resolution source for this market will be "
+        "information from NOAA, specifically the highest reading under the "
+        '"Temp" column for all times on this day, available here: '
+        f"https://www.weather.gov/wrh/timeseries?site={site or icao}\n\n"
+        "If NOAA data for the observation date is unavailable by 11:59 PM ET on "
+        "the day following the observation date, the Weather Underground Daily "
+        "Observations table will be used as the resolution source."
+    )
+    ev["markets"] = []
+    return ev
+
+
+def test_source_confirmed_accepts_the_noaa_timeseries_for_our_station():
+    # 2026-09-12: the markets moved from Weather Underground to NOAA's
+    # weather.gov timeseries, which is the station's own METAR. Rejecting those
+    # left every city idling with "no market data".
+    from dead_bracket.feeds_http import source_confirmed
+    ev = _noaa_ev("highest-temperature-in-paris-on-september-14-2026", "LFPB")
+    assert source_confirmed(ev, "LFPB") is True
+    # The site parameter is lowercase in the live descriptions.
+    assert source_confirmed(
+        _noaa_ev("x", "LFPB", site="lfpb"), "LFPB") is True
+
+
+def test_source_confirmed_rejects_a_noaa_timeseries_for_a_different_station():
+    # Stricter than the old substring test: naming our station somewhere in the
+    # text is not enough if the resolution URL points at someone else's site.
+    from dead_bracket.feeds_http import source_confirmed
+    ev = _noaa_ev("x", "LFPB", site="EGLC")
+    assert "lfpb" in (ev["description"] or "").lower()  # our station IS named
+    assert source_confirmed(ev, "LFPB") is False        # ...but it resolves on EGLC
+
+
+def test_noaa_market_does_not_need_the_wunderground_term():
+    # WU survives in the text only as a fallback clause; requiring it as the
+    # source would be reading the wrong table.
+    from dead_bracket.feeds_http import source_confirmed
+    ev = _noaa_ev("x", "ZGSZ")
+    ev["description"] = ev["description"].split("If NOAA data")[0]
+    assert "wunderground" not in ev["description"].lower()
+    assert source_confirmed(ev, "ZGSZ") is True
+
+
 def test_choose_event_filters_on_unconfirmed_source():
     from datetime import date
     good = _src_ev("highest-temperature-in-london-on-june-8-2026", icao="EGLC", wu=True)

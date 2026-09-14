@@ -8,6 +8,7 @@ why not?" without touching the network or the bot.
 
     python -m dead_bracket.tools.resolver_status
     python -m dead_bracket.tools.resolver_status --city seoul --verbose
+    python -m dead_bracket.tools.resolver_status --at 2026-08-22T12:02Z
 
 Exit code is 1 if any city is in sticky DIVERGENT state, so it can gate a
 deploy/enable script.
@@ -34,11 +35,29 @@ _METAR_LOGS = ("metar_resolver.jsonl", "metar_twc.jsonl", "metar_hko.jsonl",
                "metar.jsonl")
 
 
-def _load_wu_rows(path: str) -> tuple[list[tuple[int, int]], str | None]:
+def _parse_at(raw: str) -> datetime:
+    """Parse a --at instant, defaulting a bare timestamp to UTC."""
+
+    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _load_wu_rows(path: str, as_of: datetime | None = None
+                  ) -> tuple[list[tuple[int, int]], str | None]:
+    """Resolver rows from disk, optionally only those already *seen* by ``as_of``.
+
+    Each record carries ``ts``, the moment the poller first read it. Honouring
+    that is what makes ``--at`` a faithful replay rather than hindsight: the
+    resolver publishes up to hours late, so a row keyed inside the window may
+    not have existed yet at the instant being replayed — which is precisely the
+    confusion that produced August's false divergence blocks.
+    """
+
     import json
 
     rows: list[tuple[int, int]] = []
     station = None
+    cutoff = as_of.timestamp() if as_of else None
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -47,6 +66,10 @@ def _load_wu_rows(path: str) -> tuple[list[tuple[int, int]], str | None]:
                     continue
                 try:
                     rec = json.loads(line)
+                    if cutoff is not None:
+                        seen = _parse_at(str(rec["ts"])).timestamp()
+                        if seen > cutoff:
+                            continue
                     rows.append((int(rec["valid_time_gmt"]), int(rec["temp"])))
                     station = rec.get("obs_name") or station
                 except (ValueError, KeyError, TypeError):
@@ -56,7 +79,8 @@ def _load_wu_rows(path: str) -> tuple[list[tuple[int, int]], str | None]:
     return rows, station
 
 
-def build_guard(config: Config, city_cfg, *, now: datetime) -> ResolverCrossCheck:
+def build_guard(config: Config, city_cfg, *, now: datetime,
+                as_of: datetime | None = None) -> ResolverCrossCheck:
     """Rebuild one city's guard from the on-disk logs."""
 
     try:
@@ -72,6 +96,7 @@ def build_guard(config: Config, city_cfg, *, now: datetime) -> ResolverCrossChec
         max_gap_hours=config.resolver_max_gap_hours,
         max_lag_hours=config.resolver_max_lag_hours,
         settle_lag_min=config.resolver_settle_lag_min,
+        min_day_obs=config.resolver_min_day_obs,
         tolerance_c=config.resolver_tolerance_c,
         configured=bool(city_cfg.resolver_location),
         self_sourced=(city_cfg.resolution_source == "resolver"
@@ -86,7 +111,8 @@ def build_guard(config: Config, city_cfg, *, now: datetime) -> ResolverCrossChec
                 path, hours=config.resolver_window_hours * 2, now=now,
                 include_speci=city_cfg.include_speci))
             break
-    rows, station = _load_wu_rows(os.path.join(city_dir, "wu_rows.jsonl"))
+    rows, station = _load_wu_rows(os.path.join(city_dir, "wu_rows.jsonl"),
+                                  as_of=as_of)
     if rows:
         guard.note_theirs(rows, station=station)
     return guard
@@ -98,6 +124,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="list every mismatched observation")
+    ap.add_argument("--at", metavar="ISO8601",
+                    help="replay the guard as of a past instant "
+                         "(e.g. 2026-08-22T12:02Z) instead of now — the only "
+                         "way to ask why a sticky block actually fired")
     args = ap.parse_args(argv)
 
     config = Config.from_env()
@@ -105,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         from dataclasses import replace
 
         config = replace(config, data_dir=args.data_dir)
-    now = datetime.now(timezone.utc)
+    now = _parse_at(args.at) if args.at else datetime.now(timezone.utc)
     blocks = ResolverBlockStore(
         os.path.join(config.data_dir, "_global", "resolver_blocks.json"))
 
@@ -125,7 +155,8 @@ def main(argv: list[str] | None = None) -> int:
     diverged = []
     tradeable = 0
     for city_cfg in cities:
-        guard = build_guard(config, city_cfg, now=now)
+        guard = build_guard(config, city_cfg, now=now,
+                            as_of=now if args.at else None)
         stored = blocks.blocked(city_cfg.id)
         if stored:
             guard.adopt_block(stored.get("detail") or stored.get("reason", ""))

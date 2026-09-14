@@ -23,3 +23,5 @@ data/
 .env
 *.key
 soak.log
+soak*.log
+soak*.log.*

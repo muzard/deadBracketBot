@@ -97,6 +97,23 @@ FORBIDDEN_EVENT_TERMS = ("lowest", "minimum")
 WUNDERGROUND_TERM = "wunderground"
 WUNDERGROUND_EXEMPT_ICAOS = frozenset({"UUWW", "LTFM", "LLBG"})
 
+# 2026-09-12: Polymarket re-pointed the daily-temperature markets from Weather
+# Underground to NOAA. The description now names
+# ``https://www.weather.gov/wrh/timeseries?site=<ICAO>`` as THE resolution
+# source, with WU demoted to a fallback "if NOAA data ... is unavailable".
+# Measured the same day: that series (weather.gov's WRH page reads Synoptic /
+# MesoWest for the station) is observation-for-observation identical to the
+# station's METAR — 34 of 35 cities, ~2,700 paired obs, 100.0% agreement, same
+# counts, same window, same daily max, SPECIs included. So for a NOAA-resolved
+# market our own METAR *is* the resolution source.
+#
+# This pattern is what confirms it, and it is STRICTER than the old substring
+# test: the site parameter must be the city's own station, so a market pointing
+# at some other station can never pass.
+NOAA_TIMESERIES_RE = re.compile(
+    r"weather\.gov/wrh/timeseries\?site=([a-z0-9]+)", re.IGNORECASE
+)
+
 _TEMP_IN_QUESTION = re.compile(r"(-?\d+)\s*°?\s*[cC]\b")
 # Open-ended top bracket: "... or higher/above/more/over/greater", or a trailing
 # "+" (e.g. "30°C+" / "30+"). Matched on the bracket title to exempt it from the
@@ -242,14 +259,24 @@ def event_text(ev: dict) -> str:
 
 
 def source_confirmed(ev: dict, icao: Optional[str]) -> bool:
-    """True iff ``ev`` is confirmed to resolve on ``icao`` (and, by default, WU).
+    """True iff ``ev`` is confirmed to resolve on ``icao``, from a source we track.
 
     The resolution-source cross-check: the event text MUST name the station code
     — that is what guarantees the running max matches the market, so it is never
-    waived. By default it must ALSO name "wunderground". A WU-exempt ICAO
-    (UUWW/LTFM) skips ONLY the Weather-Underground half (its market resolves off a
-    non-WU source) but still has to name its station. An unset ``icao`` skips the
-    check entirely (keeps the pure picker usable). See ``WUNDERGROUND_EXEMPT_ICAOS``.
+    waived. It must ALSO name a resolution source we actually follow, which is
+    now one of two:
+
+    * **NOAA** (since 2026-09-12, 34 of 35 cities): the description carries
+      ``weather.gov/wrh/timeseries?site=<ICAO>``, and that site must be THIS
+      city's station. Measured identical to the station's METAR, so our running
+      max is the resolver's series by construction.
+    * **Weather Underground** (now only Taipei/RCSS): the legacy source, named
+      by the ``wunderground`` term.
+
+    A WU-exempt ICAO (UUWW/LTFM/LLBG) skips the source half — those markets were
+    already on weather.gov before the migration — but still has to name its
+    station. An unset ``icao`` skips the check entirely (keeps the pure picker
+    usable). See ``WUNDERGROUND_EXEMPT_ICAOS`` and ``NOAA_TIMESERIES_RE``.
     """
 
     if not icao:
@@ -257,8 +284,14 @@ def source_confirmed(ev: dict, icao: Optional[str]) -> bool:
     text = event_text(ev)
     if icao.lower() not in text:
         return False  # wrong/unnamed station -> never trade (false-dead risk)
+    sites = {m.lower() for m in NOAA_TIMESERIES_RE.findall(text)}
+    if sites:
+        # NOAA-resolved: the timeseries must point at OUR station, and only
+        # ours. A description naming someone else's site is a mismatch, which
+        # is the exact failure class that emptied the wallet on Seoul.
+        return sites == {icao.lower()}
     if icao.upper() in WUNDERGROUND_EXEMPT_ICAOS:
-        return True  # station confirmed; this market resolves off Weather Underground
+        return True  # station confirmed; resolves off weather.gov, no URL given
     return WUNDERGROUND_TERM in text
 
 

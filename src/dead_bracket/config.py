@@ -580,6 +580,10 @@ class Config:
     # The resolver publishes ~an hour behind, so the running-max comparison
     # only counts observations at least this old on both sides.
     resolver_settle_lag_min: float = 90.0
+    # Minimum observations each side must hold on a closed day before its
+    # running maxima are compared (resolver_guard._audit_closed_day). A
+    # half-collected day proves nothing either way.
+    resolver_min_day_obs: int = 12
     resolver_tolerance_c: int = 0  # exact agreement; 1 would have allowed Seoul
     resolver_poll_sec: float = 600.0  # table poll cadence (5-min CDN cache)
     # Strict mode: additionally require the resolver's OWN table to have reached
@@ -712,6 +716,7 @@ class Config:
             "resolver_max_gap_hours": float,
             "resolver_max_lag_hours": float,
             "resolver_settle_lag_min": float,
+            "resolver_min_day_obs": int,
             "resolver_tolerance_c": int,
             "resolver_poll_sec": float,
             "resolver_confirm_dead": _as_bool,

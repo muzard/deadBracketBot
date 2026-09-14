@@ -20,10 +20,31 @@ observation across the trailing 24 hours**. Anything else fails closed:
                 agreement — no entries, but collection continues and the state
                 clears itself as soon as coverage is met. This is also the
                 state of a city with no resolver location configured at all.
-``divergent``   at least one paired observation (or the day's running max)
-                disagreed. **Sticky**: it survives ticks, daily rollovers and
-                restarts, and only a human clears it
+``divergent``   at least one paired observation disagreed, or our running max
+                EXCEEDED the resolver's on a closed, fully-published day.
+                **Sticky**: it survives ticks, daily rollovers and restarts,
+                and only a human clears it
                 (``python -m dead_bracket.tools.resolver_clear <city>``).
+
+**Why the max check audits a closed day rather than the live one.** The first
+version compared the two running maxima for the day *in progress*, discounting
+the newest observations by an assumed 90-minute publish lag. That compares a
+complete source against an incomplete one, and between 2026-08-20 and 08-25 it
+sticky-blocked 25 of 34 cities on false evidence: 17 because the resolver had
+simply not published our peak yet (measured publish lag p50 51 min, p75 73 min,
+with rows arriving up to 564 min late), and 8 because *our own* feed had holes
+the resolver did not. Not one of them was a real divergence — paired-observation
+agreement over the same period was 100.0% for 31 of 34 cities, and across 417
+complete city-days our max never once exceeded the resolver's daily high.
+
+The audit now waits for a local day to close and for the resolver's table to
+demonstrably reach past its end, then compares complete against complete. Only
+one direction is unsafe, and it is worth stating as an invariant: a bracket is
+marked dead iff ``temp < ours_max``, so whenever ``ours_max <= theirs_max`` that
+bracket is below the resolver's high too and is genuinely dead. Our max being
+*low* can only cost opportunities; our max being *high* is exactly the Seoul
+wipe. So ``ours > theirs`` is sticky divergence and ``ours < theirs`` is a
+logged note about a gap in our collection, nothing more.
 
 Divergence is not a glitch to ride out — it means our source and the resolver
 are different instruments, so every "certain" dead bracket is a coin flip. The
@@ -201,6 +222,7 @@ class ResolverCrossCheck:
         max_gap_hours: float = 3.0,
         max_lag_hours: float = 3.0,
         settle_lag_min: float = 90.0,
+        min_day_obs: int = 12,
         tolerance_c: int = 0,
         configured: bool = True,
         self_sourced: bool = False,
@@ -219,7 +241,12 @@ class ResolverCrossCheck:
         self._min_reach = float(min_reach_hours) * 3600.0
         self._max_gap = float(max_gap_hours) * 3600.0
         self._max_lag = float(max_lag_hours) * 3600.0
+        # Grace after local midnight before the closed-day audit runs, giving
+        # the resolver time to publish the day's tail (see _audit_closed_day).
         self._settle_lag = float(settle_lag_min) * 60.0
+        # Minimum observations each side must have on a day before its maxima
+        # are worth comparing — a half-collected day proves nothing.
+        self._min_day_obs = max(1, int(min_day_obs))
         self._tol = int(tolerance_c)
         # A city with no resolver location configured (e.g. Istanbul's LTFM,
         # which the resolver API serves no rows for) can never be verified, so
@@ -433,30 +460,47 @@ class ResolverCrossCheck:
                     station=self._station,
                 )
 
-            # 4. Running-max agreement for the current local day, over the
-            #    settled portion only (the resolver's table publishes ~an hour
-            #    behind, so the newest obs are legitimately absent from it).
-            #    This is the check that speaks directly to the trade: the
-            #    running max is what marks brackets dead.
-            settled = now_ts - self._settle_lag
-            ours_max = self._day_max(self._ours, now, settled)
-            theirs_max = self._day_max(self._theirs, now, settled)
-            if ours_max is not None and theirs_max is not None and ours_max != theirs_max:
-                self._sticky = Verdict(
-                    state=DIVERGENT,
-                    reason=f"running max disagrees for the local day: "
-                           f"ours={ours_max}C resolver={theirs_max}C",
-                    pairs=len(pairs),
-                    span_hours=span / 3600.0,
-                    station=self._station,
-                    ours_max=ours_max,
-                    theirs_max=theirs_max,
-                )
-                return self._sticky
+            # 4. Closed-day running-max audit. NOT the live day: comparing a
+            #    complete source against an incomplete one is what blocked 25 of
+            #    34 cities on false evidence in August (the resolver publishes
+            #    up to 9h late, and our own feed has holes). This audits the
+            #    last local day that is BOTH closed and fully published, where
+            #    both sides are complete and the comparison means something.
+            #
+            #    Only ONE direction is unsafe, and it is worth stating as an
+            #    invariant: a bracket is marked dead iff temp < ours_max, so if
+            #    ours_max <= theirs_max then temp < theirs_max too and the
+            #    bracket is genuinely dead by the resolver's own table. Our max
+            #    being LOW can never manufacture a false dead — it only costs
+            #    opportunities. Our max being HIGH is exactly the Seoul wipe.
+            audited = self._audit_closed_day(now)
+            if audited is not None:
+                day, ours_max, theirs_max = audited
+                if ours_max > theirs_max + self._tol:
+                    self._sticky = Verdict(
+                        state=DIVERGENT,
+                        reason=f"running max exceeded the resolver's on the "
+                               f"closed day {day}: ours={ours_max}C "
+                               f"resolver={theirs_max}C",
+                        pairs=len(pairs),
+                        span_hours=span / 3600.0,
+                        station=self._station,
+                        ours_max=ours_max,
+                        theirs_max=theirs_max,
+                    )
+                    return self._sticky
+            else:
+                ours_max = theirs_max = None
 
+            reason = f"{len(pairs)} obs matched over {span / 3600:.1f}h"
+            if audited is not None and ours_max < theirs_max:
+                # Safe direction, but it means our collection missed the day's
+                # peak — worth surfacing, never worth blocking.
+                reason += (f"; NOTE closed day {audited[0]} we saw {ours_max}C "
+                           f"vs resolver {theirs_max}C (gap in our feed)")
             return Verdict(
                 state=OK,
-                reason=f"{len(pairs)} obs matched over {span / 3600:.1f}h",
+                reason=reason,
                 pairs=len(pairs),
                 span_hours=span / 3600.0,
                 station=self._station,
@@ -540,6 +584,46 @@ class ResolverCrossCheck:
                 if self._local_date(datetime.fromtimestamp(e, timezone.utc)) == today
             ]
             return bool(vals) and max(vals) >= running_max
+
+    def _audit_closed_day(
+        self, now: datetime
+    ) -> Optional[tuple[date, int, int]]:
+        """Both sides' maxima for the last local day that is closed AND published.
+
+        Returns ``(day, ours_max, theirs_max)``, or ``None`` when no day can be
+        audited yet — the day is too fresh, the resolver's table has not reached
+        its end, or either side is too thin to compare. Caller holds the lock.
+
+        The publication test is *reach*, not an assumed lag: the resolver must
+        carry a row at or past the day's final instant. Assuming a fixed lag is
+        what produced 17 of August's 25 false blocks (measured p75 73 min, tail
+        to 564 min).
+        """
+
+        if not self._ours or not self._theirs:
+            return None
+        day = self._local_date(now) - timedelta(days=1)
+        end_ts = self._local_day_end(day)
+        # The day must be closed long enough for the resolver to have caught up,
+        # and its table must demonstrably reach past the day's end.
+        if now.timestamp() < end_ts + self._settle_lag:
+            return None
+        if max(self._theirs) < end_ts:
+            return None
+        ours = [t for e, t in self._ours.items() if self._in_day(e, day)]
+        theirs = [t for e, t in self._theirs.items() if self._in_day(e, day)]
+        if len(ours) < self._min_day_obs or len(theirs) < self._min_day_obs:
+            return None
+        return day, max(ours), max(theirs)
+
+    def _in_day(self, epoch: int, day: date) -> bool:
+        return self._local_date(datetime.fromtimestamp(epoch, timezone.utc)) == day
+
+    def _local_day_end(self, day: date) -> float:
+        """Epoch seconds of the first instant AFTER ``day`` in the city's tz."""
+
+        midnight = datetime(day.year, day.month, day.day, tzinfo=self._tz or timezone.utc)
+        return (midnight + timedelta(days=1)).timestamp()
 
     def _day_max(self, store: dict[int, int], now: datetime,
                  settled_ts: float) -> Optional[int]:

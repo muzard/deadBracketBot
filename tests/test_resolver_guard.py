@@ -114,20 +114,61 @@ def test_divergence_is_sticky_even_after_the_data_agrees_again():
     assert g.evaluate(NOW).state == OK
 
 
-def test_running_max_divergence_blocks_even_when_every_pair_matches():
+def test_running_max_above_the_resolver_on_a_closed_day_blocks():
     # A SPECI spike our source counts but the resolver's table never records:
     # no paired observation disagrees, yet our running max is a degree high —
-    # exactly enough to mark a live bracket dead.
+    # exactly enough to mark a live bracket dead. Caught once the day it landed
+    # in has closed and the resolver's table has published past its end.
     g = guard(tz=ZoneInfo("Asia/Seoul"))
-    ours, theirs = agreeing_history()
-    speci = datetime(2026, 7, 19, 2, 17, tzinfo=timezone.utc)  # off-grid
+    ours, theirs = agreeing_history(n=96)  # two local days
+    speci = datetime(2026, 7, 18, 2, 17, tzinfo=timezone.utc)  # yesterday, off-grid
     g.seed_ours(ours + [(speci, 27)])
     g.note_theirs(theirs)
 
     v = g.evaluate(NOW)
     assert v.state == DIVERGENT
     assert v.ours_max == 27 and v.theirs_max == 20
-    assert "running max" in v.reason
+    assert "closed day" in v.reason and "27C" in v.reason
+
+
+def test_live_day_max_difference_does_not_block():
+    # The August false-positive class: the resolver simply has not published
+    # today's peak yet (it runs up to 9h late), or our own feed has a hole.
+    # Comparing an incomplete table against a complete one must not stick.
+    g = guard(tz=ZoneInfo("Asia/Seoul"))
+    ours, theirs = agreeing_history(n=96)  # two local days
+    today = datetime(2026, 7, 19, 2, 17, tzinfo=timezone.utc)  # NOW's local day
+    g.seed_ours(ours + [(today, 27)])
+    g.note_theirs(theirs)
+
+    assert g.evaluate(NOW).state == OK
+
+
+def test_our_max_below_the_resolver_is_reported_but_never_blocks():
+    # The safe direction: a bracket is dead iff temp < ours_max, so a LOW max
+    # can only cost opportunities, never manufacture a false dead.
+    g = guard(tz=ZoneInfo("Asia/Seoul"))
+    ours, theirs = agreeing_history(n=96)  # two local days
+    missed = int(datetime(2026, 7, 18, 2, 17, tzinfo=timezone.utc).timestamp())
+    g.seed_ours(ours)
+    g.note_theirs(theirs + [(missed, 27)])  # their table has a peak we never saw
+
+    v = g.evaluate(NOW)
+    assert v.state == OK
+    assert "gap in our feed" in v.reason and "27C" in v.reason
+
+
+def test_closed_day_audit_waits_for_the_resolver_to_publish_past_the_day_end():
+    # Reach, not an assumed lag: if their newest row stops short of the day's
+    # final instant the audit holds off rather than reading absence as conflict.
+    g = guard(tz=ZoneInfo("Asia/Seoul"))
+    ours, theirs = agreeing_history(n=96)  # two local days
+    speci = datetime(2026, 7, 18, 2, 17, tzinfo=timezone.utc)
+    g.seed_ours(ours + [(speci, 27)])
+    day_end = datetime(2026, 7, 19, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+    g.note_theirs([(e, t) for e, t in theirs if e < day_end])
+
+    assert g.evaluate(NOW).state == UNVERIFIED  # stale, not divergent
 
 
 def test_tolerance_allows_configured_slack():
