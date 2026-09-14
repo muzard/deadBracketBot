@@ -158,23 +158,52 @@ python -m dead_bracket.tools.resolver_status --seed-history
   -> 34/35 cities may trade; 1 blocked for divergence: lucknow
 ```
 
-## 7. Still to do
+## 7. Every tracker now reads its own resolver (done)
 
-1. **Move seoul and shenzhen back to `resolution_source="metar"`.** Their METAR
-   is the resolver again (96/96 and 48/48), and reading TWC's closed rows costs
-   them the whole speed edge. Wants a soak on the new cross-check first.
-2. **Re-check `SharedMetarFetcher` for batch truncation** (the method note in
-   §2). A truncated batch is indistinguishable from a feed hole, and feed holes
-   caused 8 of August's false divergence blocks.
-3. **Re-measure the edge** (`STRATEGY.md` §1 and §4) under the new resolution
+Each city's source was re-measured against the table its market actually names,
+and the set of resolver-sourced cities **inverted**:
+
+| city | vs NOAA | decision |
+|---|---|---|
+| seoul (RKSI) | 64/64 **100.0%** | METAR is the resolver -> back to `metar` |
+| shenzhen (ZGSZ) | 32/32 **100.0%** | METAR is the resolver -> back to `metar` |
+| lucknow (VILK) | 629/633 **99.4%** | genuinely divergent -> reads the resolver's rows |
+
+Seoul and Shenzhen had still been reading TWC/WU closed rows — for Shenzhen a
+table that disagrees with the real resolver on 25 of 31 paired observations, on
+every one of which **NOAA agrees with us**. Lucknow goes the other way: NOAA
+sides with WU against us on all four of its mismatches, and twice ours was the
+*higher* value, the direction that manufactures a false dead.
+
+Reading the resolver's rows used to cost the whole speed edge; NOAA does not lag,
+so it is now close to free. `TwcResolverFetcher` gained `settle_sec`: TWC
+publishes a revising hourly aggregate whose current-hour row must close first
+(the 2026-07-08 near-miss was an intra-hour value that later vanished), while
+NOAA rows are observations that nothing revises and are servable on arrival.
+
+**Result: 35/35 cities verified, 0 blocked.**
+
+One operational characteristic to know: a resolver-sourced city replays its 26 h
+of backfill one row per poll after a restart, so `lucknow` runs a stale (low)
+running max for a while before it is current. That is the safe direction — a low
+max cannot mark a live bracket dead — but it cannot trade until it catches up.
+
+## 8. Still to do
+
+1. **Re-measure the edge** (`STRATEGY.md` §1 and §4) under the new resolution
    source. Every number there was collected while the market resolved on WU; the
    Shenzhen "opportunities" in particular were false-deads created by the WU/LFS
    mismatch, which no longer exists.
-4. **Watch `fractional`** on the Synoptic rows. The feed returns whole °C for
+2. **`STRATEGY.md` §5's recycle default** is still open: the data says holding to
+   $1 by default is backwards, since every dollar ever realised came from a
+   99.9c maker fill and an unfilled one is a free false-dead alarm.
+3. **Watch `fractional`** on the Synoptic rows. The feed returns whole °C for
    every station today and the parser counts any exception; a non-zero count
    means the resolving precision changed and the rounding needs revisiting.
+4. **Speed up the resolver-sourced backfill replay** if `lucknow`'s post-restart
+   catch-up ever gets in the way.
 
-## 8. SPECI carriage is per-station — correcting §3
+## 9. SPECI carriage is per-station — correcting §3
 
 An earlier version of §3 said the NOAA series "carries SPECIs", inferring a
 global property from two stations (RKPK and RCSS). Measured properly across
