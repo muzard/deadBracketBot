@@ -37,8 +37,13 @@ window, daily max, SPECIs included. Consequences, in full in
   `site=rksi` / `site=zgsz` matched our METAR 96/96 and 48/48. Their
   `resolution_source="resolver"` setting now reads the WRONG table at a
   26-564 min publish lag — revert it once the new cross-check has soaked.
-- **The TWC/WU cross-check now gates trading on the FALLBACK table.** Re-point
-  it at Synoptic; until then its verdicts are about the wrong source.
+- **The cross-check now reads NOAA too** (`CityConfig.resolver_provider`:
+  `synoptic` for 34 cities, `twc` for Taipei only). Rows land in
+  `resolver_rows.jsonl`; no API key needed; one poll backfills 48 h, and startup
+  also seeds the guard's own side from the station's trailing METAR
+  (cross-check only — never the running max). Istanbul is verifiable for the
+  first time (WU served LTFM zero rows). Measured: Paris `ok` ~90 s after
+  startup, **34/35 cities verified**, only `lucknow` still blocked.
 - **Taipei (RCSS) stays on WU**: Synoptic carries only its SPECIs (6 obs/48 h vs
   our 90), so it cannot migrate.
 - `WUNDERGROUND_EXEMPT_ICAOS` is no longer a special case — every city but
@@ -116,7 +121,7 @@ python -m dead_bracket.main --live --bankroll 40 --forecast                 # li
 python -m dead_bracket.main --live --bankroll 40 --forecast --forecast-live # forecast live orders (human go/no-go!)
 TWC_API_KEY=<key> python -m dead_bracket.main --hko --no-trade shenzhen --calibrate  # + Shenzhen calibration collectors
 python -m dead_bracket.main --twc --no-trade shenzhen --calibrate  # Shenzhen L1 shadow: running max from the resolver's CLOSED rows + L2 lock-ahead shadow (key via .env)
-python -m dead_bracket.tools.resolver_status    # per-city: may it trade, and why not?
+python -m dead_bracket.tools.resolver_status --seed-history  # per-city: may it trade, and why not?
 python -m dead_bracket.tools.resolver_status --at 2026-08-22T12:02Z  # replay a past verdict (why did that block fire?)
 python -m dead_bracket.tools.resolver_clear <city>  # lift a sticky divergence block (human decision)
 python -m dead_bracket.tools.lfs_calibrate      # offline K1/K2/K3/ε report + L1 stability + L2 hold rate

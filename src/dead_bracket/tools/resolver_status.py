@@ -79,8 +79,24 @@ def _load_wu_rows(path: str, as_of: datetime | None = None
     return rows, station
 
 
+def _configured(city_cfg) -> bool:
+    """Can this city be cross-checked at all? Synoptic needs only the station."""
+
+    if city_cfg.resolver_provider == "synoptic":
+        return bool(city_cfg.metar_icao)
+    return bool(city_cfg.resolver_location)
+
+
+def resolver_rows_file(city_cfg) -> str:
+    """Row log for this city's resolver provider (they must not be mixed)."""
+
+    return ("resolver_rows.jsonl" if city_cfg.resolver_provider == "synoptic"
+            else "wu_rows.jsonl")
+
+
 def build_guard(config: Config, city_cfg, *, now: datetime,
-                as_of: datetime | None = None) -> ResolverCrossCheck:
+                as_of: datetime | None = None,
+                seed_history: bool = False) -> ResolverCrossCheck:
     """Rebuild one city's guard from the on-disk logs."""
 
     try:
@@ -98,9 +114,9 @@ def build_guard(config: Config, city_cfg, *, now: datetime,
         settle_lag_min=config.resolver_settle_lag_min,
         min_day_obs=config.resolver_min_day_obs,
         tolerance_c=config.resolver_tolerance_c,
-        configured=bool(city_cfg.resolver_location),
+        configured=_configured(city_cfg),
         self_sourced=(city_cfg.resolution_source == "resolver"
-                      and bool(city_cfg.resolver_location)),
+                      and _configured(city_cfg)),
         clock=lambda: now,
     )
     city_dir = os.path.join(config.data_dir, city_cfg.id)
@@ -111,7 +127,21 @@ def build_guard(config: Config, city_cfg, *, now: datetime,
                 path, hours=config.resolver_window_hours * 2, now=now,
                 include_speci=city_cfg.include_speci))
             break
-    rows, station = _load_wu_rows(os.path.join(city_dir, "wu_rows.jsonl"),
+    if seed_history and city_cfg.resolution_source == "metar":
+        # Match what the running process does at startup, so this report and the
+        # bot cannot disagree about whether a city is verified. Off by default:
+        # the tool is otherwise offline, and a replay (--at) must not be given
+        # observations from after the instant being replayed.
+        from ..feeds_http import fetch_metar_history
+
+        try:
+            guard.seed_ours(fetch_metar_history(
+                city_cfg.metar_icao,
+                hours=int(config.resolver_window_hours * 2),
+                include_speci=city_cfg.include_speci))
+        except Exception:
+            pass
+    rows, station = _load_wu_rows(os.path.join(city_dir, resolver_rows_file(city_cfg)),
                                   as_of=as_of)
     if rows:
         guard.note_theirs(rows, station=station)
@@ -124,6 +154,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="list every mismatched observation")
+    ap.add_argument("--seed-history", action="store_true",
+                    help="also pull the station's trailing METAR from the "
+                         "network, as the running bot does at startup, so this "
+                         "report matches the live guard instead of only what "
+                         "has been written to disk. Ignored with --at.")
     ap.add_argument("--at", metavar="ISO8601",
                     help="replay the guard as of a past instant "
                          "(e.g. 2026-08-22T12:02Z) instead of now — the only "
@@ -156,7 +191,8 @@ def main(argv: list[str] | None = None) -> int:
     tradeable = 0
     for city_cfg in cities:
         guard = build_guard(config, city_cfg, now=now,
-                            as_of=now if args.at else None)
+                            as_of=now if args.at else None,
+                            seed_history=args.seed_history and not args.at)
         stored = blocks.blocked(city_cfg.id)
         if stored:
             guard.adopt_block(stored.get("detail") or stored.get("reason", ""))

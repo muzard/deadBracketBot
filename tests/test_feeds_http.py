@@ -871,3 +871,108 @@ def test_hot_window_bust_never_adds_an_unknown_query_param():
     # And the bust must actually vary the cache key.
     assert len({p["hours"] for p in seen}) > 1
     assert {p["hours"] for p in seen} <= set(AWC_HOURS_ROTATION)
+
+
+# ---------------------------------------------------------------------------
+# Synoptic / NOAA — the resolver's own table since the 2026-09-12 migration
+
+
+def _syn_payload(times, temps, name="Paris-Le Bourget Airport", stid="LFPB"):
+    return {"STATION": [{"NAME": name, "STID": stid,
+                         "OBSERVATIONS": {"date_time": list(times),
+                                          "air_temp_set_1": list(temps)}}]}
+
+
+def test_parse_synoptic_token_reads_the_weather_gov_key():
+    from dead_bracket.feeds_http import parse_synoptic_token
+    js = ("// This Synoptic API key is for weather.gov websites/queries\n"
+          "var mesoToken='7c76618b66c74aee913bdbae4b448bdd';\n")
+    assert parse_synoptic_token(js) == "7c76618b66c74aee913bdbae4b448bdd"
+    assert parse_synoptic_token("nothing here") is None
+    assert parse_synoptic_token("") is None
+
+
+def test_parse_synoptic_timeseries_emits_the_twc_row_shape():
+    # The collector, the guard and the on-disk format stay provider-agnostic:
+    # swapping the resolver swaps the fetcher and nothing else.
+    from dead_bracket.feeds_http import parse_synoptic_timeseries
+    out = parse_synoptic_timeseries(_syn_payload(
+        ["2026-09-14T16:30:00Z", "2026-09-14T17:00:00Z"], [29.0, 28.0]))
+    rows = out["observations"]
+    assert [r["temp"] for r in rows] == [29, 28]
+    assert rows[0]["valid_time_gmt"] == 1789403400
+    assert rows[0]["obs_name"] == "Paris-Le Bourget Airport"
+    assert rows[0]["obs_id"] == "LFPB"
+    assert rows[0]["max_temp"] is None
+    assert out["fractional"] == 0
+
+
+def test_parse_synoptic_timeseries_rounds_to_the_resolving_precision():
+    # The market resolves on whole degrees Celsius; a fractional reading is
+    # counted so a change in that regime is visible, not silently rounded away.
+    from dead_bracket.feeds_http import parse_synoptic_timeseries
+    out = parse_synoptic_timeseries(_syn_payload(
+        ["2026-09-14T16:30:00Z", "2026-09-14T17:00:00Z"], [28.6, 27.4]))
+    assert [r["temp"] for r in out["observations"]] == [29, 27]
+    assert out["fractional"] == 2
+
+
+def test_parse_synoptic_timeseries_skips_holes_and_bad_payloads():
+    from dead_bracket.feeds_http import parse_synoptic_timeseries
+    out = parse_synoptic_timeseries(_syn_payload(
+        ["2026-09-14T16:30:00Z", "2026-09-14T17:00:00Z", "2026-09-14T17:30:00Z"],
+        [29.0, None, "x"]))
+    assert len(out["observations"]) == 1
+    # Anything malformed yields None so the collector counts a failure rather
+    # than treating an empty table as agreement.
+    assert parse_synoptic_timeseries(None) is None
+    assert parse_synoptic_timeseries({}) is None
+    assert parse_synoptic_timeseries({"STATION": []}) is None
+    assert parse_synoptic_timeseries({"STATION": [{"OBSERVATIONS": {}}]}) is None
+    assert parse_synoptic_timeseries(_syn_payload([], [])) is None
+
+
+def test_synoptic_rows_feed_the_guard_through_the_existing_collector():
+    # End-to-end on the pure pieces: a Synoptic payload must verify a city via
+    # ResolverRowCollector + ResolverCrossCheck with no provider-specific code.
+    from datetime import datetime, timedelta, timezone
+    from dead_bracket.feeds_http import parse_synoptic_timeseries
+    from dead_bracket.resolver_guard import (
+        OK, ResolverCrossCheck, ResolverRowCollector)
+    import tempfile, os as _os
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
+    stamps = [now - timedelta(minutes=30 * i) for i in range(96)]
+    times = [t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in stamps]
+    temps = [20.0] * len(stamps)
+
+    guard = ResolverCrossCheck("paris", clock=lambda: now)
+    guard.seed_ours([(t, 20) for t in stamps])
+    with tempfile.TemporaryDirectory() as d:
+        collector = ResolverRowCollector(
+            city="paris", guard=guard,
+            fetch=lambda a, b: parse_synoptic_timeseries(
+                _syn_payload(times, temps)),
+            path=_os.path.join(d, "resolver_rows.jsonl"),
+            clock=lambda: now)
+        assert len(collector.poll_once()) == 96
+    assert guard.evaluate(now).state == OK
+
+
+def test_parse_metar_history_honours_the_speci_policy_and_rejects_decimals():
+    # Seeds the cross-check's own side; must mirror exactly what the running max
+    # would have seen, or the comparison compares the wrong things.
+    from dead_bracket.feeds_http import parse_metar_history
+    recs = [
+        {"obsTime": 1789403400, "temp": 29, "rawOb": "LFPB 141630Z AUTO 29/12"},
+        {"obsTime": 1789405200, "temp": 28, "rawOb": "SPECI LFPB 141700Z 28/12"},
+        {"obsTime": 1789407000, "temp": 27.4, "rawOb": "LFPB 141730Z AUTO"},
+        {"obsTime": 1789408800, "temp": None, "rawOb": "LFPB 141800Z AUTO"},
+        "not a dict",
+    ]
+    both = parse_metar_history(recs)
+    assert [t for _, t in both] == [29, 28]           # decimal + templess skipped
+    routine = parse_metar_history(recs, include_speci=False)
+    assert [t for _, t in routine] == [29]            # SPECI excluded
+    assert parse_metar_history(None) == []
+    assert parse_metar_history("nope") == []

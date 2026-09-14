@@ -91,6 +91,17 @@ class CityConfig:
     #               resolver_location + TWC_API_KEY; without them the city has
     #               no source at all and idles.
     resolution_source: str = "metar"
+    # WHICH table the resolver_guard cross-checks us against:
+    #   "synoptic"  NOAA's own series — the one the market description now
+    #               names, https://www.weather.gov/wrh/timeseries?site=<ICAO>,
+    #               served by Synoptic/MesoWest and keyed by metar_icao. Needs
+    #               no API key. Default since the 2026-09-12 migration (see
+    #               docs/resolution_source_migration_2026-09-14.md).
+    #   "twc"       the legacy Weather Underground table via resolver_location
+    #               + TWC_API_KEY. Now only the FALLBACK source for most
+    #               cities, and the live one only for Taipei, whose routine
+    #               cycle Synoptic does not carry (6 obs/48h vs our 90).
+    resolver_provider: str = "synoptic"
 
 
 # Paris -> LFPB, London -> EGLC (spec §10), plus additional European cities.
@@ -373,11 +384,18 @@ RESOLVER_LOCATIONS: dict[str, Optional[str]] = {
 # above): their running max is read from the resolver's own closed rows instead.
 RESOLVER_SOURCED_CITIES: frozenset[str] = frozenset({"seoul", "shenzhen"})
 
+# Cities still cross-checked against the legacy Weather Underground table.
+# Taipei is the only market that did NOT migrate to NOAA on 2026-09-12, and it
+# could not have: Synoptic carries only RCSS's SPECIs (6 observations in 48h
+# against our 90), so a NOAA-resolved Taipei market would be unresolvable.
+TWC_CHECKED_CITIES: frozenset[str] = frozenset({"taipei"})
+
 DEFAULT_CITIES: tuple[CityConfig, ...] = tuple(
     replace(
         c,
         resolver_location=RESOLVER_LOCATIONS.get(c.id),
         resolution_source=("resolver" if c.id in RESOLVER_SOURCED_CITIES else "metar"),
+        resolver_provider=("twc" if c.id in TWC_CHECKED_CITIES else "synoptic"),
     )
     for c in _BASE_CITIES
 )
@@ -584,6 +602,10 @@ class Config:
     # running maxima are compared (resolver_guard._audit_closed_day). A
     # half-collected day proves nothing either way.
     resolver_min_day_obs: int = 12
+    # How far back one Synoptic poll reaches, in minutes. 48h covers the 24h
+    # agreement window plus yesterday's full local day (the closed-day audit)
+    # in every timezone we trade, in a single request.
+    resolver_recent_minutes: int = 2880
     resolver_tolerance_c: int = 0  # exact agreement; 1 would have allowed Seoul
     resolver_poll_sec: float = 600.0  # table poll cadence (5-min CDN cache)
     # Strict mode: additionally require the resolver's OWN table to have reached
@@ -717,6 +739,7 @@ class Config:
             "resolver_max_lag_hours": float,
             "resolver_settle_lag_min": float,
             "resolver_min_day_obs": int,
+            "resolver_recent_minutes": int,
             "resolver_tolerance_c": int,
             "resolver_poll_sec": float,
             "resolver_confirm_dead": _as_bool,

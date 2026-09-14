@@ -25,9 +25,11 @@ from .feeds_http import (
     TwcResolverFetcher,
     build_feed_fetcher,
     make_hko_1min_fetch,
+    fetch_metar_history,
     make_metar_fetch,
     make_tgftp_fetch,
     make_twc_historical_fetch,
+    make_synoptic_range_fetch,
     make_twc_range_fetch,
     make_twc_timeseries_fetch,
 )
@@ -55,6 +57,19 @@ from .risk import Ledger, RiskManager
 from .strategy import Strategy
 from .supervisor import Supervisor
 from .worker import CityWorker
+
+
+_SYNOPTIC_TOKEN: list = []
+
+
+def _synoptic_token() -> str:  # pragma: no cover - trivial network helper
+    """weather.gov's published Synoptic token, fetched once per process."""
+
+    if not _SYNOPTIC_TOKEN:
+        from .feeds_http import fetch_synoptic_token
+
+        _SYNOPTIC_TOKEN.append(fetch_synoptic_token(session=_new_session()))
+    return _SYNOPTIC_TOKEN[0]
 
 
 def _new_session():  # pragma: no cover - trivial network helper
@@ -427,7 +442,13 @@ def build_resolver_guards(
             tz = ZoneInfo(city_cfg.tz)
         except Exception:
             pass
-        configured = bool(city_cfg.resolver_location and config.twc_api_key)
+        # Synoptic needs no API key — only the station the market names. That
+        # also makes Istanbul verifiable for the first time: WU served LTFM no
+        # rows at all, NOAA serves 96 in 48h.
+        if city_cfg.resolver_provider == "synoptic":
+            configured = bool(city_cfg.metar_icao)
+        else:
+            configured = bool(city_cfg.resolver_location and config.twc_api_key)
         guard = ResolverCrossCheck(
             city_cfg.id,
             tz=tz,
@@ -457,6 +478,25 @@ def build_resolver_guards(
                     include_speci=city_cfg.include_speci,
                 ))
                 break
+        # Our log can have holes the resolver's table does not (a restart after
+        # downtime, a new city, a fetcher outage). The Synoptic side backfills
+        # 48h in its first poll, so without this the city sits unverified for a
+        # day waiting on reach-back while the comparison itself is ready. Seeds
+        # the CROSS-CHECK only — never the running max.
+        if configured and city_cfg.resolution_source == "metar":
+            try:
+                history = fetch_metar_history(
+                    city_cfg.metar_icao,
+                    hours=int(config.resolver_window_hours * 2),
+                    session=_new_session(),
+                    include_speci=city_cfg.include_speci,
+                )
+            except Exception:
+                history = []
+            if history:
+                guard.seed_ours(history)
+                reporter.event(city_cfg.id, "resolver_seed_history",
+                               obs=len(history))
         # Re-arm a divergence recorded by an earlier run.
         prior = blocks.blocked(city_cfg.id)
         if prior:
@@ -478,15 +518,28 @@ def build_resolver_guards(
                     "and will NOT trade (data collection continues)",
                 )
             continue
-        collector = ResolverRowCollector(
-            city=city_cfg.id,
-            guard=guard,
-            fetch=make_twc_range_fetch(
+        if city_cfg.resolver_provider == "synoptic":
+            fetch = make_synoptic_range_fetch(
+                station=city_cfg.metar_icao,
+                token=_synoptic_token(),
+                session=_new_session(),
+                recent_minutes=config.resolver_recent_minutes,
+            )
+            rows_path = os.path.join(city_dir, "resolver_rows.jsonl")
+            source_label = f"noaa/synoptic {city_cfg.metar_icao}"
+        else:
+            fetch = make_twc_range_fetch(
                 api_key=config.twc_api_key,
                 location=city_cfg.resolver_location,
                 session=_new_session(),
-            ),
-            path=os.path.join(city_dir, "wu_rows.jsonl"),
+            )
+            rows_path = os.path.join(city_dir, "wu_rows.jsonl")
+            source_label = f"twc/wu {city_cfg.resolver_location}"
+        collector = ResolverRowCollector(
+            city=city_cfg.id,
+            guard=guard,
+            fetch=fetch,
+            path=rows_path,
             tz=tz,
         )
         pollers.append(
@@ -497,7 +550,7 @@ def build_resolver_guards(
                 poll_sec=config.resolver_poll_sec,
             )
         )
-        reporter.event(city_cfg.id, "resolver_start",
+        reporter.event(city_cfg.id, "resolver_start", source=source_label,
                        location=city_cfg.resolver_location)
     return guards, pollers, blocks
 

@@ -128,19 +128,51 @@ URL points at a different site — the exact failure class that emptied the wall
 
 Result: **35/35 cities discover their event; zero "no market data".**
 
-## 6. Still to do
+## 6. The cross-check now reads NOAA (done, same day)
 
-1. **Re-point the resolver cross-check at Synoptic** instead of TWC/WU. Today the
-   guard compares our METAR against the *fallback* table; it should compare
-   against the series the market actually names. With a Synoptic-backed guard the
-   comparison is ~100% by construction and the 26–564 min WU publish lag — the
-   cause of 17 of August's 25 false blocks — disappears entirely.
-2. **Move seoul and shenzhen back to `resolution_source="metar"`** once (1) has a
-   soak behind it. Their METAR is the resolver again.
-3. **Keep taipei on the WU path** and mark it explicitly, not by omission.
-4. Re-check `SharedMetarFetcher` for the batch-truncation issue in the method
-   note above.
-5. Re-measure the edge (`STRATEGY.md` §1) under the new resolution source. Every
-   number there was collected while the market resolved on WU; the Shenzhen
-   "opportunities" in particular were false-deads created by the WU/LFS mismatch
-   that no longer exists.
+`CityConfig.resolver_provider` selects the table the guard compares us against:
+**`synoptic`** for 34 cities, **`twc`** for Taipei. The Synoptic fetcher re-emits
+the TWC row shape (`parse_synoptic_timeseries`), so the collector, the guard and
+the on-disk format are provider-agnostic — swapping the resolver swaps the
+fetcher and nothing else. Rows land in `resolver_rows.jsonl` (Taipei keeps
+`wu_rows.jsonl`; the two providers' histories must not mix).
+
+Three things fell out of it:
+
+- **No API key.** Synoptic is keyed by `metar_icao` and the token comes from
+  weather.gov's own `apiKey.js` at startup. `TWC_API_KEY` is now needed only for
+  Taipei and the Shenzhen calibration collectors.
+- **Istanbul is verifiable for the first time.** WU served LTFM *zero* rows, so
+  the city could never trade by construction. NOAA serves 96 in 48 h.
+- **Verification is immediate, not next-day.** One Synoptic call backfills 48 h,
+  where the TWC path crawled forward under a 26–564 min publish lag. Our own side
+  was then the bottleneck — `metar.jsonl` has holes after any downtime — so
+  startup also seeds the guard from the station's trailing METAR
+  (`fetch_metar_history`). That feeds the **cross-check only**: never `MetarFeed`,
+  never the running max, never `metar.jsonl`.
+
+Measured on restart, 2026-09-14: Paris reached `resolver_ok` **~90 seconds** after
+startup with 48 pairs over 23.5 h, and **34 of 35 cities verified**. The only
+city still blocked is `lucknow`, whose 4 genuine paired mismatches in 633 obs are
+unaffected by any of this.
+
+```
+python -m dead_bracket.tools.resolver_status --seed-history
+  -> 34/35 cities may trade; 1 blocked for divergence: lucknow
+```
+
+## 7. Still to do
+
+1. **Move seoul and shenzhen back to `resolution_source="metar"`.** Their METAR
+   is the resolver again (96/96 and 48/48), and reading TWC's closed rows costs
+   them the whole speed edge. Wants a soak on the new cross-check first.
+2. **Re-check `SharedMetarFetcher` for batch truncation** (the method note in
+   §2). A truncated batch is indistinguishable from a feed hole, and feed holes
+   caused 8 of August's false divergence blocks.
+3. **Re-measure the edge** (`STRATEGY.md` §1 and §4) under the new resolution
+   source. Every number there was collected while the market resolved on WU; the
+   Shenzhen "opportunities" in particular were false-deads created by the WU/LFS
+   mismatch, which no longer exists.
+4. **Watch `fractional`** on the Synoptic rows. The feed returns whole °C for
+   every station today and the parser counts any exception; a non-zero count
+   means the resolving precision changed and the rounding needs revisiting.
