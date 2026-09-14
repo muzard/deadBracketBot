@@ -382,7 +382,26 @@ RESOLVER_LOCATIONS: dict[str, Optional[str]] = {
 
 # The cities whose METAR does NOT track the resolver (see the measurements
 # above): their running max is read from the resolver's own closed rows instead.
-RESOLVER_SOURCED_CITIES: frozenset[str] = frozenset({"seoul", "shenzhen"})
+# Cities whose own METAR provably does NOT track the resolver, and which
+# therefore read their running max from the resolver's own rows instead.
+#
+# 2026-09-14, after the NOAA migration, this set inverted. Re-measured against
+# the resolver the market now actually names:
+#   seoul     RKSI  64/64  100.0%  -> METAR is the resolver; moved back.
+#   shenzhen  ZGSZ  32/32  100.0%  -> METAR is the resolver; moved back. Both
+#             failures were Weather Underground artifacts (WU's RKSI row; WU
+#             resolving "Shenzhen" off HKO Lau Fau Shan). On every one of the
+#             25 Shenzhen WU mismatches, NOAA agrees with US.
+#   lucknow   VILK  629/633 99.4% -> genuinely divergent, and NOAA agrees with
+#             WU against us on all four; twice ours was the HIGHER value, which
+#             is the direction that manufactures a false dead. Stays
+#             resolver-sourced, now off NOAA's rows rather than WU's.
+#
+# Reading the resolver's rows used to cost the whole speed edge (WU published
+# 26-564 min late). NOAA does not lag: measured 2026-09-14 its newest
+# observation is the SAME observation our METAR has, for every city. So this is
+# now close to free.
+RESOLVER_SOURCED_CITIES: frozenset[str] = frozenset({"lucknow"})
 
 # Cities still cross-checked against the legacy Weather Underground table.
 # Taipei is the only market that did NOT migrate to NOAA on 2026-09-12, and it

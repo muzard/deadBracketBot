@@ -66,6 +66,35 @@ AVIATIONWEATHER_URL = "https://aviationweather.gov/api/data/metar"
 # one; `hours` works and its extra rows are deduped by the caller. Six values at
 # a >=60 s floor means each cache entry has expired before it comes round again.
 AWC_HOURS_ROTATION = (2, 3, 4, 5, 6, 7)
+# ...but the batched endpoint caps a response at this many records, silently
+# (measured 2026-09-14: 35 stations at hours=7 returned exactly 400, and at
+# hours=12 and 24 still exactly 400). Today it truncates the OLDEST rows and
+# every station keeps its newest observation, so the running max is unaffected
+# — but 35 stations x 2 obs/h x 7 h lands exactly on the cap, so one more city
+# would start dropping whole stations, which is indistinguishable from a feed
+# hole. ``awc_hours_rotation`` keeps the rotation under the cap instead.
+AWC_MAX_BATCH_RECORDS = 400
+# Observations per station per hour to budget for. Routine cycles are half-hourly
+# at most; SPECI-heavy stations can exceed this, hence the safety margin below.
+AWC_OBS_PER_STATION_HOUR = 2
+
+
+def awc_hours_rotation(n_stations: int, *, margin: float = 0.75) -> tuple[int, ...]:
+    """Cache-bust rotation whose largest ``hours`` stays under the record cap.
+
+    Busting works by varying a LEGAL query parameter (the API 400s on unknown
+    ones), and ``hours`` is the only one available — but a bigger ``hours`` is
+    also more records, and the response is capped. Scale the ceiling with the
+    station count so adding cities can never silently starve some of them.
+    Always returns at least ``(2, 3)`` so busting still has distinct cache keys.
+    """
+
+    if n_stations <= 0:
+        return AWC_HOURS_ROTATION
+    budget = AWC_MAX_BATCH_RECORDS * margin
+    ceiling = int(budget // (n_stations * AWC_OBS_PER_STATION_HOUR))
+    ceiling = max(3, min(ceiling, AWC_HOURS_ROTATION[-1]))
+    return tuple(h for h in AWC_HOURS_ROTATION if h <= ceiling) or (2, 3)
 TAF_URL = "https://aviationweather.gov/api/data/taf"
 TGFTP_URL = "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{icao}.TXT"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
@@ -650,6 +679,7 @@ class TwcResolverFetcher:
         ttl: float = 30.0,
         stale_sec: float = 5400.0,
         backfill_hours: float = 26.0,
+        settle_sec: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
@@ -659,6 +689,13 @@ class TwcResolverFetcher:
         self._ttl = ttl
         self._stale_sec = stale_sec
         self._backfill_sec = backfill_hours * 3600.0
+        # How long a row must have existed before it may feed a running max.
+        # TWC publishes a REVISING hourly aggregate, so its current-hour row has
+        # to close first (3600) — the 2026-07-08 near-miss was an intra-hour
+        # value that later vanished. NOAA/Synoptic rows are observations, not an
+        # aggregate: nothing revises, so 0 is correct there and waiting an hour
+        # would throw away exactly the window worth trading.
+        self._settle_sec = float(settle_sec)
         self._clock = clock
         self._utc = utc_clock
         self._lock = threading.Lock()
@@ -737,7 +774,8 @@ class TwcResolverFetcher:
                 or (now_utc - self._last_activity).total_seconds() > self._stale_sec
             ):
                 return None  # poller dead / key dead -> let the feed stale-halt
-            closed = [vt for vt in self._rows if vt + 3600 <= now_utc.timestamp()]
+            closed = [vt for vt in self._rows
+                      if vt + self._settle_sec <= now_utc.timestamp()]
             if not closed:
                 return None
             pending = sorted(
@@ -1285,7 +1323,13 @@ class SharedMetarFetcher:
         self._last_success: Optional[float] = None
         self._last_attempt: Optional[float] = None
         self._station_last: dict[str, float] = {}
-        self._bust_i = 0  # rotates AWC_HOURS_ROTATION for hot-window cache-busting
+        self._bust_i = 0  # rotates the bust window for hot-window cache-busting
+        # Count of batches that came back at the endpoint's record cap — a
+        # health signal, surfaced by the supervisor's periodic report.
+        self.batches_capped = 0
+        # Sized to THIS fetcher's station count so the batch can never hit the
+        # endpoint's silent record cap (see awc_hours_rotation).
+        self._hours_rotation = awc_hours_rotation(len(self._icaos))
         self._lock = threading.Lock()
 
     def raw_for(self, icao: str, max_age: Optional[float] = None) -> Optional[str]:
@@ -1409,8 +1453,8 @@ class SharedMetarFetcher:
             # Rotating `hours` gives each poll its own cache key; the extra
             # history rows are deduped by _store for free.
             self._bust_i += 1
-            params["hours"] = AWC_HOURS_ROTATION[
-                self._bust_i % len(AWC_HOURS_ROTATION)
+            params["hours"] = self._hours_rotation[
+                self._bust_i % len(self._hours_rotation)
             ]
         for _ in range(self._retries + 1):
             try:
@@ -1422,11 +1466,19 @@ class SharedMetarFetcher:
                 )
                 resp.raise_for_status()
                 got = False
+                payload = resp.json()
+                # The endpoint truncates at a fixed record count without saying
+                # so. Today it sheds the OLDEST rows and every station keeps its
+                # newest observation, but at the cap that is luck, not contract:
+                # make it visible rather than let it read as a feed hole.
+                if (isinstance(payload, list)
+                        and len(payload) >= AWC_MAX_BATCH_RECORDS):
+                    self.batches_capped += 1
                 # Surface SPECIs from the JSON too (they carry the SPECI keyword,
                 # so the FEED can tell them apart and log-but-not-fold them on
                 # routine-only cities). We do NOT drop them here — only the
                 # unmarked tgftp fast path stays disabled for those stations.
-                for ic, rec in latest_json_by_icao(resp.json()).items():
+                for ic, rec in latest_json_by_icao(payload).items():
                     raw, obs, receipt = rec
                     # Never let a (cache-stale) batch overwrite a newer reading.
                     self._store(ic, raw, obs, receipt, now)

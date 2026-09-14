@@ -598,16 +598,18 @@ def build_supervisor(
         hko_place = (
             city_cfg.resolution_hko_place if (use_hko and not twc_resolver) else None
         )
-        # Cities whose METAR provably does not track the resolver (seoul,
-        # shenzhen — see config.RESOLVER_LOCATIONS for the measurements) read
-        # their running max from the resolver's OWN closed rows, collected by
-        # the resolver poller into wu_rows.jsonl. --twc keeps precedence so the
-        # Shenzhen calibration workflow is unchanged.
+        # Cities whose METAR provably does not track the resolver (lucknow —
+        # see config.RESOLVER_SOURCED_CITIES for the measurements) read their
+        # running max from the resolver's OWN rows, collected by the resolver
+        # poller. --twc keeps precedence so the Shenzhen calibration workflow is
+        # unchanged.
+        synoptic_src = city_cfg.resolver_provider == "synoptic"
         use_resolver_src = (
             not twc_resolver
             and city_cfg.resolution_source == "resolver"
             and config.resolver_check
-            and bool(city_cfg.resolver_location and config.twc_api_key)
+            and bool(city_cfg.metar_icao if synoptic_src
+                     else (city_cfg.resolver_location and config.twc_api_key))
         )
         if city_cfg.resolution_source == "resolver" and not (
             twc_resolver or use_resolver_src
@@ -618,15 +620,23 @@ def build_supervisor(
             reporter.notice(
                 city_cfg.id,
                 "resolution source is the resolver table but it is unavailable "
-                "(needs TWC_API_KEY + resolver_check) — city will NOT trade; "
+                "(needs resolver_check, and TWC_API_KEY on the twc provider) — "
+                "city will NOT trade; "
                 "its METAR is known not to track the resolver",
             )
         if use_resolver_src:
+            # NOAA rows are observations, not a revising hourly aggregate, so
+            # they are servable as soon as they arrive; TWC's current-hour row
+            # must close first. Same fetcher, different settling rule.
             fetcher = TwcResolverFetcher(
-                path=os.path.join(config.data_dir, city_cfg.id, "wu_rows.jsonl"),
+                path=os.path.join(
+                    config.data_dir, city_cfg.id,
+                    "resolver_rows.jsonl" if synoptic_src else "wu_rows.jsonl"),
                 icao=city_cfg.metar_icao,
-                location=city_cfg.resolver_location,
+                location=(city_cfg.metar_icao if synoptic_src
+                          else city_cfg.resolver_location),
                 stale_sec=config.twc_resolver_stale_sec,
+                settle_sec=(0.0 if synoptic_src else 3600.0),
             )
             metar = MetarFeed(
                 city_cfg.metar_icao,
@@ -641,8 +651,9 @@ def build_supervisor(
                            location=city_cfg.resolver_location)
             reporter.notice(
                 city_cfg.id,
-                f"resolution source: the RESOLVER's own closed rows "
-                f"({city_cfg.resolver_location} -> metar_resolver.jsonl); "
+                f"resolution source: the RESOLVER's own rows "
+                f"({'noaa/synoptic ' + city_cfg.metar_icao if synoptic_src else city_cfg.resolver_location}"
+                f" -> metar_resolver.jsonl); "
                 f"{city_cfg.metar_icao} METAR is OUT of the trading path "
                 "(it does not track the resolver)",
             )

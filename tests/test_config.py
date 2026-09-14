@@ -144,13 +144,40 @@ def test_resolver_locations_cover_every_city_except_istanbul():
 
 
 def test_only_the_measured_cities_read_from_the_resolver_table():
-    # The METAR agreed with the resolver 100% on 31 of 34 cities, so only the
-    # two that provably diverge give up the speed edge.
+    # Re-measured 2026-09-14 against the resolver the market now names (NOAA):
+    # seoul 64/64 and shenzhen 32/32 agree, so their METAR IS the resolver and
+    # they no longer give up the speed edge. lucknow still diverges (629/633,
+    # and NOAA sides with WU against us on all four), so it reads the table.
     from dead_bracket.config import Config
 
     sourced = {c.id for c in Config().cities if c.resolution_source == "resolver"}
-    assert sourced == {"seoul", "shenzhen"}
+    assert sourced == {"lucknow"}
     for c in Config().cities:
         assert c.resolution_source in ("metar", "resolver")
         if c.resolution_source == "resolver":
-            assert c.resolver_location, f"{c.id} needs a table to read"
+            # Either provider gives it a table: synoptic is keyed by the ICAO,
+            # twc by the WU location id.
+            assert (c.metar_icao if c.resolver_provider == "synoptic"
+                    else c.resolver_location), f"{c.id} needs a table to read"
+
+
+def test_every_city_has_a_usable_resolver_provider():
+    # "Every tracker works" means no city is structurally unable to verify.
+    from dead_bracket.config import Config
+
+    for c in Config().cities:
+        assert c.resolver_provider in ("synoptic", "twc")
+        if c.resolver_provider == "synoptic":
+            assert c.metar_icao, f"{c.id} has no station to key NOAA by"
+        else:
+            assert c.resolver_location, f"{c.id} has no WU table"
+
+
+def test_taipei_is_the_only_city_left_on_weather_underground():
+    # Synoptic carries only RCSS's SPECIs (6 obs/48h vs our 90), so Taipei could
+    # not migrate with the others. If that ever changes, this test should fail
+    # and the city should move.
+    from dead_bracket.config import Config
+
+    twc = {c.id for c in Config().cities if c.resolver_provider == "twc"}
+    assert twc == {"taipei"}

@@ -46,12 +46,14 @@ window, daily max, SPECIs included. Consequences, in full in
   startup, **34/35 cities verified**, only `lucknow` still blocked.
 - **Taipei (RCSS) stays on WU**: Synoptic carries only its SPECIs (6 obs/48 h vs
   our 90), so it cannot migrate.
-- `WUNDERGROUND_EXEMPT_ICAOS` is no longer a special case — every city but
-  Taipei now resolves the way UUWW/LTFM/LLBG already did. The premise behind
-  their `include_speci=False` ("weather.gov is routine-only") is **false** — the
-  NOAA series carries SPECIs — but keeping the flag off is conservative (it can
-  only lower our running max), so it is safe as-is, just no longer true as
-  documented.
+- `WUNDERGROUND_EXEMPT_ICAOS` is no longer a special case for *source* purposes
+  — every city but Taipei now resolves the way UUWW/LTFM/LLBG already did.
+  Their `include_speci=False` **is still correct**: measured 2026-09-14, NOAA
+  records **0 of Moscow's 14 SPECIs**, so counting them would push our running
+  max above the resolver's. Conversely the 32 SPECI-counting cities have **zero
+  orphan SPECIs** — every one is in the resolver's table. `include_speci` is a
+  per-station measurement against the resolver, never an inference from the
+  source; re-measure it when adding a city.
 - `source_confirmed` now accepts either source and is STRICTER for NOAA markets:
   the `site=` in the resolution URL must be our station and only ours.
 

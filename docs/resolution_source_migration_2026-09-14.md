@@ -92,13 +92,10 @@ tel_aviv  LLBG  96/96  100.0%  33 / 33      lucknow   VILK  96/96  100.0%  33 / 
   and eating a 26–564 min publish lag — is now the *wrong* source and pure cost.
 - **The WU/TWC resolver cross-check is now checking the fallback table**, not the
   resolver. Its sticky blocks gate trading on a table the market no longer uses.
-- `WUNDERGROUND_EXEMPT_ICAOS` (UUWW/LTFM/LLBG) is no longer a special case —
-  every city except Taipei now resolves the way those three already did.
-- The `include_speci=False` exemption for Moscow/Istanbul/Tel Aviv was justified
-  by "weather.gov resolves on the routine cycle". That premise is **false**: the
-  NOAA series carries SPECIs with identical values (verified on RKPK and RCSS).
-  Leaving the flag off stays *conservative* — it can only lower our running max,
-  never raise it — so it is safe to keep, but it is no longer correct as stated.
+- `WUNDERGROUND_EXEMPT_ICAOS` (UUWW/LTFM/LLBG) is no longer a special case for
+  *source* purposes — every city except Taipei now resolves the way those three
+  already did. Their `include_speci=False` setting, however, is **correct and
+  should stay** — see §8, which corrects an earlier claim here.
 
 ## 4. Taipei is the exception
 
@@ -176,3 +173,40 @@ python -m dead_bracket.tools.resolver_status --seed-history
 4. **Watch `fractional`** on the Synoptic rows. The feed returns whole °C for
    every station today and the parser counts any exception; a non-zero count
    means the resolving precision changed and the rounding needs revisiting.
+
+## 8. SPECI carriage is per-station — correcting §3
+
+An earlier version of §3 said the NOAA series "carries SPECIs", inferring a
+global property from two stations (RKPK and RCSS). Measured properly across
+every city over a 7-day window, that is **not** a global property:
+
+| | result |
+|---|---|
+| SPECI-counting cities checked | 32 |
+| our SPECIs absent from the NOAA table | **0** |
+| Moscow (UUWW), `include_speci=False` | **0 of 14** SPECIs present in NOAA |
+
+So both settings are right, for different reasons, and neither is a leftover:
+
+- For the 32 `include_speci=True` cities there are **zero orphan SPECIs** — every
+  SPECI we fold into the running max is in the resolver's table too. This is the
+  dangerous direction (an orphan SPECI can push our max above the resolver's and
+  mark a live bracket dead), and it is clean.
+- For **Moscow** the resolver records none of its SPECIs, so `include_speci=False`
+  matches the resolver exactly. Flipping it on — as the earlier §3 text invited —
+  would have started marking brackets dead on observations the resolver never
+  sees. That is a false-dead generator, not a cleanup.
+- Istanbul and Tel Aviv issued no SPECIs in the window, so there is no evidence
+  either way; the conservative setting stays.
+
+**Rule: `include_speci` is a per-station measurement against the resolver's own
+table, never an inference from the resolution source.** Re-measure it when
+adding a city, with `scripts` equivalent to the orphan check above.
+
+The same measurement explains why Taipei must stay on the `twc` provider.
+Against NOAA its daily max looks 3–8 °C *above* the resolver's on all 7 days —
+not a divergence, but an artifact of NOAA carrying only RCSS's SPECIs and none
+of its routine cycle. Against the table Taipei actually resolves on (WU) it
+agrees on 589 of 589 paired observations. If Taipei were ever switched to
+`synoptic` the guard would sticky-block it immediately, which is the correct
+fail-closed response.

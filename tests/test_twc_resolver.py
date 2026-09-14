@@ -398,3 +398,37 @@ def test_resolver_fetcher_reads_the_general_wu_rows_schema(tmp_path):
                            utc_clock=lambda: now)
     raw = f.raw_for("RKSI")
     assert raw is not None and "RKSI" in raw and "26/" in raw
+
+
+def test_noaa_rows_are_servable_immediately_but_twc_rows_wait_for_the_hour(tmp_path):
+    """settle_sec is the whole difference between the two providers.
+
+    TWC publishes a REVISING hourly aggregate, so its current-hour row must
+    close before it can feed a running max (the 2026-07-08 near-miss was an
+    intra-hour value that later vanished). NOAA/Synoptic rows are observations —
+    nothing revises them — so waiting an hour would throw away precisely the
+    window worth trading.
+    """
+
+    import json
+    from datetime import datetime, timedelta, timezone
+    from dead_bracket.feeds_http import TwcResolverFetcher
+
+    now = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
+    recent = now - timedelta(minutes=10)
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps({
+        "ts": now.isoformat(),
+        "valid_time_gmt": int(recent.timestamp()),
+        "temp": 31,
+    }) + "\n")
+
+    def build(settle):
+        return TwcResolverFetcher(
+            path=str(path), icao="VILK", location="VILK",
+            ttl=0.0, settle_sec=settle,
+            clock=lambda: 0.0, utc_clock=lambda: now)
+
+    # The row is 10 minutes old: NOAA serves it, TWC does not.
+    assert "31/" in (build(0.0).raw_for() or "")
+    assert build(3600.0).raw_for() is None
