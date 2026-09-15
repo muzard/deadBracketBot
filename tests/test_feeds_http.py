@@ -976,3 +976,92 @@ def test_parse_metar_history_honours_the_speci_policy_and_rejects_decimals():
     assert [t for _, t in routine] == [29]            # SPECI excluded
     assert parse_metar_history(None) == []
     assert parse_metar_history("nope") == []
+
+
+# ---------------------------------------------------------------------------
+# Shared discovery: one events fetch for the whole process
+
+
+class _FakeEventsSession:
+    """Counts paginated GETs and can be made to fail on demand."""
+
+    def __init__(self, pages, fail=False):
+        self.pages = pages
+        self.fail = fail
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("429 Too Many Requests")
+        offset = (params or {}).get("offset", 0)
+        limit = (params or {}).get("limit", 100)
+        body = self.pages[offset:offset + limit]
+
+        class _R:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self_inner):
+                return body
+        return _R()
+
+
+def test_shared_events_fetcher_serves_all_cities_from_one_fetch():
+    # The bug this replaces: 35 cities each paginating the identical query,
+    # which earned 106 HTTP 429s in a four-minute window on 2026-09-14.
+    from dead_bracket.feeds_http import SharedEventsFetcher
+
+    t = [0.0]
+    sess = _FakeEventsSession([_ev(f"highest-temperature-in-c{i}-on-june-8-2026")
+                               for i in range(250)])
+    f = SharedEventsFetcher(session=sess, ttl=120.0, monotonic=lambda: t[0])
+
+    first = f.events()
+    assert len(first) == 250          # paginated fully
+    assert sess.calls == 3            # 100 + 100 + 50 -> stops short
+
+    for _ in range(35):               # every other city this tick
+        assert len(f.events()) == 250
+    assert sess.calls == 3            # ...and not one extra request
+
+    t[0] = 121.0                      # past the TTL
+    f.events()
+    assert sess.calls == 6
+
+
+def test_shared_events_fetcher_serves_last_good_then_goes_empty():
+    """A blip must not blank discovery; a real outage must not freeze it either."""
+    from dead_bracket.feeds_http import SharedEventsFetcher
+
+    t = [0.0]
+    sess = _FakeEventsSession([_ev("highest-temperature-in-paris-on-june-8-2026")])
+    f = SharedEventsFetcher(session=sess, ttl=10.0, max_age=100.0,
+                            monotonic=lambda: t[0])
+    assert len(f.events()) == 1
+
+    sess.fail = True
+    t[0] = 20.0
+    assert len(f.events()) == 1       # last-good still served
+    assert f.failures == 1
+
+    t[0] = 200.0                      # older than max_age -> stop serving
+    assert f.events() == []
+
+
+def test_provider_uses_the_shared_fetch_instead_of_paginating(monkeypatch):
+    """Wiring check: with events_fetch supplied the provider makes no HTTP call."""
+    from dead_bracket.feeds_http import GammaMarketProvider
+
+    events = [_noaa_ev("highest-temperature-in-paris-on-june-8-2026", "LFPB")]
+    calls = []
+    p = GammaMarketProvider(
+        market_terms=("paris",), metar_icao="LFPB",
+        events_fetch=lambda: (calls.append(1) or events),
+        session=object(),  # would explode if any request were attempted
+    )
+    ev = p.discover(now=NOW)
+    assert ev is not None and ev["slug"].endswith("june-8-2026")
+    assert calls == [1]

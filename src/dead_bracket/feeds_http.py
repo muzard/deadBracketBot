@@ -1490,6 +1490,90 @@ class SharedMetarFetcher:
                 continue  # keep last-good cache; raw_for ages it out via max_age
 
 
+class SharedEventsFetcher:
+    """One paginated daily-temperature events fetch shared by every city.
+
+    Discovery asks the same question for all 35 cities — "every open event with
+    the daily-temperature tag" — and then each city picks its own out of the
+    identical answer. Doing that per city meant 35 x 3 paginated requests every
+    discovery round, which reliably earned HTTP 429s from the events endpoint
+    (106 of them in a four-minute window across two restarts, 2026-09-14). The
+    workers recover by retrying, so it only ever cost a slow, noisy startup —
+    but it is pure duplicate work.
+
+    Same shape as ``SharedMetarFetcher`` and the batched ``/books`` POST: one
+    network call per ``ttl`` for the whole process, last-good served while a
+    refresh fails, and nothing served once the last success is older than
+    ``max_age`` so a genuine outage still surfaces as "no market data" rather
+    than a frozen event list.
+
+    The refresh runs INSIDE the lock, deliberately. The lock is not only
+    protecting the cache, it is also bounding concurrency: letting 35 threads
+    fetch off-lock is what turned a previous shared-fetcher refactor into a
+    socket and rate-limit blowup.
+    """
+
+    def __init__(self, *, session, tag_slug: str = DAILY_TEMP_TAG,
+                 ttl: float = 120.0, max_age: float = 900.0,
+                 page_size: int = 100, timeout: float = 20.0,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+        self._session = session
+        self._tag = tag_slug
+        self._ttl = float(ttl)
+        self._max_age = float(max_age)
+        self._page_size = int(page_size)
+        self._timeout = timeout
+        self._mono = monotonic
+        self._events: list = []
+        self._last_success: Optional[float] = None
+        self._last_attempt: Optional[float] = None
+        self._lock = threading.Lock()
+        self.fetches = 0
+        self.failures = 0
+
+    def events(self) -> list:
+        """Today's open daily-temperature events; ``[]`` if none are fresh."""
+
+        with self._lock:
+            now = self._mono()
+            if (self._last_attempt is None
+                    or (now - self._last_attempt) >= self._ttl):
+                self._last_attempt = now
+                self._refresh(now)
+            if (self._last_success is None
+                    or (now - self._last_success) > self._max_age):
+                return []
+            return list(self._events)
+
+    def _refresh(self, now: float) -> None:  # pragma: no cover - network
+        """Caller holds the lock (see the class docstring on why)."""
+
+        collected: list = []
+        offset = 0
+        try:
+            while True:
+                resp = self._session.get(
+                    GAMMA_EVENTS_URL,
+                    params={"closed": "false", "tag_slug": self._tag,
+                            "limit": self._page_size, "offset": offset},
+                    timeout=self._timeout,
+                )
+                resp.raise_for_status()
+                page = resp.json()
+                if not page:
+                    break
+                collected.extend(page)
+                if len(page) < self._page_size:
+                    break
+                offset += self._page_size
+        except Exception:
+            self.failures += 1
+            return  # keep last-good; events() ages it out via max_age
+        self.fetches += 1
+        self._events = collected
+        self._last_success = now
+
+
 class GammaMarketProvider:  # pragma: no cover - network orchestration
     """Discovers the city's daily-temperature event and reads CLOB book/depth."""
 
@@ -1505,7 +1589,13 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
         tz: Optional[ZoneInfo] = None,
         book_band_below: int = 1,
         book_band_above: int = 2,
+        events_fetch: Optional[Callable[[], list]] = None,
     ) -> None:
+        # Shared, TTL-cached "all open daily-temperature events" callable. Every
+        # city asks the SAME question, so without this each one paginates the
+        # identical query itself. None keeps the standalone behaviour (tests,
+        # one-off tools).
+        self._events_fetch = events_fetch
         self._terms = tuple(t.lower() for t in market_terms)
         # Resolution station this city trades on; used to cross-check the
         # discovered event's description names our station + Weather Underground.
@@ -1603,6 +1693,10 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
         now = now or datetime.now(timezone.utc)
         if self._event_slug:
             events = self._get(GAMMA_EVENTS_URL, slug=self._event_slug)
+        elif self._events_fetch is not None:
+            # Shared across every city: one paginated fetch per TTL for the whole
+            # process instead of 35 identical ones (see SharedEventsFetcher).
+            events = self._events_fetch()
         else:
             events = []
             offset = 0

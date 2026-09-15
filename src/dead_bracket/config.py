@@ -516,6 +516,12 @@ class Config:
     # to catch off-cycle SPECI reports (which publish at irregular times) within
     # ~a minute, while the shared fetcher only hits the network once per cycle.
     metar_poll_sec: float = 60.0
+    # How often the SHARED discovery fetch re-reads the open daily-temperature
+    # events. All cities read the same cached answer, so this is one request per
+    # interval for the whole process rather than one per city. Discovery only
+    # needs to notice a new day's market appearing, so it can be slow; the old
+    # per-city paging is what earned HTTP 429s on startup.
+    discovery_poll_sec: float = 120.0
     # Aggressive cadence inside a "hot window" — from a :00/:30 slot until that
     # slot's report actually lands (empirically 100-400s later) — to grab a new
     # high (and the brief opportunity it opens) as fast as the API allows.
@@ -731,6 +737,7 @@ class Config:
             "crossed_book_recover_ticks": int,
             "data_dir": str,
             "metar_poll_sec": float,
+            "discovery_poll_sec": float,
             "metar_hot_poll_sec": float,
             "metar_expected_gap_min": float,
             "market_poll_sec": float,

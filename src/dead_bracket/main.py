@@ -21,6 +21,7 @@ from .executor import PaperExecutor, make_executor
 from .feeds_http import (
     GammaMarketProvider,
     HkoStationFetcher,
+    SharedEventsFetcher,
     SharedMetarFetcher,
     TwcResolverFetcher,
     build_feed_fetcher,
@@ -585,6 +586,13 @@ def build_supervisor(
         # exclude SPECIs from the JSON selection and skip their tgftp fast path.
         exclude_speci_icaos={c.metar_icao for c in selected if not c.include_speci},
     )
+    # Likewise for discovery: every city asks the SAME question (all open
+    # daily-temperature events) and then picks its own out of the identical
+    # answer, so one shared paginated fetch per TTL replaces 35 of them.
+    events_fetcher = SharedEventsFetcher(
+        session=_new_session(),
+        ttl=config.discovery_poll_sec,
+    )
     workers: list[CityWorker] = []
     for city_cfg in selected:
         # Resolution-source selection for HKO/TWC-resolved cities (Shenzhen).
@@ -717,6 +725,7 @@ def build_supervisor(
             market_terms=city_cfg.market_terms,
             metar_icao=city_cfg.metar_icao,
             on_event=_on_event,
+            events_fetch=events_fetcher.events,
             tz=ZoneInfo(city_cfg.tz),
             book_band_below=config.book_band_below,
             # Widen the read band so the price sampler's frontier band still has
