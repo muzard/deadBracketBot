@@ -486,3 +486,49 @@ def test_self_sourced_city_still_honours_an_adopted_block():
     g.note_theirs(agreeing_history()[1])
     g.adopt_block("divergence recorded before the source was switched")
     assert g.evaluate(NOW).state == DIVERGENT
+
+
+def test_poller_goes_hot_while_our_max_is_ahead_of_the_resolver():
+    """Under confirm-dead, the time until the resolver's catch-up is noticed is
+    time the opportunity cannot be traded, so the poller tightens its cadence
+    while a new high is unconfirmed — and only then."""
+
+    class _Collector:
+        polls = failures = new_rows = 0
+
+        def poll_once(self):
+            self.polls += 1
+
+    class _Rep:
+        def event(self, *a, **k):
+            pass
+
+    hurry = [False]
+    col = _Collector()
+    w = ResolverPollerWorker(city="paris", collector=col, reporter=_Rep(),
+                             poll_sec=600.0, hot_poll_sec=60.0,
+                             hurry=lambda: hurry[0], monotonic=lambda: 0.0)
+    w.tick(now=0.0)
+    w.tick(now=120.0)
+    assert col.polls == 1                 # cold: 600s cadence
+
+    hurry[0] = True                       # our max just got ahead
+    w.tick(now=121.0)
+    assert col.polls == 2                 # hot: 60s cadence
+    w.tick(now=150.0)
+    assert col.polls == 2
+    w.tick(now=182.0)
+    assert col.polls == 3
+
+
+def test_awaiting_confirmation_tracks_our_max_against_the_resolvers():
+    g = guard(tz=ZoneInfo("Asia/Seoul"))
+    ours, theirs = agreeing_history()
+    g.seed_ours(ours)
+    g.note_theirs(theirs)
+    assert g.awaiting_confirmation(NOW) is False       # they agree
+
+    g.seed_ours([(NOW - timedelta(minutes=5), 27)])    # a new high of ours
+    assert g.awaiting_confirmation(NOW) is True
+    g.note_theirs([(int((NOW - timedelta(minutes=5)).timestamp()), 27)])
+    assert g.awaiting_confirmation(NOW) is False       # resolver caught up

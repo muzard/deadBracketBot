@@ -124,6 +124,10 @@ class CityWorker:
         self._resting_since: dict[int, float] = {}
         # Brackets already reported by the alarm, so it speaks once per position.
         self._alarmed: set[int] = set()
+        # When our running max first got ahead of the resolver's table (monotonic);
+        # None while they agree. Drives change-only events and the confirmation
+        # latency measurement under resolver_confirm_dead.
+        self._unconfirmed_since: Optional[float] = None
         # Our running max per local trading day — the settlement fallback when
         # the resolver's table holds no rows for the day being settled.
         self._day_high: dict[date, int] = {}
@@ -446,13 +450,27 @@ class CityWorker:
                     self.city,
                     f"resolver cross-check OK: {verdict.reason}"
                     + (f" (station {verdict.station})" if verdict.station else ""))
-            # Strict mode: also wait for the resolver's own table to reach the
-            # running max, closing the publish-lag window the 24h check leaves.
-            if (self._cfg.resolver_confirm_dead
-                    and not self._resolver.confirms_max(rmax)):
-                self._reporter.event(self.city, "resolver_max_unconfirmed",
-                                     running_max=rmax)
-                return False
+            # Confirmed-dead mode: a bracket is only dead once the RESOLVER's
+            # own table has reached our running max. The 24h pairing check
+            # cannot see a reading the resolver simply never ingested — it has
+            # nothing to pair — and that is precisely how Singapore 2026-09-20
+            # and three of the four European trades on 09-22 were made on
+            # readings NOAA's table does not contain.
+            if self._cfg.resolver_confirm_dead:
+                if not self._resolver.confirms_max(rmax):
+                    if self._unconfirmed_since is None:
+                        self._unconfirmed_since = self._mono()
+                        self._reporter.event(self.city, "resolver_max_unconfirmed",
+                                             running_max=rmax)
+                    return False
+                if self._unconfirmed_since is not None:
+                    # The measurement confirm-dead's cost depends on: how long
+                    # the resolver took to reach our max.
+                    waited = self._mono() - self._unconfirmed_since
+                    self._unconfirmed_since = None
+                    self._reporter.event(self.city, "resolver_max_confirmed",
+                                         running_max=rmax,
+                                         waited_sec=round(waited, 1))
             return True
 
         if verdict.sticky:

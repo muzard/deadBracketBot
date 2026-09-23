@@ -650,13 +650,33 @@ class Config:
     resolver_recent_minutes: int = 2880
     resolver_tolerance_c: int = 0  # exact agreement; 1 would have allowed Seoul
     resolver_poll_sec: float = 600.0  # table poll cadence (5-min CDN cache)
-    # Strict mode: additionally require the resolver's OWN table to have reached
-    # the running max before any bracket below it counts as dead. Closes the
-    # residual window the 24 h check cannot cover (the resolver publishes 25-65
-    # min late, so the newest print has nothing to disagree with yet) — at the
-    # cost of the speed edge the whole strategy is built on. Off by default;
-    # turn it on in paper to measure the trade-off.
-    resolver_confirm_dead: bool = False
+    # Require the resolver's OWN table to have reached our running max before
+    # any bracket counts as dead. ON by default since 2026-09-23.
+    #
+    # The 24h pairing check compares observations both sides hold, so it is
+    # blind to a reading the resolver simply never ingests — there is nothing
+    # to pair. NOAA does drop readings, several stations at a time: on
+    # 2026-09-20 it never ingested the peak hours of Singapore, Beijing,
+    # Guangzhou, Qingdao and Manila, and every one of those markets resolved on
+    # NOAA's lower value; on 09-22 it missed 10:50Z and 11:20Z at Ankara,
+    # London and Munich. We traded Singapore (a real -$191) and all three
+    # European cities on readings NOAA's table does not contain; the European
+    # ones paid only because the next reading happened to go higher. A missing
+    # reading can only ever LOWER the resolver's max — the one direction that
+    # manufactures a false dead — so the METAR is not a safe proxy for it.
+    #
+    # The cost is the time for the resolver to catch up to a new high, during
+    # which the fresh frontier bracket cannot be bought. Under WU that was the
+    # whole edge (26-564 min lag); NOAA publishes the same observations
+    # promptly, and resolver_hot_poll_sec notices the catch-up quickly. Every
+    # confirmation is logged as `resolver_max_confirmed` with the wait, so the
+    # real cost is measured rather than assumed.
+    resolver_confirm_dead: bool = True
+    # Resolver poll cadence while our running max is ahead of its table (see
+    # above). Only applied to NOAA/Synoptic-backed cities: the TWC table sits
+    # behind a 5-minute CDN cache and a metered key, so polling it faster buys
+    # nothing.
+    resolver_hot_poll_sec: float = 60.0
     # Daily rollover: re-arm risk and settle positions at this tz's midnight so
     # the bot runs unattended across days. daily_rearm=False disables it.
     rollover_tz: str = "UTC"
@@ -787,6 +807,7 @@ class Config:
             "resolver_tolerance_c": int,
             "resolver_poll_sec": float,
             "resolver_confirm_dead": _as_bool,
+            "resolver_hot_poll_sec": float,
             "rollover_tz": str,
         }
         for name, cast in casters.items():

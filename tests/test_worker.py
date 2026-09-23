@@ -645,6 +645,12 @@ class _StubGuard:
     def evaluate(self, now=None):
         return self.verdict
 
+    def confirms_max(self, running_max, now=None):
+        return True  # the resolver's table has reached our max
+
+    def day_maxima(self, day):
+        return (None, None)
+
 
 def test_resolver_divergence_blocks_buys_and_sticks(config, risk, reporter):
     from dead_bracket.resolver_guard import DIVERGENT, Mismatch, Verdict
@@ -988,3 +994,71 @@ def test_settlement_says_so_when_it_cannot_consult_the_resolver():
     worker.process_book(make_snapshot("paris", [make_bracket(31, asks=[(0.95, 100)])]))
     worker.roll_day(ended_day=date(2026, 9, 20))
     assert any("against OUR max" in n for n in rep.progress_lines)
+
+
+
+class _ConfirmingResolver(_SwitchableResolver):
+    """The resolver's table is behind our max until the test says it caught up."""
+
+    def __init__(self):
+        super().__init__()
+        self.caught_up = False
+
+    def confirms_max(self, running_max, now=None):
+        return self.caught_up
+
+
+def test_confirm_dead_withholds_the_buy_until_the_resolver_reaches_our_max():
+    """Regression for 2026-09-20: Singapore was bought on a 32C reading NOAA's
+    table never ingested. Under confirm-dead the bracket is not dead until the
+    resolver's own table says so — and when it never does, it is never bought."""
+
+    t = [0.0]
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    resolver = _ConfirmingResolver()
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018", monotonic=lambda: t[0])
+    metar.poll_once()
+    assert Config().resolver_confirm_dead is True       # on by default
+
+    snap = make_snapshot("paris", [make_bracket(31, asks=[(0.38, 100)])])
+    worker.process_book(snap)
+    worker.process_book(snap)
+    assert ("paris", 31) not in ex.positions            # withheld
+
+    t[0] = 75.0
+    resolver.caught_up = True                           # NOAA publishes 32
+    worker.process_book(snap)
+    assert ex.positions[("paris", 31)].shares > 0       # now genuinely dead
+
+
+def test_confirm_dead_logs_how_long_the_resolver_took(tmp_path):
+    """The cost of confirm-dead is the resolver's catch-up time, so every wait
+    is recorded — once on entering it and once, with its length, on leaving."""
+
+    import json
+    from dead_bracket.reporter import Reporter
+    t = [0.0]
+    risk = RiskManager(Config())
+    rep = Reporter(str(tmp_path), progress=False, stdout=None)
+    resolver = _ConfirmingResolver()
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018", monotonic=lambda: t[0])
+    metar.poll_once()
+    snap = make_snapshot("paris", [make_bracket(31, asks=[(0.38, 100)])])
+    for _ in range(5):                                   # many ticks waiting...
+        worker.process_book(snap)
+    t[0] = 75.0
+    resolver.caught_up = True
+    worker.process_book(snap)
+
+    events = []
+    for p in tmp_path.rglob("events.jsonl"):
+        events += [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    kinds = [e["event"] for e in events]
+    assert kinds.count("resolver_max_unconfirmed") == 1  # ...one event, not five
+    done = [e for e in events if e["event"] == "resolver_max_confirmed"]
+    assert len(done) == 1 and done[0]["waited_sec"] == 75.0

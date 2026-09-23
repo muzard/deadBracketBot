@@ -549,6 +549,11 @@ def build_resolver_guards(
                 collector=collector,
                 reporter=reporter,
                 poll_sec=config.resolver_poll_sec,
+                # Hot cadence only for NOAA-backed cities, and only while our
+                # running max is ahead of the resolver's table.
+                hot_poll_sec=(config.resolver_hot_poll_sec
+                              if city_cfg.resolver_provider == "synoptic" else None),
+                hurry=guard.awaiting_confirmation,
             )
         )
         reporter.event(city_cfg.id, "resolver_start", source=source_label,
