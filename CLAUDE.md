@@ -28,6 +28,17 @@ paths, one order pipeline:
    wins the day) → any settled loss pauses the whole forecast path (sticky).
    YES-side / day-max betting remains a **non-goal**.
 
+## 2026-09-20: NOAA DROPS READINGS — the METAR is not the resolver
+A ~5 h worldwide Synoptic ingest outage (02:30–07:30Z, up to 31 of 34 stations)
+never recorded East Asia's afternoon peaks; five markets resolved on NOAA's
+lower high, and a paper NO bought on Singapore's "dead" 31 °C bracket lost
+−$191 (paper booked it +$308). A reading NOAA never ingests is invisible to the
+pairwise cross-check. Hence: `resolver_confirm_dead` is ON (a bracket is dead
+only once NOAA's own table reaches our max), each city settles at its own
+midnight against the resolver's max, and PnL is booked from the market's
+ACTUAL resolution (`reconcile.py`). Full analysis:
+**[docs/noaa_ingest_outage_2026-09-20.md](docs/noaa_ingest_outage_2026-09-20.md)**.
+
 ## 2026-09-12: THE RESOLVER MOVED — WU -> NOAA (read with the STOP section)
 Polymarket re-pointed every daily-temperature market (except Taipei) from
 Weather Underground to **NOAA**, naming
@@ -39,9 +50,9 @@ window, daily max, SPECIs included. Consequences, in full in
 **[docs/resolution_source_migration_2026-09-14.md](docs/resolution_source_migration_2026-09-14.md)**:
 - **Seoul and Shenzhen are no longer divergent.** Both failures were *WU*
   artifacts (WU's RKSI row; WU resolving Shenzhen off HKO Lau Fau Shan). NOAA's
-  `site=rksi` / `site=zgsz` matched our METAR 96/96 and 48/48. Their
-  `resolution_source="resolver"` setting now reads the WRONG table at a
-  26-564 min publish lag — revert it once the new cross-check has soaked.
+  `site=rksi` / `site=zgsz` matched our METAR 96/96 and 48/48, so both
+  are back on `resolution_source="metar"`; `lucknow` is the only
+  resolver-sourced city now (its METAR genuinely diverges).
 - **The cross-check now reads NOAA too** (`CityConfig.resolver_provider`:
   `synoptic` for 34 cities, `twc` for Taipei only). Rows land in
   `resolver_rows.jsonl`; no API key needed; one poll backfills 48 h, and startup

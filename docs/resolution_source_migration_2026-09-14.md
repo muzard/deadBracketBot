@@ -53,6 +53,13 @@ returns `Paris-Le Bourget Airport`, half-hourly, matching our METAR exactly.
 
 ## 2. That series IS the METAR (34/35 cities, 100.0%)
 
+> **Corrected 2026-09-23.** Observation-for-observation this holds *when NOAA
+> has the observation* — but NOAA drops readings, in bulk: a ~5 h worldwide
+> ingest outage on 2026-09-20 changed five markets' daily high, and all five
+> resolved on NOAA's lower value. A dropped reading is invisible to any
+> pairwise comparison like the one below. The METAR is **not** a safe proxy for
+> the resolver. See [noaa_ingest_outage_2026-09-20.md](noaa_ingest_outage_2026-09-20.md).
+
 Head-to-head over the trailing 48 hours, per station, resolver series vs
 `aviationweather.gov` METAR:
 
