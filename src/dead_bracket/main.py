@@ -941,11 +941,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 2
 
-    initial_balance = (
-        resolve_initial_balance(config, args.balance, live_client)
-        if (config.bankroll_pct > 0 or config.forecast)
-        else 0.0
-    )
+    # Resolve the balance whenever one is known — not only when percentage
+    # sizing or the forecast path asks for it. The static dollar caps are meant
+    # to be clamped to real capital too (max_bracket_pct, max_deployed_pct), and
+    # that clamp only exists once the risk manager knows a balance. Gating this
+    # on bankroll_pct silently discarded `--balance 100` in the default config:
+    # the 2026-09-14..23 soak ran on the unclamped $500/city, $1000 total caps
+    # and filled $190-490 per bracket on a "$100" account.
+    initial_balance = resolve_initial_balance(config, args.balance, live_client)
 
     city_tz = {c.id: c.tz for c in config.cities}
     reporter = Reporter(config.data_dir, city_tz=city_tz, progress=not args.quiet)

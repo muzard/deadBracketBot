@@ -186,3 +186,35 @@ def test_taipei_is_the_only_city_left_on_weather_underground():
 
     twc = {c.id for c in Config().cities if c.resolver_provider == "twc"}
     assert twc == {"taipei"}
+
+
+def test_a_paper_balance_clamps_the_default_static_caps():
+    """Regression: `--balance 100` was discarded unless bankroll_pct > 0.
+
+    main() only resolved the balance for percentage sizing or the forecast path,
+    so the DEFAULT config ran on the unclamped static caps ($500/city, $1000
+    total) and the 2026-09-14..23 soak filled $190-490 per bracket on a "$100"
+    account — including a single $189 false-dead position. With the balance
+    known, one bracket is held to max_bracket_pct of equity and everything to
+    the capital that actually exists.
+    """
+
+    from dead_bracket.main import resolve_initial_balance
+    from dead_bracket.risk import RiskManager
+
+    cfg = Config()                       # default: bankroll_pct == 0
+    assert cfg.bankroll_pct == 0.0
+    balance = resolve_initial_balance(cfg, 100.0)
+    risk = RiskManager(cfg, initial_balance=balance)
+
+    # Caps are expressed at the CAP price ceiling, so 25% of $100 is 25/0.98.
+    per_bracket = risk.per_bracket_cap_remaining("singapore", 31)
+    assert per_bracket <= 100.0 * cfg.max_bracket_pct / 100.0 / cfg.cap + 1e-9
+    deployed = 100.0 * cfg.max_deployed_pct / 100.0 / cfg.cap
+    assert risk.per_city_cap_remaining("singapore") <= deployed + 1e-9
+    assert risk.total_cap_remaining() <= deployed + 1e-9
+
+    # Without a balance the static caps are all there is (the old behaviour
+    # every paper run silently fell back to).
+    unclamped = RiskManager(cfg, initial_balance=0.0)
+    assert unclamped.total_cap_remaining() > 100.0
