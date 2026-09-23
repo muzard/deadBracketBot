@@ -449,13 +449,17 @@ class RiskManager:
         self._check_daily_loss()
 
     def record_settlement(self, *, city: str, temp: int, shares: float, cost_basis: float,
-                          payout: float = 1.0) -> None:
-        """A NO settled: free exposure and realise PnL (payout*shares - cost).
+                          payout: float = 1.0, realise: bool = True) -> None:
+        """A NO settled: free exposure and (by default) realise PnL.
 
         ``payout`` is the per-share redemption: $1 for every bracket that was
-        NOT the day's high (all dead-path positions), $0 when the bracket WON
-        the day — only possible for forecast entries, whose predicted kill
-        never confirmed."""
+        NOT the day's high, $0 for the bracket that WON it — a forecast entry
+        whose predicted kill never confirmed, or a dead-path false dead where
+        our running max ran ahead of the resolver's table.
+
+        ``realise=False`` frees the exposure without booking PnL. Live uses it:
+        redemption happens on-chain and the wallet is the equity source there,
+        so the executor releases the caps but does not synthesise a result."""
 
         if shares <= 0:
             return
@@ -466,8 +470,10 @@ class RiskManager:
             self._bracket_exposure[key] = max(0.0, self._bracket_exposure.get(key, 0.0) - cost_basis)
             self._city_exposure[city] = max(0.0, self._city_exposure.get(city, 0.0) - cost_basis)
             self._total_exposure = max(0.0, self._total_exposure - cost_basis)
-            self._record_pnl(payout * shares - cost_basis)
-        self._check_daily_loss()
+            if realise:
+                self._record_pnl(payout * shares - cost_basis)
+        if realise:
+            self._check_daily_loss()
 
     # -- kill-switch / halts ----------------------------------------------
     # Only a portfolio-wide condition (daily-loss) trips the GLOBAL kill-switch.
@@ -557,14 +563,22 @@ class RiskManager:
     def roll_day(self, day_key: str) -> bool:
         """Re-arm for a new trading day (idempotent per ``day_key``).
 
-        Clears the global kill-switch, all per-city halts, error counters, and
-        resets DAILY PnL and exposures so the bot runs unattended across days.
-        Returns True only on the first call for a given day. Positions should be
-        settled by the caller *before* this resets exposure.
+        Clears the global kill-switch, all per-city halts and error counters,
+        and resets the DAILY PnL the loss breaker reads, so the bot runs
+        unattended across days. Returns True only on the first call for a given
+        day.
 
-        Deliberately NOT cleared: cumulative PnL (the sizing base must compound
-        across days rather than snapping back to the starting balance), the
-        sticky forecast pause, and sticky resolver blocks.
+        Deliberately NOT cleared:
+
+        * **Exposure and share counts.** They are released exactly by the
+          events that end a position — a sell fill (``record_sell_fill``) or a
+          settlement (``record_settlement``) — and positions are now settled at
+          each city's OWN local midnight, not at this shared boundary. Wiping
+          exposure here would drop every still-open position from the caps: a
+          city west of this boundary is mid-afternoon at it, and a city east of
+          it may already hold positions in its new day.
+        * Cumulative PnL (the sizing base must compound across days), the
+          sticky forecast pause, and sticky resolver blocks.
         """
 
         with self._lock:
@@ -577,11 +591,6 @@ class RiskManager:
             self._city_halted.clear()
             self._city_recoverable.clear()
             self._order_errors.clear()
-            self._bracket_shares.clear()
-            self._bracket_exposure.clear()
-            self._city_exposure.clear()
-            self._forecast_exposure.clear()  # pause stays sticky (human decision)
-            self._total_exposure = 0.0
             self._realized_pnl = 0.0
             return True
 

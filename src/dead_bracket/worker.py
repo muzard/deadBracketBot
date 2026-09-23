@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -124,6 +124,9 @@ class CityWorker:
         self._resting_since: dict[int, float] = {}
         # Brackets already reported by the alarm, so it speaks once per position.
         self._alarmed: set[int] = set()
+        # Our running max per local trading day — the settlement fallback when
+        # the resolver's table holds no rows for the day being settled.
+        self._day_high: dict[date, int] = {}
         # Seed the METAR-output dedup from the feed's log so a restart doesn't
         # re-announce a report already recorded (it appeared as an inflated
         # "+my" latency on every restart).
@@ -263,6 +266,9 @@ class CityWorker:
         self._market_available = True
 
         rmax = self._metar.running_max
+        today = self._metar.trading_day
+        if today is not None and rmax is not None:
+            self._day_high[today] = max(self._day_high.get(today, rmax), rmax)
 
         # 0. Windowed price sampling (pure telemetry, runs even while halted): in a
         #    publication hot window, sparsely record the frontier NO prices so we
@@ -784,38 +790,95 @@ class CityWorker:
         if reason:
             self._reporter.halt(reason)
 
-    def roll_day(self) -> None:
-        """Settle yesterday's positions and log the daily rollover for this city.
+    def local_date(self, now: datetime) -> date:
+        """This city's calendar date at ``now`` — its settlement boundary."""
 
-        Called at the trading-day boundary so the bot runs unattended: open
-        dead-NO positions from the resolved day are settled and reported. The
-        day's final running max marks the WINNING bracket, whose NO pays $0 —
-        only reachable by a forecast entry whose predicted kill never confirmed
-        (dead-path positions always sit below the final max). Such a loss
-        pauses the forecast path globally (config.forecast_pause_on_loss): at
-        p-hat >= 0.97 it is a model/mapping bug until a human clears it. The
-        shared risk re-arm is done once by the supervisor.
+        tz = self._tz or timezone.utc
+        return now.astimezone(tz).date()
+
+    def roll_day(self, ended_day: Optional[date] = None) -> None:
+        """Settle the positions of the local day that just ended.
+
+        Called by the supervisor at THIS city's local midnight — not at a shared
+        UTC midnight. The market resolves each city on its own calendar day, so
+        that is the only boundary at which "the day's high" means anything. The
+        first version rolled every city at 00:00 UTC: a city east of UTC was
+        settled hours into its NEXT day against that morning's partial running
+        max, and a city west of UTC was settled before its own day had ended.
+
+        The winning bracket is taken from the RESOLVER's table for the ended day
+        — the table the market actually pays out on — falling back to our own
+        max only when the resolver holds no rows for that day, and saying so.
+        Settling against our own max (as the first version did) makes a false
+        dead unrepresentable: a dead-path NO always sits below our max, so on
+        paper it always paid $1. On 2026-09-20 that turned Singapore's 500-share
+        false dead, a real -$191, into a reported +$308.
+
+        ``ended_day=None`` settles the city's current trading day (unit tests,
+        and any caller without a boundary to hand).
         """
 
-        final_max = self._metar.running_max
+        day = ended_day or self._metar.trading_day
+        ours_max = theirs_max = None
+        if day is not None and self._resolver is not None:
+            ours_max, theirs_max = self._resolver.day_maxima(day)
+        if ours_max is None and day is not None:
+            ours_max = self._day_high.get(day)
+        if ours_max is None:
+            ours_max = self._metar.running_max
+        final_max = theirs_max if theirs_max is not None else ours_max
+
         settlements = self._executor.settle(final_max)
         total_pnl = 0.0
         for s in settlements:
             self._reporter.settlement(s.city, temp=s.temp, shares=s.shares, pnl=s.pnl,
                                       won=s.won)
             total_pnl += s.pnl
-            if not s.won and self._cfg.forecast_pause_on_loss:
+            if s.won:
+                continue
+            # A dead-path position is one we held because temp < OUR max. If it
+            # lost, the resolver's table did not reach our max — the failure that
+            # emptied the wallet on 2026-07-19. Otherwise it was a forecast entry
+            # whose predicted kill never confirmed.
+            false_dead = ours_max is not None and s.temp < ours_max
+            if false_dead:
+                self._reporter.event(self.city, "false_dead_settled", temp=s.temp,
+                                     ours_max=ours_max, resolver_max=theirs_max,
+                                     pnl=s.pnl, day=str(day))
+                self._reporter.notice(
+                    self.city,
+                    f"FALSE DEAD: bracket {s.temp}C settled as the day's high "
+                    f"(resolver max {theirs_max}C, ours {ours_max}C), "
+                    f"pnl {s.pnl:+.2f}. Our running max was ahead of the table "
+                    f"the market resolves on.")
+            if self._cfg.forecast_pause_on_loss:
+                # Fail closed on ANY settled loss: a resolver dropping readings
+                # threatens forecast entries exactly as it does dead-path ones.
+                cause = "false dead" if false_dead else "forecast miss"
                 if self._risk.pause_forecast(
-                        f"settled loss: {s.city} {s.temp}C was the daily high"):
+                        f"settled loss ({cause}): {s.city} {s.temp}C was the daily high"):
                     self._reporter.event(self.city, "forecast_paused",
                                          temp=s.temp, final_max=final_max,
-                                         pnl=s.pnl)
+                                         pnl=s.pnl, cause=cause)
                     self._reporter.notice(
-                        self.city, "FORECAST PAUSED: settled loss on "
+                        self.city, f"FORECAST PAUSED: settled loss ({cause}) on "
                         f"{s.temp}C (final max {final_max}) — restart to clear")
+        if settlements and theirs_max is None:
+            self._reporter.event(self.city, "settle_unverified", day=str(day),
+                                 final_max=final_max)
+            self._reporter.notice(
+                self.city,
+                f"settled {len(settlements)} position(s) against OUR max "
+                f"({final_max}C): the resolver holds no rows for {day}, so a "
+                f"false dead here would not show as a loss")
+        if day is not None:
+            for d in [d for d in self._day_high if d <= day]:
+                del self._day_high[d]
         if self._forecast is not None:
             self._forecast.roll_day()
-        self._reporter.event(self.city, "day_rollover", settled=len(settlements), pnl=total_pnl)
+        self._reporter.event(self.city, "day_rollover", settled=len(settlements),
+                             pnl=total_pnl, day=str(day), final_max=final_max,
+                             resolver_max=theirs_max)
         self._reporter.notice(self.city, f"new day: settled {len(settlements)} position(s), pnl {total_pnl:+.2f}")
 
     # -- progress ----------------------------------------------------------

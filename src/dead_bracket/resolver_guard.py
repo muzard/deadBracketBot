@@ -616,6 +616,24 @@ class ResolverCrossCheck:
             return None
         return day, max(ours), max(theirs)
 
+    def day_maxima(self, day: date) -> tuple[Optional[int], Optional[int]]:
+        """``(ours, resolver's)`` maximum for one local ``day``, from the rows held.
+
+        This is what settlement must use. The market pays out on the RESOLVER's
+        table, and that table can be missing observations our METAR has — on
+        2026-09-20 NOAA never ingested the peak readings of five Asian stations
+        and every one of those markets resolved on NOAA's lower value. Settling
+        against our own max makes a false dead unrepresentable: the position
+        always "wins" on paper. Either side is None when no rows for ``day``
+        are held (rows are kept for twice the comparison window, so yesterday is
+        always available at a local-midnight rollover).
+        """
+
+        with self._lock:
+            ours = [t for e, t in self._ours.items() if self._in_day(e, day)]
+            theirs = [t for e, t in self._theirs.items() if self._in_day(e, day)]
+        return (max(ours) if ours else None, max(theirs) if theirs else None)
+
     def _in_day(self, epoch: int, day: date) -> bool:
         return self._local_date(datetime.fromtimestamp(epoch, timezone.utc)) == day
 

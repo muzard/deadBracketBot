@@ -123,3 +123,49 @@ def test_supervisor_start_and_stop_threads():
     sup.stop()
     # All threads joined / not alive after stop.
     assert all(not t.is_alive() for t in sup._threads.values())
+
+
+class _TzWorker:
+    """A worker stub with a real timezone that records what it was asked to settle."""
+
+    def __init__(self, city, tz):
+        from zoneinfo import ZoneInfo
+        self.city = city
+        self._tz = ZoneInfo(tz)
+        self.settled = []
+
+    def local_date(self, now):
+        return now.astimezone(self._tz).date()
+
+    def roll_day(self, ended_day=None):
+        self.settled.append(ended_day)
+
+
+def test_each_city_settles_at_its_own_local_midnight():
+    """Regression: every city used to roll at 00:00 UTC.
+
+    Singapore (UTC+8) was then settled 8 hours into its NEXT day, against that
+    morning's partial max — which is how a false dead on bracket 31 "won" on
+    2026-09-20. Toronto (UTC-4) was settled at 20:00 local, before its own day
+    had ended. Each must settle at its own midnight, the day that just ended.
+    """
+
+    from datetime import date, datetime, timezone
+    sg = _TzWorker("singapore", "Asia/Singapore")
+    to = _TzWorker("toronto", "America/Toronto")
+    clock = {"t": datetime(2026, 9, 20, 10, 0, tzinfo=timezone.utc)}
+    sup = Supervisor([sg, to], clock=lambda: clock["t"])
+    sup.maybe_roll_day()                                    # record only
+
+    clock["t"] = datetime(2026, 9, 20, 16, 30, tzinfo=timezone.utc)  # SG 00:30
+    sup.maybe_roll_day()
+    assert sg.settled == [date(2026, 9, 20)] and to.settled == []
+
+    clock["t"] = datetime(2026, 9, 21, 0, 30, tzinfo=timezone.utc)   # UTC midnight
+    sup.maybe_roll_day()
+    assert to.settled == []                                 # Toronto is 20:30 still
+    assert sg.settled == [date(2026, 9, 20)]                # not settled twice
+
+    clock["t"] = datetime(2026, 9, 21, 4, 30, tzinfo=timezone.utc)   # TO 00:30
+    sup.maybe_roll_day()
+    assert to.settled == [date(2026, 9, 20)]

@@ -913,3 +913,78 @@ def test_exits_are_reposted_while_entries_are_gated():
     pos.resting_sell = 0.0              # simulate the resting sell being lost
     worker.process_book(make_snapshot("paris", [make_bracket(22)]))
     assert pos.resting_sell == pos.shares
+
+
+# ---------------------------------------------------------------------------
+# Settlement against the resolver's table, per city
+
+
+class _ResolverWithDayMax(_SwitchableResolver):
+    """Stub resolver that also reports (ours, resolver's) maxima for a day."""
+
+    def __init__(self, ours, theirs):
+        super().__init__()
+        self._maxima = (ours, theirs)
+        self.asked = []
+
+    def day_maxima(self, day):
+        self.asked.append(day)
+        return self._maxima
+
+
+def test_false_dead_settles_as_a_loss_against_the_resolvers_table():
+    """Regression for 2026-09-20, Singapore: our METAR peaked at 32, NOAA's
+    table never ingested those readings and topped out at 31, and the market
+    resolved YES on 31. Paper used to settle against OUR max, so the NO on 31 —
+    a real -$191 — was booked as a +$308 win."""
+
+    from datetime import date
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    resolver = _ResolverWithDayMax(ours=32, theirs=31)
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(31, asks=[(0.38, 100)])]))
+    assert ex.positions[("paris", 31)].shares == 100
+
+    day = date(2026, 9, 20)
+    worker.roll_day(ended_day=day)
+
+    assert resolver.asked == [day]                 # the ENDED day, not today
+    assert ex.positions[("paris", 31)].shares == 0
+    assert risk.realized_pnl == pytest.approx(0.0 * 100 - 38.0)   # NO paid $0
+    assert any("FALSE DEAD" in n and "31C" in n for n in rep.progress_lines)
+
+
+def test_dead_path_position_still_wins_when_the_resolver_agrees():
+    from datetime import date
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    resolver = _ResolverWithDayMax(ours=32, theirs=32)
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(31, asks=[(0.95, 100)])]))
+    worker.roll_day(ended_day=date(2026, 9, 20))
+    assert risk.realized_pnl == pytest.approx(100 - 95.0)
+    assert not any("FALSE DEAD" in n for n in rep.progress_lines)
+
+
+def test_settlement_says_so_when_it_cannot_consult_the_resolver():
+    """No resolver rows for the day: settle against our own max, but LOUDLY —
+    a false dead there would not show up as a loss."""
+
+    from datetime import date
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    resolver = _ResolverWithDayMax(ours=None, theirs=None)
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(31, asks=[(0.95, 100)])]))
+    worker.roll_day(ended_day=date(2026, 9, 20))
+    assert any("against OUR max" in n for n in rep.progress_lines)

@@ -160,8 +160,14 @@ def test_roll_day_rearms_and_is_idempotent(config):
     assert r.roll_day("2026-06-09") is True
     assert r.halted is False and r.halt_reason is None
     assert r.is_city_blocked("paris") is False
-    assert r.total_exposure == 0.0 and r.realized_pnl == 0.0
-    # All caps free again after the EOD rollover.
+    assert r.realized_pnl == 0.0
+    # The re-arm does NOT free an open position's exposure: settlement happens
+    # at each city's own midnight, so a position can legitimately be open
+    # across this shared boundary and must keep counting against the caps.
+    assert r.total_exposure == pytest.approx(95.0)
+    # Settling it is what frees the caps.
+    r.record_settlement(city="paris", temp=22, shares=100, cost_basis=95.0)
+    assert r.total_exposure == 0.0
     assert r.per_bracket_cap_remaining("paris", 22) == config.max_shares_per_bracket
     assert r.per_city_cap_remaining("paris") == config.max_exposure_per_city / config.cap
     assert r.roll_day("2026-06-09") is False  # idempotent for the same day

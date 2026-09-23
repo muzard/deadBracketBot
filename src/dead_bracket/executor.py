@@ -430,8 +430,14 @@ class LiveExecutor:
         linger (mis-reporting open volume and prompting stray exit re-posts).
         ``final_max`` marks the winning bracket so the reported (informational)
         PnL and ``won`` flag are honest for forecast positions; the actual
-        redemption amount is decided on-chain either way. The shared risk caps
-        are reset by RiskManager.roll_day().
+        redemption amount is decided on-chain either way.
+
+        The position's exposure is released HERE. It used to be left for
+        ``RiskManager.roll_day`` to wipe at one shared midnight, which dropped
+        still-open positions in cities whose own day had not ended; settlement
+        now happens at each city's own midnight and releases exactly what it
+        settles. PnL is still NOT synthesised (``realise=False``) — redemption
+        is on-chain and the wallet is the equity source in live.
         """
 
         results: list[Settlement] = []
@@ -439,6 +445,9 @@ class LiveExecutor:
             if pos.shares > 0:
                 won = final_max is None or temp != final_max
                 payout = 1.0 if won else 0.0
+                self._risk.record_settlement(city=city, temp=temp, shares=pos.shares,
+                                             cost_basis=pos.cost_basis, payout=payout,
+                                             realise=False)
                 results.append(Settlement(city=city, temp=temp, shares=pos.shares,
                                           pnl=payout * pos.shares - pos.cost_basis,
                                           won=won))
