@@ -820,3 +820,96 @@ def test_recycle_alarm_can_be_disabled():
     t[0] = 10_000 * 60
     worker.process_book(make_snapshot("paris", [make_bracket(22)]))
     assert risk.city_halt_reason("paris") is None
+
+
+class _SwitchableResolver:
+    """A resolver stub whose verdict the test flips mid-scenario."""
+
+    def __init__(self):
+        from dead_bracket.resolver_guard import OK, Verdict
+        self.verdict = Verdict(state=OK, reason="ok", pairs=48, span_hours=23.5)
+
+    def evaluate(self, now=None):
+        return self.verdict
+
+    def confirms_max(self, running_max, now=None):
+        return True
+
+    def go_stale(self):
+        from dead_bracket.resolver_guard import UNVERIFIED, Verdict
+        self.verdict = Verdict(state=UNVERIFIED, reason="resolver rows stale (3.2h old)")
+
+
+def test_alarm_still_fires_after_the_resolver_goes_unverified():
+    """Regression for 2026-09-20, Singapore.
+
+    The bot bought 500 NO on a bracket that was not actually dead. Later that
+    day NOAA's rows for the station went stale, the guard turned UNVERIFIED, and
+    process_book started returning before the alarm check — so the one check
+    built for exactly this situation went silent with the position on the book.
+    """
+
+    from dataclasses import replace
+    t = [0.0]
+    cfg = replace(Config(), recycle_alarm_min=90.0)
+    risk = RiskManager(cfg)
+    rep = StubReporter()
+    resolver = _SwitchableResolver()
+    worker, ex, metar = build_worker(
+        config=cfg, risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 24/10 Q1018", monotonic=lambda: t[0])
+    metar.poll_once()
+
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    assert ex.positions[("paris", 22)].resting_sell == 100
+
+    resolver.go_stale()                 # entry gate now closes every tick
+    t[0] = 91 * 60
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+
+    assert risk.city_halt_reason("paris") == "unfilled recycle sell"
+    assert any("bracket 22" in n and "unfilled" in n for n in rep.progress_lines)
+
+
+def test_alarm_reports_even_when_the_city_was_already_halted():
+    """The report is the point: a city already paused for another reason (a
+    stale feed, say) must not swallow the warning about a held position."""
+
+    from dataclasses import replace
+    t = [0.0]
+    cfg = replace(Config(), recycle_alarm_min=90.0)
+    risk = RiskManager(cfg)
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=cfg, risk=risk, reporter=rep,
+        metar_raw="LFPB 031530Z 24/10 Q1018", monotonic=lambda: t[0])
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+
+    risk.halt_city("paris", "stale feed", recoverable=True)
+    t[0] = 91 * 60
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))  # once only
+
+    alarms = [n for n in rep.progress_lines if "unfilled" in n]
+    assert len(alarms) == 1 and "bracket 22" in alarms[0]
+
+
+def test_exits_are_reposted_while_entries_are_gated():
+    """A blocked city must still be able to get OUT: a lost exit is re-posted
+    even when the resolver has closed the entry gate."""
+
+    resolver = _SwitchableResolver()
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    pos = ex.positions[("paris", 22)]
+
+    resolver.go_stale()
+    pos.resting_sell = 0.0              # simulate the resting sell being lost
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert pos.resting_sell == pos.shares

@@ -122,6 +122,8 @@ class CityWorker:
         # (monotonic). A genuinely dead NO attracts a ~$1 bid; one that never
         # does is the signature of a false dead. See _check_recycle_alarm.
         self._resting_since: dict[int, float] = {}
+        # Brackets already reported by the alarm, so it speaks once per position.
+        self._alarmed: set[int] = set()
         # Seed the METAR-output dedup from the feed's log so a restart doesn't
         # re-announce a report already recorded (it appeared as an inflated
         # "+my" latency on every restart).
@@ -301,6 +303,20 @@ class CityWorker:
         else:
             self._order_ok_streak = 0
 
+        # 2b. Positions we already hold are maintained whatever the entry gates
+        #     below decide. Those gates exist to stop NEW buys; the exits and the
+        #     false-dead alarm protect money that is already committed, and the
+        #     situations that trip the gates (resolver unverified or divergent)
+        #     are exactly when a held position most needs watching. Running them
+        #     after the gates — as the first version did — meant that on
+        #     2026-09-20 Singapore's alarm stopped being checked the moment its
+        #     resolver rows went stale, with a 500-share false dead on the book.
+        #     Exit re-posting is skipped only while the venue itself is erroring.
+        if (not self._cfg.recycle_on_opportunity
+                and self._risk.city_halt_reason(self.city) != "repeated order errors"):
+            self._ensure_exits(snapshot)
+        self._check_recycle_alarm()
+
         # 3. No new entries while halted (globally or for this city).
         if self._risk.is_city_blocked(self.city):
             return
@@ -394,7 +410,9 @@ class CityWorker:
         else:
             self._ensure_exits(snapshot)
 
-        # 7. False-dead alarm: a recycle sell that never fills.
+        # 7. Re-run the alarm now that this tick's buys exist, so a fresh
+        #    position's clock starts at the buy rather than one tick later. It is
+        #    idempotent — the 2b call above covers ticks the gates cut short.
         self._check_recycle_alarm()
 
     def _check_resolver(self, rmax: Optional[int] = None) -> bool:
@@ -552,26 +570,30 @@ class CityWorker:
         for temp in list(self._resting_since):
             if temp not in live:
                 del self._resting_since[temp]  # filled or cancelled -> clock resets
+                self._alarmed.discard(temp)
         for temp in live:
             started = self._resting_since.setdefault(temp, now)
             waited = now - started
-            if waited < limit:
+            if waited < limit or temp in self._alarmed:
                 continue
-            if self._risk.halt_city(
-                self.city, "unfilled recycle sell",
-                recoverable=False,
-            ):
-                self._reporter.event(self.city, "recycle_unfilled",
-                                     temp=temp, minutes=round(waited / 60.0, 1))
-                self._reporter.notice(
-                    self.city,
-                    f"HALTED: the 99.9c sell on bracket {temp} has rested "
-                    f"{waited / 60.0:.0f} min unfilled. Nobody is bidding ~$1 "
-                    f"for a NO we believe is certain — check that this city's "
-                    f"running max really matches its resolver before trading it "
-                    f"again.",
-                )
-            return
+            # Halt (a no-op if the city is already halted for another reason)
+            # and report REGARDLESS of whether this call was the one that halted
+            # it: the report is the point. A city already paused for, say, a
+            # stale feed must not swallow the only warning that a held position
+            # looks like a false dead.
+            self._risk.halt_city(self.city, "unfilled recycle sell",
+                                 recoverable=False)
+            self._alarmed.add(temp)
+            self._reporter.event(self.city, "recycle_unfilled",
+                                 temp=temp, minutes=round(waited / 60.0, 1))
+            self._reporter.notice(
+                self.city,
+                f"HALTED: the 99.9c sell on bracket {temp} has rested "
+                f"{waited / 60.0:.0f} min unfilled. Nobody is bidding ~$1 "
+                f"for a NO we believe is certain — check that this city's "
+                f"running max really matches its resolver before trading it "
+                f"again.",
+            )
 
     def _cancel_exit_for(self, temp: int) -> None:
         """Retract the resting recycle sell for one bracket (revert to hold-$1)."""
