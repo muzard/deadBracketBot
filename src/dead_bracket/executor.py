@@ -31,6 +31,9 @@ class Settlement:
     shares: float
     pnl: float
     won: bool = True  # False iff this bracket WAS the day's high (NO paid $0)
+    # What the settled shares cost, so the actual market resolution can re-price
+    # them later (reconcile.py) without re-deriving it from a provisional PnL.
+    cost_basis: float = 0.0
 
 
 class Executor(Protocol):
@@ -38,7 +41,8 @@ class Executor(Protocol):
     def place_exit(self, intent: Intent) -> None: ...
     def cancel_exit(self, city: str, temp: int) -> None: ...
     def on_book(self, snapshot: MarketSnapshot) -> list[Fill]: ...
-    def settle(self, final_max: Optional[int] = None) -> list[Settlement]: ...
+    def settle(self, final_max: Optional[int] = None, *,
+               realise: bool = True) -> list[Settlement]: ...
 
 
 class PaperExecutor:
@@ -182,14 +186,19 @@ class PaperExecutor:
         return fills
 
     # -- settlement --------------------------------------------------------
-    def settle(self, final_max: Optional[int] = None) -> list[Settlement]:
+    def settle(self, final_max: Optional[int] = None, *,
+               realise: bool = True) -> list[Settlement]:
         """Settle all remaining open shares (spec §4, held to resolution).
 
-        ``final_max`` is the day's final running max (the winning bracket): a
-        held NO redeems at $1 for every bracket EXCEPT that one, whose NO pays
-        $0. Dead-path positions always sit below the final max, so only a
-        forecast entry (predicted kill that never confirmed) can hit the $0
-        leg. ``final_max=None`` (no METAR data all day) falls back to $1.
+        ``final_max`` is the winning bracket: a held NO redeems at $1 for every
+        bracket EXCEPT that one, whose NO pays $0. The caller passes the
+        resolver's max for the day, so a dead-path false dead lands on the $0
+        leg too. ``final_max=None`` falls back to $1.
+
+        ``realise=False`` frees the exposure but books no PnL. The worker uses
+        it when the market's ACTUAL resolution will book the result instead
+        (``reconcile.py``); ``pnl``/``won`` on the returned settlements are
+        then provisional.
         """
 
         results: list[Settlement] = []
@@ -202,11 +211,13 @@ class PaperExecutor:
             payout = 1.0 if won else 0.0
             pnl = payout * shares - cost
             self._risk.record_settlement(city=city, temp=temp, shares=shares,
-                                         cost_basis=cost, payout=payout)
+                                         cost_basis=cost, payout=payout,
+                                         realise=realise)
             pos.shares = 0.0
             pos.cost_basis = 0.0
             pos.resting_sell = 0.0
-            results.append(Settlement(city=city, temp=temp, shares=shares, pnl=pnl, won=won))
+            results.append(Settlement(city=city, temp=temp, shares=shares, pnl=pnl,
+                                      won=won, cost_basis=cost))
         return results
 
 
@@ -421,7 +432,8 @@ class LiveExecutor:
         except (TypeError, ValueError):
             return 0.0
 
-    def settle(self, final_max: Optional[int] = None) -> list[Settlement]:
+    def settle(self, final_max: Optional[int] = None, *,
+               realise: bool = False) -> list[Settlement]:
         """Day's end: the resolved market's positions redeem on-chain to USDC.
 
         Realised PnL is the venue/chain's job (not synthesised here), but the
@@ -447,10 +459,10 @@ class LiveExecutor:
                 payout = 1.0 if won else 0.0
                 self._risk.record_settlement(city=city, temp=temp, shares=pos.shares,
                                              cost_basis=pos.cost_basis, payout=payout,
-                                             realise=False)
+                                             realise=realise)
                 results.append(Settlement(city=city, temp=temp, shares=pos.shares,
                                           pnl=payout * pos.shares - pos.cost_basis,
-                                          won=won))
+                                          won=won, cost_basis=pos.cost_basis))
             pos.shares = 0.0
             pos.cost_basis = 0.0
             pos.resting_sell = 0.0
@@ -484,7 +496,8 @@ class DisabledExecutor:
     def on_book(self, snapshot: MarketSnapshot) -> list[Fill]:
         return []
 
-    def settle(self, final_max: Optional[int] = None) -> list[Settlement]:
+    def settle(self, final_max: Optional[int] = None, *,
+               realise: bool = True) -> list[Settlement]:
         return []
 
 

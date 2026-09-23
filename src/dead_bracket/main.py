@@ -26,6 +26,7 @@ from .feeds_http import (
     TwcResolverFetcher,
     build_feed_fetcher,
     make_hko_1min_fetch,
+    fetch_event_resolution,
     fetch_metar_history,
     make_metar_fetch,
     make_tgftp_fetch,
@@ -46,6 +47,7 @@ from .lfs_calibration import (
 )
 from .market import MarketFeed
 from .metar import MetarFeed
+from .reconcile import ReconcilerWorker, SettlementReconciler
 from .reporter import Reporter
 from .resolver_guard import (
     ResolverBlockStore,
@@ -575,6 +577,7 @@ def build_supervisor(
     balance=None,
     resolver_guards=None,
     resolver_blocks=None,
+    reconciler=None,
 ) -> Supervisor:
     selected = select_cities(config, city_ids)
     no_trade = set(no_trade_cities)
@@ -770,6 +773,7 @@ def build_supervisor(
                 balance=balance,
                 resolver=(resolver_guards or {}).get(city_cfg.id),
                 resolver_blocks=resolver_blocks,
+                reconciler=reconciler,
             )
         )
     return Supervisor(
@@ -1014,6 +1018,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     resolver_guards, resolver_workers, resolver_blocks = build_resolver_guards(
         config, reporter, risk, city_ids
     )
+    # Settlement reconciler: every settled position's PnL is booked from how
+    # the market ACTUALLY resolved, in paper and live alike (reconcile.py).
+    reconciler = reconcile_worker = None
+    if config.settlement_reconcile:
+        reconciler = SettlementReconciler(
+            path=os.path.join(config.data_dir, "_global", "pending_settlements.json"),
+            resolve=lambda slug, _s=_new_session(): fetch_event_resolution(slug, session=_s),
+            risk=risk,
+            reporter=reporter,
+            give_up_hours=config.settlement_give_up_hours,
+        )
+        reconcile_worker = ReconcilerWorker(
+            reconciler, reporter, poll_sec=config.settlement_reconcile_poll_sec)
+        if reconciler.pending:
+            reporter.progress(
+                f"RECONCILE  {len(reconciler.pending)} settlement(s) awaiting their "
+                f"market's resolution from a previous run")
     supervisor = build_supervisor(
         config,
         reporter,
@@ -1027,6 +1048,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         balance=balance,
         resolver_guards=resolver_guards,
         resolver_blocks=resolver_blocks,
+        reconciler=reconciler,
     )
     # LFS calibration collectors (Shenzhen): --calibrate or LFS_CALIBRATION=1.
     cal_workers = (
@@ -1083,6 +1105,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         w.start()
     for w in resolver_workers:
         w.start()
+    if reconcile_worker is not None:
+        reconcile_worker.start()
     try:
         supervisor.run_forever()
     except KeyboardInterrupt:
@@ -1094,6 +1118,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             w.stop()
         for w in resolver_workers:
             w.stop()
+        if reconcile_worker is not None:
+            reconcile_worker.stop()
     return 0
 
 

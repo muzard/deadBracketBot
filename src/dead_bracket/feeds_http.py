@@ -1164,6 +1164,56 @@ def fetch_metar_history(
     return parse_metar_history(payload, include_speci=include_speci)
 
 
+def resolved_bracket(event) -> Optional[int]:
+    """The bracket a daily-temperature event ACTUALLY resolved YES on. Pure.
+
+    Returns None until the event is fully and unambiguously resolved: every
+    market must carry ``umaResolutionStatus == "resolved"`` and exactly one must
+    pay YES at exactly 1. An open market can sit at 0.999 for hours on a bracket
+    that is all but certain — that is a price, not a resolution, and reading it
+    as one would re-create the mistake this exists to catch.
+    """
+
+    if not isinstance(event, dict):
+        return None
+    markets = event.get("markets") or []
+    if not markets:
+        return None
+    winners = []
+    for m in markets:
+        if not isinstance(m, dict) or m.get("umaResolutionStatus") != "resolved":
+            return None
+        try:
+            prices = m.get("outcomePrices")
+            prices = json.loads(prices) if isinstance(prices, str) else prices
+            yes = float(prices[0])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if yes == 1.0:
+            winners.append(m)
+    if len(winners) != 1:
+        return None
+    return parse_bracket_temp(winners[0])
+
+
+def fetch_event_resolution(
+    slug: str, *, session=None, timeout: float = 20.0
+) -> Optional[int]:  # pragma: no cover - network
+    """How the event ``slug`` actually resolved, or None if it has not yet."""
+
+    sess = session or (requests.Session() if requests else None)
+    if sess is None:
+        return None
+    try:
+        resp = sess.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        events = resp.json()
+    except Exception:
+        return None
+    return resolved_bracket(events[0]) if events else None
+
+
 def make_tgftp_fetch(
     *, user_agent: str = _DEFAULT_UA, timeout: float = 5.0, session=None
 ) -> Callable[[str], Optional[str]]:

@@ -475,6 +475,20 @@ class RiskManager:
         if realise:
             self._check_daily_loss()
 
+    def record_resolved_pnl(self, pnl: float) -> None:
+        """Book a settlement's PnL once the market has ACTUALLY resolved it.
+
+        The exposure was already released at the city's local midnight
+        (``record_settlement(..., realise=False)``); this is the result, taken
+        from the market's own resolution rather than our reconstruction of it
+        (see reconcile.py). Feeds the paper ledger and the daily-loss breaker in
+        both modes — so in live a false-dead loss now reaches the breaker.
+        """
+
+        with self._lock:
+            self._record_pnl(pnl)
+        self._check_daily_loss()
+
     # -- kill-switch / halts ----------------------------------------------
     # Only a portfolio-wide condition (daily-loss) trips the GLOBAL kill-switch.
     # City-specific problems (order errors, stale feed, crossed book, downward

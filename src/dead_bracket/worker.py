@@ -54,6 +54,7 @@ class CityWorker:
         balance=None,  # BalanceTracker (live) / PaperBalanceTracker; refreshed before buys
         resolver=None,  # ResolverCrossCheck: our source vs the resolver's table
         resolver_blocks=None,  # ResolverBlockStore: persists sticky divergence
+        reconciler=None,  # SettlementReconciler: books PnL from the ACTUAL resolution
         monotonic=time.monotonic,
         wall_clock=None,  # () -> aware UTC datetime; injectable for tests
     ) -> None:
@@ -84,6 +85,7 @@ class CityWorker:
         # 24 h (resolver_guard.py). ``_resolver_state`` remembers the last
         # verdict state so the notice prints on change, not every tick.
         self._resolver = resolver
+        self._reconciler = reconciler
         self._resolver_blocks = resolver_blocks
         self._resolver_state: Optional[str] = None
         self._wall = wall_clock or (lambda: datetime.now(timezone.utc))
@@ -131,6 +133,9 @@ class CityWorker:
         # Our running max per local trading day — the settlement fallback when
         # the resolver's table holds no rows for the day being settled.
         self._day_high: dict[date, int] = {}
+        # The market (event slug) each local trading day traded on, so a
+        # settlement can be checked against how THAT market actually resolved.
+        self._day_slug: dict[date, str] = {}
         # Seed the METAR-output dedup from the feed's log so a restart doesn't
         # re-announce a report already recorded (it appeared as an inflated
         # "+my" latency on every restart).
@@ -273,6 +278,10 @@ class CityWorker:
         today = self._metar.trading_day
         if today is not None and rmax is not None:
             self._day_high[today] = max(self._day_high.get(today, rmax), rmax)
+        if snapshot.event_slug:
+            # Keyed by the worker's own local date — the same function the
+            # supervisor uses to name the day it asks us to settle.
+            self._day_slug[self.local_date(self._wall())] = snapshot.event_slug
 
         # 0. Windowed price sampling (pure telemetry, runs even while halted): in a
         #    publication hot window, sparsely record the frontier NO prices so we
@@ -846,11 +855,20 @@ class CityWorker:
             ours_max = self._metar.running_max
         final_max = theirs_max if theirs_max is not None else ours_max
 
-        settlements = self._executor.settle(final_max)
+        # With a reconciler the result is booked later, from the market's ACTUAL
+        # resolution; here the caps are freed and the outcome is provisional.
+        reconciling = self._reconciler is not None
+        settlements = self._executor.settle(final_max, realise=not reconciling)
         total_pnl = 0.0
         for s in settlements:
-            self._reporter.settlement(s.city, temp=s.temp, shares=s.shares, pnl=s.pnl,
-                                      won=s.won)
+            if reconciling:
+                self._reconciler.enqueue(
+                    city=s.city, day=str(day), slug=self._day_slug.get(day),
+                    temp=s.temp, shares=s.shares, cost_basis=s.cost_basis,
+                    provisional_payout=1.0 if s.won else 0.0)
+            else:
+                self._reporter.settlement(s.city, temp=s.temp, shares=s.shares,
+                                          pnl=s.pnl, won=s.won)
             total_pnl += s.pnl
             if s.won:
                 continue
@@ -890,14 +908,19 @@ class CityWorker:
                 f"({final_max}C): the resolver holds no rows for {day}, so a "
                 f"false dead here would not show as a loss")
         if day is not None:
-            for d in [d for d in self._day_high if d <= day]:
-                del self._day_high[d]
+            for store in (self._day_high, self._day_slug):
+                for d in [d for d in store if d <= day]:
+                    del store[d]
         if self._forecast is not None:
             self._forecast.roll_day()
         self._reporter.event(self.city, "day_rollover", settled=len(settlements),
                              pnl=total_pnl, day=str(day), final_max=final_max,
                              resolver_max=theirs_max)
-        self._reporter.notice(self.city, f"new day: settled {len(settlements)} position(s), pnl {total_pnl:+.2f}")
+        self._reporter.notice(
+            self.city, f"new day: settled {len(settlements)} position(s), "
+                       f"{'provisional ' if reconciling else ''}pnl {total_pnl:+.2f}"
+                       + (" (awaiting the market's resolution)"
+                          if reconciling and settlements else ""))
 
     # -- progress ----------------------------------------------------------
     def open_volume(self) -> tuple[int, float, float]:

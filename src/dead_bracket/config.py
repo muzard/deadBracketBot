@@ -677,6 +677,14 @@ class Config:
     # behind a 5-minute CDN cache and a metered key, so polling it faster buys
     # nothing.
     resolver_hot_poll_sec: float = 60.0
+    # Book every settled position's PnL from how the market ACTUALLY resolved
+    # (reconcile.py) instead of our reconstruction at local midnight. Paper and
+    # live alike, so the ledger and the daily-loss breaker see the real outcome.
+    settlement_reconcile: bool = True
+    settlement_reconcile_poll_sec: float = 600.0  # resolution takes hours
+    # Polymarket resolves by 11:59 PM ET the day after; past this a settlement is
+    # booked at its provisional outcome and flagged.
+    settlement_give_up_hours: float = 48.0
     # Daily rollover: re-arm risk and settle positions at this tz's midnight so
     # the bot runs unattended across days. daily_rearm=False disables it.
     rollover_tz: str = "UTC"
@@ -808,6 +816,9 @@ class Config:
             "resolver_poll_sec": float,
             "resolver_confirm_dead": _as_bool,
             "resolver_hot_poll_sec": float,
+            "settlement_reconcile": _as_bool,
+            "settlement_reconcile_poll_sec": float,
+            "settlement_give_up_hours": float,
             "rollover_tz": str,
         }
         for name, cast in casters.items():
