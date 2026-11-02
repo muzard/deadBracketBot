@@ -15,16 +15,16 @@ This is *capture-if-it-appears*: sub-98¢ dead-NO asks are expected to be rare, 
 the system sits idle cheaply, acts fast when one appears, and logs every
 opportunity. **Default mode is paper** — no live orders until explicitly enabled.
 
-> ⚠️ **Empirical status (see [FINDINGS.md](FINDINGS.md)):** across every day
-> measured, dead brackets are already priced to ~$0.997–0.999 by the time our
-> resolution METAR confirms them, because the market leads the resolution feed by
-> minutes (via the 6-min feed / nowcasting). The sub-98¢ capture window the
-> strategy assumes has **not** appeared. The bot is correct and safe, but the
-> *edge as specified does not exist on the data so far.* Read FINDINGS.md before
-> assuming this makes money.
+> **Empirical status ([STRATEGY.md](STRATEGY.md)).**
+> - Across **7,014 bracket deaths in 35 cities**, the dead bracket's NO was already priced at about 0.999 the moment our source confirmed it.
+> - In source-verified cities only **2 of 1,913** quoted deaths were liftable.
+> - Nearly every apparent edge was a **resolution-source mismatch**: of the 43 liftable deaths with real depth, 41 were Shenzhen and 1 was Seoul (the other was Moscow). In those cases the market was right and our source was wrong.
+> - That mismatch emptied the wallet once in live trading (Seoul, 2026-07-19). The bot now trades a city only after **24 h of exact agreement** with the market's own resolution table, and fails closed otherwise. Live trading is locked ([LIVE.md](LIVE.md)).
+> - Since 2026-09-23 a bracket also counts as dead only once the resolver's own table has reached our running max, and settlements are booked from how the market actually resolved, because NOAA's table missed readings on 2026-09-20 and a Singapore position that lost $191.48 against the real resolution had been booked as +$308.52 ([outage notes](docs/noaa_ingest_outage_2026-09-20.md)).
+> - These measurements predate Polymarket's 2026-09-12 move from Weather Underground to NOAA ([migration notes](docs/resolution_source_migration_2026-09-14.md)); re-measuring them is still listed as to do there (§8).
 
-**Cities (concurrent):** Paris, London, Moscow, Milan, Madrid, Ankara, Istanbul,
-Helsinki, Amsterdam, Warsaw, Munich. Each has its own resolution station and IANA timezone;
+**Cities (concurrent):** 35 cities (see `DEFAULT_CITIES` in `src/dead_bracket/config.py`).
+Each has its own resolution station and IANA timezone;
 the running max **resets at the city's local midnight**, and a reading from one
 station can never fold into another city (hard ICAO isolation). All station/tz
 pairs are confirmed against the live markets — see [LIVE.md](LIVE.md).
