@@ -25,3 +25,7 @@ data/
 soak.log
 soak*.log
 soak*.log.*
+
+# Local machine / editor-agent files
+.DS_Store
+.claude/settings.local.json
