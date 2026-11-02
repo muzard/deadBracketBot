@@ -1,3 +1,5 @@
+> Superseded by [STRATEGY.md](STRATEGY.md) (2026-09-14); kept as the historical record.
+
 # Findings — does the dead-bracket edge exist?
 
 Updated **2026-06-29**. Short answer: **yes, but only in thin / less-efficient
