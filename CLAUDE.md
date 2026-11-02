@@ -234,7 +234,7 @@ Coverage gate (CI): ≥90% line on strategy/risk/executor/forecast/forecast_feed
   Shenzhen stays `no_trade` until the calibration acceptance gates AND the
   re-enable plan's shadow gates (L1 closed-row stability, end-of-day
   running-max-vs-WU-High agreement) pass — a human decision, see
-  `shenzhen_calibration_requirements.md` and
+  `docs/shenzhen_calibration_requirements.md` and
   `data/shenzhen_reenable_plan_2026-07-08.md`.
 - **Forecast live orders are human-gated.** `--forecast` alone trades only in
   paper; in live mode it logs signals. Real forecast orders require the
