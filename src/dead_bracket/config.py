@@ -382,7 +382,26 @@ RESOLVER_LOCATIONS: dict[str, Optional[str]] = {
 
 # The cities whose METAR does NOT track the resolver (see the measurements
 # above): their running max is read from the resolver's own closed rows instead.
-RESOLVER_SOURCED_CITIES: frozenset[str] = frozenset({"seoul", "shenzhen"})
+# Cities whose own METAR provably does NOT track the resolver, and which
+# therefore read their running max from the resolver's own rows instead.
+#
+# 2026-09-14, after the NOAA migration, this set inverted. Re-measured against
+# the resolver the market now actually names:
+#   seoul     RKSI  64/64  100.0%  -> METAR is the resolver; moved back.
+#   shenzhen  ZGSZ  32/32  100.0%  -> METAR is the resolver; moved back. Both
+#             failures were Weather Underground artifacts (WU's RKSI row; WU
+#             resolving "Shenzhen" off HKO Lau Fau Shan). On every one of the
+#             25 Shenzhen WU mismatches, NOAA agrees with US.
+#   lucknow   VILK  629/633 99.4% -> genuinely divergent, and NOAA agrees with
+#             WU against us on all four; twice ours was the HIGHER value, which
+#             is the direction that manufactures a false dead. Stays
+#             resolver-sourced, now off NOAA's rows rather than WU's.
+#
+# Reading the resolver's rows used to cost the whole speed edge (WU published
+# 26-564 min late). NOAA does not lag: measured 2026-09-14 its newest
+# observation is the SAME observation our METAR has, for every city. So this is
+# now close to free.
+RESOLVER_SOURCED_CITIES: frozenset[str] = frozenset({"lucknow"})
 
 # Cities still cross-checked against the legacy Weather Underground table.
 # Taipei is the only market that did NOT migrate to NOAA on 2026-09-12, and it
@@ -441,15 +460,32 @@ class Config:
     # bankroll-limited, not liquidity-limited, so 1.0 deploys the available edge.
     max_frac_of_depth: float = 1.0
     max_daily_loss: float = 50.0
-    # Capital recycling policy. A dead NO is certain to pay $1, so resting a
-    # 99.9c maker sell only pays off when the 0.1c given up frees capital for a
-    # NEW <=CAP opportunity worth more. When True (default), the bot HOLDS every
-    # dead NO to $1 and posts a recycle sell only when a would-be buy this tick
-    # was blocked purely by the bankroll caps (strategy.last_blocked_value > 0),
-    # sized to cover just that shortfall; when the block clears the unfilled
-    # recycle sells are cancelled (revert to hold). False restores the old
-    # always-rest-after-every-buy behaviour.
-    recycle_on_opportunity: bool = True
+    # Capital recycling policy. When False (the default since 2026-09-14) every
+    # buy is immediately backed by a resting 99.9c maker sell. When True the bot
+    # instead HOLDS each dead NO to $1 and posts a recycle sell only when a
+    # would-be buy this tick was blocked purely by the bankroll caps
+    # (strategy.last_blocked_value > 0), sized to cover just that shortfall,
+    # cancelling it when the block clears.
+    #
+    # Holding looks free — a dead NO "certainly" pays $1, so why give up 0.1c?
+    # The trade history says otherwise. Across the whole project every dollar
+    # ever REALISED came from a 99.9c maker fill (9 of 9 filled, 0.7-234 min,
+    # median ~30 min), and every dollar ever lost came from a position held to
+    # settlement in a city whose source turned out not to be the resolver's.
+    # Resting the sell buys three things for 0.1c: it converts an uncertain
+    # settlement claim into cash, it frees capital while the opportunity is
+    # still open (we are bankroll-limited, not liquidity-limited, whenever an
+    # opportunity does appear), and a sell that does NOT fill is a free
+    # false-dead alarm — nobody bids ~$1 for a NO that is not actually certain.
+    # See STRATEGY.md section 2, and recycle_alarm_min below for the alarm.
+    recycle_on_opportunity: bool = False
+    # Minutes a 99.9c recycle sell may rest unfilled before the city is halted
+    # and a human paged. A genuinely dead NO attracts a ~$1 bid; one that never
+    # does is the signature of a false dead, which is the failure that emptied
+    # the wallet on 2026-07-19. Measured fill times were 0.7-234 min with a
+    # ~30 min median, so this is deliberately well past the tail rather than at
+    # it. 0 disables the alarm.
+    recycle_alarm_min: float = 240.0
     # Live wallet-balance polling cadence (seconds). The balance tracker reads
     # the real USDC balance fast while a buy is being attempted, and cools the
     # cadence (doubling up to slow) once ``balance_poll_cool_after`` consecutive
@@ -480,6 +516,12 @@ class Config:
     # to catch off-cycle SPECI reports (which publish at irregular times) within
     # ~a minute, while the shared fetcher only hits the network once per cycle.
     metar_poll_sec: float = 60.0
+    # How often the SHARED discovery fetch re-reads the open daily-temperature
+    # events. All cities read the same cached answer, so this is one request per
+    # interval for the whole process rather than one per city. Discovery only
+    # needs to notice a new day's market appearing, so it can be slow; the old
+    # per-city paging is what earned HTTP 429s on startup.
+    discovery_poll_sec: float = 120.0
     # Aggressive cadence inside a "hot window" — from a :00/:30 slot until that
     # slot's report actually lands (empirically 100-400s later) — to grab a new
     # high (and the brief opportunity it opens) as fast as the API allows.
@@ -608,13 +650,41 @@ class Config:
     resolver_recent_minutes: int = 2880
     resolver_tolerance_c: int = 0  # exact agreement; 1 would have allowed Seoul
     resolver_poll_sec: float = 600.0  # table poll cadence (5-min CDN cache)
-    # Strict mode: additionally require the resolver's OWN table to have reached
-    # the running max before any bracket below it counts as dead. Closes the
-    # residual window the 24 h check cannot cover (the resolver publishes 25-65
-    # min late, so the newest print has nothing to disagree with yet) — at the
-    # cost of the speed edge the whole strategy is built on. Off by default;
-    # turn it on in paper to measure the trade-off.
-    resolver_confirm_dead: bool = False
+    # Require the resolver's OWN table to have reached our running max before
+    # any bracket counts as dead. ON by default since 2026-09-23.
+    #
+    # The 24h pairing check compares observations both sides hold, so it is
+    # blind to a reading the resolver simply never ingests — there is nothing
+    # to pair. NOAA does drop readings, several stations at a time: on
+    # 2026-09-20 it never ingested the peak hours of Singapore, Beijing,
+    # Guangzhou, Qingdao and Manila, and every one of those markets resolved on
+    # NOAA's lower value; on 09-22 it missed 10:50Z and 11:20Z at Ankara,
+    # London and Munich. We traded Singapore (a real -$191) and all three
+    # European cities on readings NOAA's table does not contain; the European
+    # ones paid only because the next reading happened to go higher. A missing
+    # reading can only ever LOWER the resolver's max — the one direction that
+    # manufactures a false dead — so the METAR is not a safe proxy for it.
+    #
+    # The cost is the time for the resolver to catch up to a new high, during
+    # which the fresh frontier bracket cannot be bought. Under WU that was the
+    # whole edge (26-564 min lag); NOAA publishes the same observations
+    # promptly, and resolver_hot_poll_sec notices the catch-up quickly. Every
+    # confirmation is logged as `resolver_max_confirmed` with the wait, so the
+    # real cost is measured rather than assumed.
+    resolver_confirm_dead: bool = True
+    # Resolver poll cadence while our running max is ahead of its table (see
+    # above). Only applied to NOAA/Synoptic-backed cities: the TWC table sits
+    # behind a 5-minute CDN cache and a metered key, so polling it faster buys
+    # nothing.
+    resolver_hot_poll_sec: float = 60.0
+    # Book every settled position's PnL from how the market ACTUALLY resolved
+    # (reconcile.py) instead of our reconstruction at local midnight. Paper and
+    # live alike, so the ledger and the daily-loss breaker see the real outcome.
+    settlement_reconcile: bool = True
+    settlement_reconcile_poll_sec: float = 600.0  # resolution takes hours
+    # Polymarket resolves by 11:59 PM ET the day after; past this a settlement is
+    # booked at its provisional outcome and flagged.
+    settlement_give_up_hours: float = 48.0
     # Daily rollover: re-arm risk and settle positions at this tz's midnight so
     # the bot runs unattended across days. daily_rearm=False disables it.
     rollover_tz: str = "UTC"
@@ -684,6 +754,7 @@ class Config:
             "max_frac_of_depth": float,
             "max_daily_loss": float,
             "recycle_on_opportunity": _as_bool,
+            "recycle_alarm_min": float,
             "balance_poll_fast_sec": float,
             "balance_poll_slow_sec": float,
             "balance_poll_cool_after": int,
@@ -694,6 +765,7 @@ class Config:
             "crossed_book_recover_ticks": int,
             "data_dir": str,
             "metar_poll_sec": float,
+            "discovery_poll_sec": float,
             "metar_hot_poll_sec": float,
             "metar_expected_gap_min": float,
             "market_poll_sec": float,
@@ -743,6 +815,10 @@ class Config:
             "resolver_tolerance_c": int,
             "resolver_poll_sec": float,
             "resolver_confirm_dead": _as_bool,
+            "resolver_hot_poll_sec": float,
+            "settlement_reconcile": _as_bool,
+            "settlement_reconcile_poll_sec": float,
+            "settlement_give_up_hours": float,
             "rollover_tz": str,
         }
         for name, cast in casters.items():

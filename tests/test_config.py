@@ -78,15 +78,20 @@ def test_from_env_overrides():
 
 def test_recycle_and_balance_defaults_and_env():
     c = Config()
-    assert c.recycle_on_opportunity is True  # hold-to-$1 gated recycling by default
+    # Always-rest is the default: the 0.1c given up buys realisation, capital
+    # recycling, and a false-dead alarm (STRATEGY.md section 2).
+    assert c.recycle_on_opportunity is False
+    assert c.recycle_alarm_min == 240.0
     assert c.balance_poll_fast_sec == 2.0
     assert c.balance_poll_slow_sec == 60.0
     assert c.balance_poll_cool_after == 3
-    over = Config.from_env({"RECYCLE_ON_OPPORTUNITY": "false",
+    over = Config.from_env({"RECYCLE_ON_OPPORTUNITY": "true",
+                            "RECYCLE_ALARM_MIN": "45",
                             "BALANCE_POLL_FAST_SEC": "1.5",
                             "BALANCE_POLL_SLOW_SEC": "90",
                             "BALANCE_POLL_COOL_AFTER": "5"})
-    assert over.recycle_on_opportunity is False
+    assert over.recycle_on_opportunity is True
+    assert over.recycle_alarm_min == 45.0
     assert over.balance_poll_fast_sec == 1.5
     assert over.balance_poll_slow_sec == 90.0
     assert over.balance_poll_cool_after == 5
@@ -144,13 +149,72 @@ def test_resolver_locations_cover_every_city_except_istanbul():
 
 
 def test_only_the_measured_cities_read_from_the_resolver_table():
-    # The METAR agreed with the resolver 100% on 31 of 34 cities, so only the
-    # two that provably diverge give up the speed edge.
+    # Re-measured 2026-09-14 against the resolver the market now names (NOAA):
+    # seoul 64/64 and shenzhen 32/32 agree, so their METAR IS the resolver and
+    # they no longer give up the speed edge. lucknow still diverges (629/633,
+    # and NOAA sides with WU against us on all four), so it reads the table.
     from dead_bracket.config import Config
 
     sourced = {c.id for c in Config().cities if c.resolution_source == "resolver"}
-    assert sourced == {"seoul", "shenzhen"}
+    assert sourced == {"lucknow"}
     for c in Config().cities:
         assert c.resolution_source in ("metar", "resolver")
         if c.resolution_source == "resolver":
-            assert c.resolver_location, f"{c.id} needs a table to read"
+            # Either provider gives it a table: synoptic is keyed by the ICAO,
+            # twc by the WU location id.
+            assert (c.metar_icao if c.resolver_provider == "synoptic"
+                    else c.resolver_location), f"{c.id} needs a table to read"
+
+
+def test_every_city_has_a_usable_resolver_provider():
+    # "Every tracker works" means no city is structurally unable to verify.
+    from dead_bracket.config import Config
+
+    for c in Config().cities:
+        assert c.resolver_provider in ("synoptic", "twc")
+        if c.resolver_provider == "synoptic":
+            assert c.metar_icao, f"{c.id} has no station to key NOAA by"
+        else:
+            assert c.resolver_location, f"{c.id} has no WU table"
+
+
+def test_taipei_is_the_only_city_left_on_weather_underground():
+    # Synoptic carries only RCSS's SPECIs (6 obs/48h vs our 90), so Taipei could
+    # not migrate with the others. If that ever changes, this test should fail
+    # and the city should move.
+    from dead_bracket.config import Config
+
+    twc = {c.id for c in Config().cities if c.resolver_provider == "twc"}
+    assert twc == {"taipei"}
+
+
+def test_a_paper_balance_clamps_the_default_static_caps():
+    """Regression: `--balance 100` was discarded unless bankroll_pct > 0.
+
+    main() only resolved the balance for percentage sizing or the forecast path,
+    so the DEFAULT config ran on the unclamped static caps ($500/city, $1000
+    total) and the 2026-09-14..23 soak filled $190-490 per bracket on a "$100"
+    account — including a single $189 false-dead position. With the balance
+    known, one bracket is held to max_bracket_pct of equity and everything to
+    the capital that actually exists.
+    """
+
+    from dead_bracket.main import resolve_initial_balance
+    from dead_bracket.risk import RiskManager
+
+    cfg = Config()                       # default: bankroll_pct == 0
+    assert cfg.bankroll_pct == 0.0
+    balance = resolve_initial_balance(cfg, 100.0)
+    risk = RiskManager(cfg, initial_balance=balance)
+
+    # Caps are expressed at the CAP price ceiling, so 25% of $100 is 25/0.98.
+    per_bracket = risk.per_bracket_cap_remaining("singapore", 31)
+    assert per_bracket <= 100.0 * cfg.max_bracket_pct / 100.0 / cfg.cap + 1e-9
+    deployed = 100.0 * cfg.max_deployed_pct / 100.0 / cfg.cap
+    assert risk.per_city_cap_remaining("singapore") <= deployed + 1e-9
+    assert risk.total_cap_remaining() <= deployed + 1e-9
+
+    # Without a balance the static caps are all there is (the old behaviour
+    # every paper run silently fell back to).
+    unclamped = RiskManager(cfg, initial_balance=0.0)
+    assert unclamped.total_cap_remaining() > 100.0

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -54,6 +54,7 @@ class CityWorker:
         balance=None,  # BalanceTracker (live) / PaperBalanceTracker; refreshed before buys
         resolver=None,  # ResolverCrossCheck: our source vs the resolver's table
         resolver_blocks=None,  # ResolverBlockStore: persists sticky divergence
+        reconciler=None,  # SettlementReconciler: books PnL from the ACTUAL resolution
         monotonic=time.monotonic,
         wall_clock=None,  # () -> aware UTC datetime; injectable for tests
     ) -> None:
@@ -84,6 +85,7 @@ class CityWorker:
         # 24 h (resolver_guard.py). ``_resolver_state`` remembers the last
         # verdict state so the notice prints on change, not every tick.
         self._resolver = resolver
+        self._reconciler = reconciler
         self._resolver_blocks = resolver_blocks
         self._resolver_state: Optional[str] = None
         self._wall = wall_clock or (lambda: datetime.now(timezone.utc))
@@ -118,6 +120,22 @@ class CityWorker:
         self._last_price_sample: Optional[float] = None
         # Peak $ of liftable dead-NO blocked by the bankroll caps today.
         self._capped_peak = 0.0
+        # When each bracket's 99.9c recycle sell first started resting unfilled
+        # (monotonic). A genuinely dead NO attracts a ~$1 bid; one that never
+        # does is the signature of a false dead. See _check_recycle_alarm.
+        self._resting_since: dict[int, float] = {}
+        # Brackets already reported by the alarm, so it speaks once per position.
+        self._alarmed: set[int] = set()
+        # When our running max first got ahead of the resolver's table (monotonic);
+        # None while they agree. Drives change-only events and the confirmation
+        # latency measurement under resolver_confirm_dead.
+        self._unconfirmed_since: Optional[float] = None
+        # Our running max per local trading day — the settlement fallback when
+        # the resolver's table holds no rows for the day being settled.
+        self._day_high: dict[date, int] = {}
+        # The market (event slug) each local trading day traded on, so a
+        # settlement can be checked against how THAT market actually resolved.
+        self._day_slug: dict[date, str] = {}
         # Seed the METAR-output dedup from the feed's log so a restart doesn't
         # re-announce a report already recorded (it appeared as an inflated
         # "+my" latency on every restart).
@@ -257,6 +275,13 @@ class CityWorker:
         self._market_available = True
 
         rmax = self._metar.running_max
+        today = self._metar.trading_day
+        if today is not None and rmax is not None:
+            self._day_high[today] = max(self._day_high.get(today, rmax), rmax)
+        if snapshot.event_slug:
+            # Keyed by the worker's own local date — the same function the
+            # supervisor uses to name the day it asks us to settle.
+            self._day_slug[self.local_date(self._wall())] = snapshot.event_slug
 
         # 0. Windowed price sampling (pure telemetry, runs even while halted): in a
         #    publication hot window, sparsely record the frontier NO prices so we
@@ -296,6 +321,20 @@ class CityWorker:
                 self._order_ok_streak = 0
         else:
             self._order_ok_streak = 0
+
+        # 2b. Positions we already hold are maintained whatever the entry gates
+        #     below decide. Those gates exist to stop NEW buys; the exits and the
+        #     false-dead alarm protect money that is already committed, and the
+        #     situations that trip the gates (resolver unverified or divergent)
+        #     are exactly when a held position most needs watching. Running them
+        #     after the gates — as the first version did — meant that on
+        #     2026-09-20 Singapore's alarm stopped being checked the moment its
+        #     resolver rows went stale, with a 500-share false dead on the book.
+        #     Exit re-posting is skipped only while the venue itself is erroring.
+        if (not self._cfg.recycle_on_opportunity
+                and self._risk.city_halt_reason(self.city) != "repeated order errors"):
+            self._ensure_exits(snapshot)
+        self._check_recycle_alarm()
 
         # 3. No new entries while halted (globally or for this city).
         if self._risk.is_city_blocked(self.city):
@@ -380,14 +419,20 @@ class CityWorker:
                 # defer to step 6 and are held to $1 unless capital is blocked.
                 self._place_exit_for(fill.temp, fill.size, bracket)
 
-        # 6. Capital recycling. Default (opportunity-gated): hold every dead NO to
-        #    $1 and post recycle sells only to cover a bankroll-blocked buy this
-        #    tick, cancelling them when the block clears. Legacy: guarantee every
-        #    held share rests (spec §4 as originally written).
+        # 6. Capital recycling. Default: guarantee every held share rests at
+        #    99.9c (spec §4 as originally written). Opportunity-gated (opt-in):
+        #    hold every dead NO to $1 and post recycle sells only to cover a
+        #    bankroll-blocked buy this tick, cancelling them when the block
+        #    clears.
         if self._cfg.recycle_on_opportunity:
             self._maintain_recycle_sells(snapshot, frozenset(acted), blocked_this_tick)
         else:
             self._ensure_exits(snapshot)
+
+        # 7. Re-run the alarm now that this tick's buys exist, so a fresh
+        #    position's clock starts at the buy rather than one tick later. It is
+        #    idempotent — the 2b call above covers ticks the gates cut short.
+        self._check_recycle_alarm()
 
     def _check_resolver(self, rmax: Optional[int] = None) -> bool:
         """Evaluate the resolver cross-check. Returns True if entries may proceed.
@@ -414,13 +459,27 @@ class CityWorker:
                     self.city,
                     f"resolver cross-check OK: {verdict.reason}"
                     + (f" (station {verdict.station})" if verdict.station else ""))
-            # Strict mode: also wait for the resolver's own table to reach the
-            # running max, closing the publish-lag window the 24h check leaves.
-            if (self._cfg.resolver_confirm_dead
-                    and not self._resolver.confirms_max(rmax)):
-                self._reporter.event(self.city, "resolver_max_unconfirmed",
-                                     running_max=rmax)
-                return False
+            # Confirmed-dead mode: a bracket is only dead once the RESOLVER's
+            # own table has reached our running max. The 24h pairing check
+            # cannot see a reading the resolver simply never ingested — it has
+            # nothing to pair — and that is precisely how Singapore 2026-09-20
+            # and three of the four European trades on 09-22 were made on
+            # readings NOAA's table does not contain.
+            if self._cfg.resolver_confirm_dead:
+                if not self._resolver.confirms_max(rmax):
+                    if self._unconfirmed_since is None:
+                        self._unconfirmed_since = self._mono()
+                        self._reporter.event(self.city, "resolver_max_unconfirmed",
+                                             running_max=rmax)
+                    return False
+                if self._unconfirmed_since is not None:
+                    # The measurement confirm-dead's cost depends on: how long
+                    # the resolver took to reach our max.
+                    waited = self._mono() - self._unconfirmed_since
+                    self._unconfirmed_since = None
+                    self._reporter.event(self.city, "resolver_max_confirmed",
+                                         running_max=rmax,
+                                         waited_sec=round(waited, 1))
             return True
 
         if verdict.sticky:
@@ -514,6 +573,60 @@ class CityWorker:
             if bracket is None:
                 continue  # bracket not in the current book; will retry next tick
             self._place_exit_for(pos.temp, uncovered, bracket)
+
+    def _check_recycle_alarm(self) -> None:
+        """Halt the city if a 99.9c recycle sell has rested unfilled too long.
+
+        This is the one independent check we have on a live position. Our own
+        reasoning says a dead bracket's NO is certain to pay $1 — but that
+        reasoning is exactly what fails when the running max came from the wrong
+        source, and it fails silently: the position simply settles to $0 hours
+        later. The market disagrees much sooner. A genuinely certain NO attracts
+        a ~$1 bid (9 of 9 historical recycle sells filled, 0.7-234 min, median
+        ~30); a false-dead NO never will, because it is not worth $1 and the
+        other side knows it.
+
+        So an unfilled sell is treated as evidence against our own deadness
+        call, not as a liquidity inconvenience. The halt stops new entries for
+        the day (not sticky — this is suspicion, not the proof that
+        resolver divergence provides) and the notice names the bracket so a
+        human can check the source before anything else is bought.
+        """
+
+        limit = float(self._cfg.recycle_alarm_min) * 60.0
+        if limit <= 0:
+            return
+        now = self._mono()
+        positions = getattr(self._executor, "positions", {})
+        live = {p.temp for p in positions.values()
+                if p.city == self.city and p.resting_sell > 0}
+        for temp in list(self._resting_since):
+            if temp not in live:
+                del self._resting_since[temp]  # filled or cancelled -> clock resets
+                self._alarmed.discard(temp)
+        for temp in live:
+            started = self._resting_since.setdefault(temp, now)
+            waited = now - started
+            if waited < limit or temp in self._alarmed:
+                continue
+            # Halt (a no-op if the city is already halted for another reason)
+            # and report REGARDLESS of whether this call was the one that halted
+            # it: the report is the point. A city already paused for, say, a
+            # stale feed must not swallow the only warning that a held position
+            # looks like a false dead.
+            self._risk.halt_city(self.city, "unfilled recycle sell",
+                                 recoverable=False)
+            self._alarmed.add(temp)
+            self._reporter.event(self.city, "recycle_unfilled",
+                                 temp=temp, minutes=round(waited / 60.0, 1))
+            self._reporter.notice(
+                self.city,
+                f"HALTED: the 99.9c sell on bracket {temp} has rested "
+                f"{waited / 60.0:.0f} min unfilled. Nobody is bidding ~$1 "
+                f"for a NO we believe is certain — check that this city's "
+                f"running max really matches its resolver before trading it "
+                f"again.",
+            )
 
     def _cancel_exit_for(self, temp: int) -> None:
         """Retract the resting recycle sell for one bracket (revert to hold-$1)."""
@@ -704,39 +817,110 @@ class CityWorker:
         if reason:
             self._reporter.halt(reason)
 
-    def roll_day(self) -> None:
-        """Settle yesterday's positions and log the daily rollover for this city.
+    def local_date(self, now: datetime) -> date:
+        """This city's calendar date at ``now`` — its settlement boundary."""
 
-        Called at the trading-day boundary so the bot runs unattended: open
-        dead-NO positions from the resolved day are settled and reported. The
-        day's final running max marks the WINNING bracket, whose NO pays $0 —
-        only reachable by a forecast entry whose predicted kill never confirmed
-        (dead-path positions always sit below the final max). Such a loss
-        pauses the forecast path globally (config.forecast_pause_on_loss): at
-        p-hat >= 0.97 it is a model/mapping bug until a human clears it. The
-        shared risk re-arm is done once by the supervisor.
+        tz = self._tz or timezone.utc
+        return now.astimezone(tz).date()
+
+    def roll_day(self, ended_day: Optional[date] = None) -> None:
+        """Settle the positions of the local day that just ended.
+
+        Called by the supervisor at THIS city's local midnight — not at a shared
+        UTC midnight. The market resolves each city on its own calendar day, so
+        that is the only boundary at which "the day's high" means anything. The
+        first version rolled every city at 00:00 UTC: a city east of UTC was
+        settled hours into its NEXT day against that morning's partial running
+        max, and a city west of UTC was settled before its own day had ended.
+
+        The winning bracket is taken from the RESOLVER's table for the ended day
+        — the table the market actually pays out on — falling back to our own
+        max only when the resolver holds no rows for that day, and saying so.
+        Settling against our own max (as the first version did) makes a false
+        dead unrepresentable: a dead-path NO always sits below our max, so on
+        paper it always paid $1. On 2026-09-20 that turned Singapore's 500-share
+        false dead, a real -$191, into a reported +$308.
+
+        ``ended_day=None`` settles the city's current trading day (unit tests,
+        and any caller without a boundary to hand).
         """
 
-        final_max = self._metar.running_max
-        settlements = self._executor.settle(final_max)
+        day = ended_day or self._metar.trading_day
+        ours_max = theirs_max = None
+        if day is not None and self._resolver is not None:
+            ours_max, theirs_max = self._resolver.day_maxima(day)
+        if ours_max is None and day is not None:
+            ours_max = self._day_high.get(day)
+        if ours_max is None:
+            ours_max = self._metar.running_max
+        final_max = theirs_max if theirs_max is not None else ours_max
+
+        # With a reconciler the result is booked later, from the market's ACTUAL
+        # resolution; here the caps are freed and the outcome is provisional.
+        reconciling = self._reconciler is not None
+        settlements = self._executor.settle(final_max, realise=not reconciling)
         total_pnl = 0.0
         for s in settlements:
-            self._reporter.settlement(s.city, temp=s.temp, shares=s.shares, pnl=s.pnl,
-                                      won=s.won)
+            if reconciling:
+                self._reconciler.enqueue(
+                    city=s.city, day=str(day), slug=self._day_slug.get(day),
+                    temp=s.temp, shares=s.shares, cost_basis=s.cost_basis,
+                    provisional_payout=1.0 if s.won else 0.0)
+            else:
+                self._reporter.settlement(s.city, temp=s.temp, shares=s.shares,
+                                          pnl=s.pnl, won=s.won)
             total_pnl += s.pnl
-            if not s.won and self._cfg.forecast_pause_on_loss:
+            if s.won:
+                continue
+            # A dead-path position is one we held because temp < OUR max. If it
+            # lost, the resolver's table did not reach our max — the failure that
+            # emptied the wallet on 2026-07-19. Otherwise it was a forecast entry
+            # whose predicted kill never confirmed.
+            false_dead = ours_max is not None and s.temp < ours_max
+            if false_dead:
+                self._reporter.event(self.city, "false_dead_settled", temp=s.temp,
+                                     ours_max=ours_max, resolver_max=theirs_max,
+                                     pnl=s.pnl, day=str(day))
+                self._reporter.notice(
+                    self.city,
+                    f"FALSE DEAD: bracket {s.temp}C settled as the day's high "
+                    f"(resolver max {theirs_max}C, ours {ours_max}C), "
+                    f"pnl {s.pnl:+.2f}. Our running max was ahead of the table "
+                    f"the market resolves on.")
+            if self._cfg.forecast_pause_on_loss:
+                # Fail closed on ANY settled loss: a resolver dropping readings
+                # threatens forecast entries exactly as it does dead-path ones.
+                cause = "false dead" if false_dead else "forecast miss"
                 if self._risk.pause_forecast(
-                        f"settled loss: {s.city} {s.temp}C was the daily high"):
+                        f"settled loss ({cause}): {s.city} {s.temp}C was the daily high"):
                     self._reporter.event(self.city, "forecast_paused",
                                          temp=s.temp, final_max=final_max,
-                                         pnl=s.pnl)
+                                         pnl=s.pnl, cause=cause)
                     self._reporter.notice(
-                        self.city, "FORECAST PAUSED: settled loss on "
+                        self.city, f"FORECAST PAUSED: settled loss ({cause}) on "
                         f"{s.temp}C (final max {final_max}) — restart to clear")
+        if settlements and theirs_max is None:
+            self._reporter.event(self.city, "settle_unverified", day=str(day),
+                                 final_max=final_max)
+            self._reporter.notice(
+                self.city,
+                f"settled {len(settlements)} position(s) against OUR max "
+                f"({final_max}C): the resolver holds no rows for {day}, so a "
+                f"false dead here would not show as a loss")
+        if day is not None:
+            for store in (self._day_high, self._day_slug):
+                for d in [d for d in store if d <= day]:
+                    del store[d]
         if self._forecast is not None:
             self._forecast.roll_day()
-        self._reporter.event(self.city, "day_rollover", settled=len(settlements), pnl=total_pnl)
-        self._reporter.notice(self.city, f"new day: settled {len(settlements)} position(s), pnl {total_pnl:+.2f}")
+        self._reporter.event(self.city, "day_rollover", settled=len(settlements),
+                             pnl=total_pnl, day=str(day), final_max=final_max,
+                             resolver_max=theirs_max)
+        self._reporter.notice(
+            self.city, f"new day: settled {len(settlements)} position(s), "
+                       f"{'provisional ' if reconciling else ''}pnl {total_pnl:+.2f}"
+                       + (" (awaiting the market's resolution)"
+                          if reconciling and settlements else ""))
 
     # -- progress ----------------------------------------------------------
     def open_volume(self) -> tuple[int, float, float]:

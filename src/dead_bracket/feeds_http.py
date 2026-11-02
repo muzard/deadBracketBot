@@ -66,6 +66,35 @@ AVIATIONWEATHER_URL = "https://aviationweather.gov/api/data/metar"
 # one; `hours` works and its extra rows are deduped by the caller. Six values at
 # a >=60 s floor means each cache entry has expired before it comes round again.
 AWC_HOURS_ROTATION = (2, 3, 4, 5, 6, 7)
+# ...but the batched endpoint caps a response at this many records, silently
+# (measured 2026-09-14: 35 stations at hours=7 returned exactly 400, and at
+# hours=12 and 24 still exactly 400). Today it truncates the OLDEST rows and
+# every station keeps its newest observation, so the running max is unaffected
+# — but 35 stations x 2 obs/h x 7 h lands exactly on the cap, so one more city
+# would start dropping whole stations, which is indistinguishable from a feed
+# hole. ``awc_hours_rotation`` keeps the rotation under the cap instead.
+AWC_MAX_BATCH_RECORDS = 400
+# Observations per station per hour to budget for. Routine cycles are half-hourly
+# at most; SPECI-heavy stations can exceed this, hence the safety margin below.
+AWC_OBS_PER_STATION_HOUR = 2
+
+
+def awc_hours_rotation(n_stations: int, *, margin: float = 0.75) -> tuple[int, ...]:
+    """Cache-bust rotation whose largest ``hours`` stays under the record cap.
+
+    Busting works by varying a LEGAL query parameter (the API 400s on unknown
+    ones), and ``hours`` is the only one available — but a bigger ``hours`` is
+    also more records, and the response is capped. Scale the ceiling with the
+    station count so adding cities can never silently starve some of them.
+    Always returns at least ``(2, 3)`` so busting still has distinct cache keys.
+    """
+
+    if n_stations <= 0:
+        return AWC_HOURS_ROTATION
+    budget = AWC_MAX_BATCH_RECORDS * margin
+    ceiling = int(budget // (n_stations * AWC_OBS_PER_STATION_HOUR))
+    ceiling = max(3, min(ceiling, AWC_HOURS_ROTATION[-1]))
+    return tuple(h for h in AWC_HOURS_ROTATION if h <= ceiling) or (2, 3)
 TAF_URL = "https://aviationweather.gov/api/data/taf"
 TGFTP_URL = "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{icao}.TXT"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
@@ -650,6 +679,7 @@ class TwcResolverFetcher:
         ttl: float = 30.0,
         stale_sec: float = 5400.0,
         backfill_hours: float = 26.0,
+        settle_sec: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
         utc_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
@@ -659,6 +689,13 @@ class TwcResolverFetcher:
         self._ttl = ttl
         self._stale_sec = stale_sec
         self._backfill_sec = backfill_hours * 3600.0
+        # How long a row must have existed before it may feed a running max.
+        # TWC publishes a REVISING hourly aggregate, so its current-hour row has
+        # to close first (3600) — the 2026-07-08 near-miss was an intra-hour
+        # value that later vanished. NOAA/Synoptic rows are observations, not an
+        # aggregate: nothing revises, so 0 is correct there and waiting an hour
+        # would throw away exactly the window worth trading.
+        self._settle_sec = float(settle_sec)
         self._clock = clock
         self._utc = utc_clock
         self._lock = threading.Lock()
@@ -737,7 +774,8 @@ class TwcResolverFetcher:
                 or (now_utc - self._last_activity).total_seconds() > self._stale_sec
             ):
                 return None  # poller dead / key dead -> let the feed stale-halt
-            closed = [vt for vt in self._rows if vt + 3600 <= now_utc.timestamp()]
+            closed = [vt for vt in self._rows
+                      if vt + self._settle_sec <= now_utc.timestamp()]
             if not closed:
                 return None
             pending = sorted(
@@ -1126,6 +1164,56 @@ def fetch_metar_history(
     return parse_metar_history(payload, include_speci=include_speci)
 
 
+def resolved_bracket(event) -> Optional[int]:
+    """The bracket a daily-temperature event ACTUALLY resolved YES on. Pure.
+
+    Returns None until the event is fully and unambiguously resolved: every
+    market must carry ``umaResolutionStatus == "resolved"`` and exactly one must
+    pay YES at exactly 1. An open market can sit at 0.999 for hours on a bracket
+    that is all but certain — that is a price, not a resolution, and reading it
+    as one would re-create the mistake this exists to catch.
+    """
+
+    if not isinstance(event, dict):
+        return None
+    markets = event.get("markets") or []
+    if not markets:
+        return None
+    winners = []
+    for m in markets:
+        if not isinstance(m, dict) or m.get("umaResolutionStatus") != "resolved":
+            return None
+        try:
+            prices = m.get("outcomePrices")
+            prices = json.loads(prices) if isinstance(prices, str) else prices
+            yes = float(prices[0])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if yes == 1.0:
+            winners.append(m)
+    if len(winners) != 1:
+        return None
+    return parse_bracket_temp(winners[0])
+
+
+def fetch_event_resolution(
+    slug: str, *, session=None, timeout: float = 20.0
+) -> Optional[int]:  # pragma: no cover - network
+    """How the event ``slug`` actually resolved, or None if it has not yet."""
+
+    sess = session or (requests.Session() if requests else None)
+    if sess is None:
+        return None
+    try:
+        resp = sess.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        events = resp.json()
+    except Exception:
+        return None
+    return resolved_bracket(events[0]) if events else None
+
+
 def make_tgftp_fetch(
     *, user_agent: str = _DEFAULT_UA, timeout: float = 5.0, session=None
 ) -> Callable[[str], Optional[str]]:
@@ -1285,7 +1373,13 @@ class SharedMetarFetcher:
         self._last_success: Optional[float] = None
         self._last_attempt: Optional[float] = None
         self._station_last: dict[str, float] = {}
-        self._bust_i = 0  # rotates AWC_HOURS_ROTATION for hot-window cache-busting
+        self._bust_i = 0  # rotates the bust window for hot-window cache-busting
+        # Count of batches that came back at the endpoint's record cap — a
+        # health signal, surfaced by the supervisor's periodic report.
+        self.batches_capped = 0
+        # Sized to THIS fetcher's station count so the batch can never hit the
+        # endpoint's silent record cap (see awc_hours_rotation).
+        self._hours_rotation = awc_hours_rotation(len(self._icaos))
         self._lock = threading.Lock()
 
     def raw_for(self, icao: str, max_age: Optional[float] = None) -> Optional[str]:
@@ -1409,8 +1503,8 @@ class SharedMetarFetcher:
             # Rotating `hours` gives each poll its own cache key; the extra
             # history rows are deduped by _store for free.
             self._bust_i += 1
-            params["hours"] = AWC_HOURS_ROTATION[
-                self._bust_i % len(AWC_HOURS_ROTATION)
+            params["hours"] = self._hours_rotation[
+                self._bust_i % len(self._hours_rotation)
             ]
         for _ in range(self._retries + 1):
             try:
@@ -1422,11 +1516,19 @@ class SharedMetarFetcher:
                 )
                 resp.raise_for_status()
                 got = False
+                payload = resp.json()
+                # The endpoint truncates at a fixed record count without saying
+                # so. Today it sheds the OLDEST rows and every station keeps its
+                # newest observation, but at the cap that is luck, not contract:
+                # make it visible rather than let it read as a feed hole.
+                if (isinstance(payload, list)
+                        and len(payload) >= AWC_MAX_BATCH_RECORDS):
+                    self.batches_capped += 1
                 # Surface SPECIs from the JSON too (they carry the SPECI keyword,
                 # so the FEED can tell them apart and log-but-not-fold them on
                 # routine-only cities). We do NOT drop them here — only the
                 # unmarked tgftp fast path stays disabled for those stations.
-                for ic, rec in latest_json_by_icao(resp.json()).items():
+                for ic, rec in latest_json_by_icao(payload).items():
                     raw, obs, receipt = rec
                     # Never let a (cache-stale) batch overwrite a newer reading.
                     self._store(ic, raw, obs, receipt, now)
@@ -1436,6 +1538,90 @@ class SharedMetarFetcher:
                 return
             except Exception:
                 continue  # keep last-good cache; raw_for ages it out via max_age
+
+
+class SharedEventsFetcher:
+    """One paginated daily-temperature events fetch shared by every city.
+
+    Discovery asks the same question for all 35 cities — "every open event with
+    the daily-temperature tag" — and then each city picks its own out of the
+    identical answer. Doing that per city meant 35 x 3 paginated requests every
+    discovery round, which reliably earned HTTP 429s from the events endpoint
+    (106 of them in a four-minute window across two restarts, 2026-09-14). The
+    workers recover by retrying, so it only ever cost a slow, noisy startup —
+    but it is pure duplicate work.
+
+    Same shape as ``SharedMetarFetcher`` and the batched ``/books`` POST: one
+    network call per ``ttl`` for the whole process, last-good served while a
+    refresh fails, and nothing served once the last success is older than
+    ``max_age`` so a genuine outage still surfaces as "no market data" rather
+    than a frozen event list.
+
+    The refresh runs INSIDE the lock, deliberately. The lock is not only
+    protecting the cache, it is also bounding concurrency: letting 35 threads
+    fetch off-lock is what turned a previous shared-fetcher refactor into a
+    socket and rate-limit blowup.
+    """
+
+    def __init__(self, *, session, tag_slug: str = DAILY_TEMP_TAG,
+                 ttl: float = 120.0, max_age: float = 900.0,
+                 page_size: int = 100, timeout: float = 20.0,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+        self._session = session
+        self._tag = tag_slug
+        self._ttl = float(ttl)
+        self._max_age = float(max_age)
+        self._page_size = int(page_size)
+        self._timeout = timeout
+        self._mono = monotonic
+        self._events: list = []
+        self._last_success: Optional[float] = None
+        self._last_attempt: Optional[float] = None
+        self._lock = threading.Lock()
+        self.fetches = 0
+        self.failures = 0
+
+    def events(self) -> list:
+        """Today's open daily-temperature events; ``[]`` if none are fresh."""
+
+        with self._lock:
+            now = self._mono()
+            if (self._last_attempt is None
+                    or (now - self._last_attempt) >= self._ttl):
+                self._last_attempt = now
+                self._refresh(now)
+            if (self._last_success is None
+                    or (now - self._last_success) > self._max_age):
+                return []
+            return list(self._events)
+
+    def _refresh(self, now: float) -> None:  # pragma: no cover - network
+        """Caller holds the lock (see the class docstring on why)."""
+
+        collected: list = []
+        offset = 0
+        try:
+            while True:
+                resp = self._session.get(
+                    GAMMA_EVENTS_URL,
+                    params={"closed": "false", "tag_slug": self._tag,
+                            "limit": self._page_size, "offset": offset},
+                    timeout=self._timeout,
+                )
+                resp.raise_for_status()
+                page = resp.json()
+                if not page:
+                    break
+                collected.extend(page)
+                if len(page) < self._page_size:
+                    break
+                offset += self._page_size
+        except Exception:
+            self.failures += 1
+            return  # keep last-good; events() ages it out via max_age
+        self.fetches += 1
+        self._events = collected
+        self._last_success = now
 
 
 class GammaMarketProvider:  # pragma: no cover - network orchestration
@@ -1453,7 +1639,13 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
         tz: Optional[ZoneInfo] = None,
         book_band_below: int = 1,
         book_band_above: int = 2,
+        events_fetch: Optional[Callable[[], list]] = None,
     ) -> None:
+        # Shared, TTL-cached "all open daily-temperature events" callable. Every
+        # city asks the SAME question, so without this each one paginates the
+        # identical query itself. None keeps the standalone behaviour (tests,
+        # one-off tools).
+        self._events_fetch = events_fetch
         self._terms = tuple(t.lower() for t in market_terms)
         # Resolution station this city trades on; used to cross-check the
         # discovered event's description names our station + Weather Underground.
@@ -1551,6 +1743,10 @@ class GammaMarketProvider:  # pragma: no cover - network orchestration
         now = now or datetime.now(timezone.utc)
         if self._event_slug:
             events = self._get(GAMMA_EVENTS_URL, slug=self._event_slug)
+        elif self._events_fetch is not None:
+            # Shared across every city: one paginated fetch per TTL for the whole
+            # process instead of 35 identical ones (see SharedEventsFetcher).
+            events = self._events_fetch()
         else:
             events = []
             offset = 0

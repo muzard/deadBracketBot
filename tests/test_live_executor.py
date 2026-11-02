@@ -282,6 +282,9 @@ def test_settle_reports_then_clears_state_without_realising_pnl(config):
     results = ex.settle()
     assert len(results) == 1 and results[0].shares == 100
     assert risk.realized_pnl == pnl_before  # settlement is on-chain; not synthesised
+    # ...but the exposure IS released: the shared midnight no longer wipes it,
+    # so a live settlement that left it behind would fill the caps for good.
+    assert risk.total_exposure == 0.0
     # EOD must clear the executor's local state so the new day starts flat.
     assert ex.positions[("paris", 22)].shares == 0
     assert ex._resting == {}

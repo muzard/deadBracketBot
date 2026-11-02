@@ -312,6 +312,14 @@ class MetarFeed:
             return self._tracker.value
 
     @property
+    def trading_day(self) -> Optional[date]:
+        """The local date the current running max belongs to (rolls on read)."""
+
+        with self._lock:
+            self._tracker.roll(self._clock())
+            return self._tracker.trading_day
+
+    @property
     def revision_detected(self) -> bool:
         with self._lock:
             self._tracker.roll(self._clock())

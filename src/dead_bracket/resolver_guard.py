@@ -616,6 +616,37 @@ class ResolverCrossCheck:
             return None
         return day, max(ours), max(theirs)
 
+    def awaiting_confirmation(self, now: Optional[datetime] = None) -> bool:
+        """Is our running max for today ahead of the resolver's own table?
+
+        While it is, ``confirms_max`` withholds entries (under
+        ``resolver_confirm_dead``) and the poller switches to its hot cadence so
+        the resolver's catch-up is noticed within a minute rather than ten.
+        """
+
+        now = now or self._clock()
+        today = self._local_date(now)
+        ours, theirs = self.day_maxima(today)
+        return ours is not None and (theirs is None or theirs < ours)
+
+    def day_maxima(self, day: date) -> tuple[Optional[int], Optional[int]]:
+        """``(ours, resolver's)`` maximum for one local ``day``, from the rows held.
+
+        This is what settlement must use. The market pays out on the RESOLVER's
+        table, and that table can be missing observations our METAR has — on
+        2026-09-20 NOAA never ingested the peak readings of five Asian stations
+        and every one of those markets resolved on NOAA's lower value. Settling
+        against our own max makes a false dead unrepresentable: the position
+        always "wins" on paper. Either side is None when no rows for ``day``
+        are held (rows are kept for twice the comparison window, so yesterday is
+        always available at a local-midnight rollover).
+        """
+
+        with self._lock:
+            ours = [t for e, t in self._ours.items() if self._in_day(e, day)]
+            theirs = [t for e, t in self._theirs.items() if self._in_day(e, day)]
+        return (max(ours) if ours else None, max(theirs) if theirs else None)
+
     def _in_day(self, epoch: int, day: date) -> bool:
         return self._local_date(datetime.fromtimestamp(epoch, timezone.utc)) == day
 
@@ -777,6 +808,8 @@ class ResolverPollerWorker:
 
     def __init__(self, *, city: str, collector: ResolverRowCollector, reporter,
                  poll_sec: float = 600.0, health_every_sec: float = 3600.0,
+                 hot_poll_sec: Optional[float] = None,
+                 hurry: Optional[Callable[[], bool]] = None,
                  monotonic: Callable[[], float] = None) -> None:
         import time as _time
 
@@ -784,6 +817,14 @@ class ResolverPollerWorker:
         self.collector = collector
         self._reporter = reporter
         self._poll_sec = float(poll_sec)
+        # Hot cadence, used while ``hurry()`` says our running max is ahead of
+        # the resolver's table. Under resolver_confirm_dead that gap is exactly
+        # the window in which entries are withheld, so the time to notice the
+        # resolver catching up is time the opportunity is not being traded:
+        # measured on the 2026-09-22 trades, a 10-minute poll saw the confirming
+        # row 8-29 minutes after the buy, against windows of 0.5-27 minutes.
+        self._hot_poll_sec = float(hot_poll_sec) if hot_poll_sec else None
+        self._hurry = hurry
         self._health_every = float(health_every_sec)
         self._mono = monotonic or _time.monotonic
         self._last_poll: Optional[float] = None
@@ -798,7 +839,14 @@ class ResolverPollerWorker:
         """One scheduling pass (extracted from ``run`` so tests need no thread)."""
 
         now = self._mono() if now is None else now
-        if self._due(self._last_poll, self._poll_sec, now):
+        every = self._poll_sec
+        if self._hot_poll_sec is not None and self._hurry is not None:
+            try:
+                if self._hurry():
+                    every = min(every, self._hot_poll_sec)
+            except Exception:
+                pass  # a broken signal must never stop the regular cadence
+        if self._due(self._last_poll, every, now):
             self._last_poll = now
             try:
                 self.collector.poll_once()

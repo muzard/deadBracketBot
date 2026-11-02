@@ -349,6 +349,13 @@ def test_forecast_cap_remaining_and_roll_day():
     risk.record_buy_fill(fcast_fill(size=20.0))  # $18
     assert risk.forecast_cap_remaining() == pytest.approx(22.0)
     risk.roll_day("2026-07-08")
+    # Still open across the shared re-arm, so still counted...
+    assert risk.forecast_cap_remaining() == pytest.approx(22.0)
+    # ...until it settles. (At break-even, so equity — which the cap scales
+    # with — stays at $100 and only the exposure release is being measured.)
+    f = fcast_fill(size=20.0)
+    risk.record_settlement(city=f.city, temp=f.temp, shares=20.0,
+                           cost_basis=f.notional, payout=f.notional / 20.0)
     assert risk.forecast_cap_remaining() == pytest.approx(40.0)
 
 

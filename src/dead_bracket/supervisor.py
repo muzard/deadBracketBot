@@ -46,6 +46,8 @@ class Supervisor:
         except Exception:
             self._tz = ZoneInfo("UTC")
         self._current_day: Optional[str] = None
+        # Each city's own local date, so it is settled at its OWN midnight.
+        self._city_day: dict = {}
         self._threads: dict[str, threading.Thread] = {}
         self._restart_backoff = restart_backoff
         self._stop = threading.Event()
@@ -61,27 +63,49 @@ class Supervisor:
 
     # -- daily rollover ----------------------------------------------------
     def maybe_roll_day(self) -> bool:
-        """Settle + re-arm at the rollover-tz midnight. Returns True if it rolled.
+        """Settle each city at its own local midnight; re-arm risk at the rollover-tz one.
 
-        The first call only records the current day (no roll). Subsequent calls
-        on a new day settle every worker's positions and re-arm shared risk once.
+        Two different boundaries, deliberately:
+
+        * **Settlement is per city.** A market resolves on its city's calendar
+          day, so positions are settled the moment THAT day ends, against the
+          resolver's high for it. Rolling every city at one shared midnight
+          settled cities east of it hours into their next day (against that
+          morning's partial max) and cities west of it before their day ended.
+        * **The shared re-arm is global** (halts, error counters, the daily PnL
+          the loss breaker reads) and stays on ``rollover_tz``.
+
+        The first sighting of any day only records it. Returns True if anything
+        rolled.
         """
 
-        day = self._clock().astimezone(self._tz).date().isoformat()
-        if self._current_day is None:
-            self._current_day = day
-            return False
-        if day == self._current_day or not self._daily_rearm:
-            self._current_day = day
-            return False
-        self._current_day = day
+        now = self._clock()
+        rolled = False
         for w in self._workers:
+            local_date = getattr(w, "local_date", None)
+            if local_date is None:
+                continue
+            today = local_date(now)
+            prev = self._city_day.get(w.city)
+            self._city_day[w.city] = today
+            if prev is None or prev == today or not self._daily_rearm:
+                continue
             try:
-                w.roll_day()  # settle yesterday's positions, log per city
+                w.roll_day(ended_day=prev)  # settle the local day that just ended
             except Exception:  # pragma: no cover - defensive
                 pass
+            rolled = True
+
+        day = now.astimezone(self._tz).date().isoformat()
+        if self._current_day is None:
+            self._current_day = day
+            return rolled
+        if day == self._current_day or not self._daily_rearm:
+            self._current_day = day
+            return rolled
+        self._current_day = day
         if self._risk is not None:
-            self._risk.roll_day(day)  # re-arm kill-switch, reset daily PnL/exposure
+            self._risk.roll_day(day)  # re-arm halts/errors, reset DAILY PnL
         if self._reporter is not None:
             self._reporter.progress(f"===== NEW TRADING DAY {day} (risk re-armed) =====")
         return True

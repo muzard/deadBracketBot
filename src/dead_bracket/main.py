@@ -21,10 +21,12 @@ from .executor import PaperExecutor, make_executor
 from .feeds_http import (
     GammaMarketProvider,
     HkoStationFetcher,
+    SharedEventsFetcher,
     SharedMetarFetcher,
     TwcResolverFetcher,
     build_feed_fetcher,
     make_hko_1min_fetch,
+    fetch_event_resolution,
     fetch_metar_history,
     make_metar_fetch,
     make_tgftp_fetch,
@@ -45,6 +47,7 @@ from .lfs_calibration import (
 )
 from .market import MarketFeed
 from .metar import MetarFeed
+from .reconcile import ReconcilerWorker, SettlementReconciler
 from .reporter import Reporter
 from .resolver_guard import (
     ResolverBlockStore,
@@ -548,6 +551,11 @@ def build_resolver_guards(
                 collector=collector,
                 reporter=reporter,
                 poll_sec=config.resolver_poll_sec,
+                # Hot cadence only for NOAA-backed cities, and only while our
+                # running max is ahead of the resolver's table.
+                hot_poll_sec=(config.resolver_hot_poll_sec
+                              if city_cfg.resolver_provider == "synoptic" else None),
+                hurry=guard.awaiting_confirmation,
             )
         )
         reporter.event(city_cfg.id, "resolver_start", source=source_label,
@@ -569,6 +577,7 @@ def build_supervisor(
     balance=None,
     resolver_guards=None,
     resolver_blocks=None,
+    reconciler=None,
 ) -> Supervisor:
     selected = select_cities(config, city_ids)
     no_trade = set(no_trade_cities)
@@ -585,6 +594,13 @@ def build_supervisor(
         # exclude SPECIs from the JSON selection and skip their tgftp fast path.
         exclude_speci_icaos={c.metar_icao for c in selected if not c.include_speci},
     )
+    # Likewise for discovery: every city asks the SAME question (all open
+    # daily-temperature events) and then picks its own out of the identical
+    # answer, so one shared paginated fetch per TTL replaces 35 of them.
+    events_fetcher = SharedEventsFetcher(
+        session=_new_session(),
+        ttl=config.discovery_poll_sec,
+    )
     workers: list[CityWorker] = []
     for city_cfg in selected:
         # Resolution-source selection for HKO/TWC-resolved cities (Shenzhen).
@@ -598,16 +614,18 @@ def build_supervisor(
         hko_place = (
             city_cfg.resolution_hko_place if (use_hko and not twc_resolver) else None
         )
-        # Cities whose METAR provably does not track the resolver (seoul,
-        # shenzhen — see config.RESOLVER_LOCATIONS for the measurements) read
-        # their running max from the resolver's OWN closed rows, collected by
-        # the resolver poller into wu_rows.jsonl. --twc keeps precedence so the
-        # Shenzhen calibration workflow is unchanged.
+        # Cities whose METAR provably does not track the resolver (lucknow —
+        # see config.RESOLVER_SOURCED_CITIES for the measurements) read their
+        # running max from the resolver's OWN rows, collected by the resolver
+        # poller. --twc keeps precedence so the Shenzhen calibration workflow is
+        # unchanged.
+        synoptic_src = city_cfg.resolver_provider == "synoptic"
         use_resolver_src = (
             not twc_resolver
             and city_cfg.resolution_source == "resolver"
             and config.resolver_check
-            and bool(city_cfg.resolver_location and config.twc_api_key)
+            and bool(city_cfg.metar_icao if synoptic_src
+                     else (city_cfg.resolver_location and config.twc_api_key))
         )
         if city_cfg.resolution_source == "resolver" and not (
             twc_resolver or use_resolver_src
@@ -618,15 +636,23 @@ def build_supervisor(
             reporter.notice(
                 city_cfg.id,
                 "resolution source is the resolver table but it is unavailable "
-                "(needs TWC_API_KEY + resolver_check) — city will NOT trade; "
+                "(needs resolver_check, and TWC_API_KEY on the twc provider) — "
+                "city will NOT trade; "
                 "its METAR is known not to track the resolver",
             )
         if use_resolver_src:
+            # NOAA rows are observations, not a revising hourly aggregate, so
+            # they are servable as soon as they arrive; TWC's current-hour row
+            # must close first. Same fetcher, different settling rule.
             fetcher = TwcResolverFetcher(
-                path=os.path.join(config.data_dir, city_cfg.id, "wu_rows.jsonl"),
+                path=os.path.join(
+                    config.data_dir, city_cfg.id,
+                    "resolver_rows.jsonl" if synoptic_src else "wu_rows.jsonl"),
                 icao=city_cfg.metar_icao,
-                location=city_cfg.resolver_location,
+                location=(city_cfg.metar_icao if synoptic_src
+                          else city_cfg.resolver_location),
                 stale_sec=config.twc_resolver_stale_sec,
+                settle_sec=(0.0 if synoptic_src else 3600.0),
             )
             metar = MetarFeed(
                 city_cfg.metar_icao,
@@ -641,8 +667,9 @@ def build_supervisor(
                            location=city_cfg.resolver_location)
             reporter.notice(
                 city_cfg.id,
-                f"resolution source: the RESOLVER's own closed rows "
-                f"({city_cfg.resolver_location} -> metar_resolver.jsonl); "
+                f"resolution source: the RESOLVER's own rows "
+                f"({'noaa/synoptic ' + city_cfg.metar_icao if synoptic_src else city_cfg.resolver_location}"
+                f" -> metar_resolver.jsonl); "
                 f"{city_cfg.metar_icao} METAR is OUT of the trading path "
                 "(it does not track the resolver)",
             )
@@ -706,6 +733,7 @@ def build_supervisor(
             market_terms=city_cfg.market_terms,
             metar_icao=city_cfg.metar_icao,
             on_event=_on_event,
+            events_fetch=events_fetcher.events,
             tz=ZoneInfo(city_cfg.tz),
             book_band_below=config.book_band_below,
             # Widen the read band so the price sampler's frontier band still has
@@ -745,6 +773,7 @@ def build_supervisor(
                 balance=balance,
                 resolver=(resolver_guards or {}).get(city_cfg.id),
                 resolver_blocks=resolver_blocks,
+                reconciler=reconciler,
             )
         )
     return Supervisor(
@@ -921,11 +950,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 2
 
-    initial_balance = (
-        resolve_initial_balance(config, args.balance, live_client)
-        if (config.bankroll_pct > 0 or config.forecast)
-        else 0.0
-    )
+    # Resolve the balance whenever one is known — not only when percentage
+    # sizing or the forecast path asks for it. The static dollar caps are meant
+    # to be clamped to real capital too (max_bracket_pct, max_deployed_pct), and
+    # that clamp only exists once the risk manager knows a balance. Gating this
+    # on bankroll_pct silently discarded `--balance 100` in the default config:
+    # the 2026-09-14..23 soak ran on the unclamped $500/city, $1000 total caps
+    # and filled $190-490 per bracket on a "$100" account.
+    initial_balance = resolve_initial_balance(config, args.balance, live_client)
 
     city_tz = {c.id: c.tz for c in config.cities}
     reporter = Reporter(config.data_dir, city_tz=city_tz, progress=not args.quiet)
@@ -986,6 +1018,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     resolver_guards, resolver_workers, resolver_blocks = build_resolver_guards(
         config, reporter, risk, city_ids
     )
+    # Settlement reconciler: every settled position's PnL is booked from how
+    # the market ACTUALLY resolved, in paper and live alike (reconcile.py).
+    reconciler = reconcile_worker = None
+    if config.settlement_reconcile:
+        reconciler = SettlementReconciler(
+            path=os.path.join(config.data_dir, "_global", "pending_settlements.json"),
+            resolve=lambda slug, _s=_new_session(): fetch_event_resolution(slug, session=_s),
+            risk=risk,
+            reporter=reporter,
+            give_up_hours=config.settlement_give_up_hours,
+        )
+        reconcile_worker = ReconcilerWorker(
+            reconciler, reporter, poll_sec=config.settlement_reconcile_poll_sec)
+        if reconciler.pending:
+            reporter.progress(
+                f"RECONCILE  {len(reconciler.pending)} settlement(s) awaiting their "
+                f"market's resolution from a previous run")
     supervisor = build_supervisor(
         config,
         reporter,
@@ -999,6 +1048,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         balance=balance,
         resolver_guards=resolver_guards,
         resolver_blocks=resolver_blocks,
+        reconciler=reconciler,
     )
     # LFS calibration collectors (Shenzhen): --calibrate or LFS_CALIBRATION=1.
     cal_workers = (
@@ -1055,6 +1105,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         w.start()
     for w in resolver_workers:
         w.start()
+    if reconcile_worker is not None:
+        reconcile_worker.start()
     try:
         supervisor.run_forever()
     except KeyboardInterrupt:
@@ -1066,6 +1118,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             w.stop()
         for w in resolver_workers:
             w.stop()
+        if reconcile_worker is not None:
+            reconcile_worker.stop()
     return 0
 
 

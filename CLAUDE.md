@@ -7,10 +7,15 @@ paths, one order pipeline:
 1. **Dead path (certainty).** Once the resolution-grade METAR's running max
    passes a bracket, that bracket can never be the high, so its NO is certain
    → buy the NO if offered <98¢ (IOC). By default the NO is then **held to $1**;
-   the 99.9¢ maker recycle sell is posted only when a *new* dead-NO buy this tick
-   is blocked purely by the bankroll caps (`strategy.last_blocked_value > 0`),
-   sized to cover just that shortfall, and cancelled when the block clears
-   (`recycle_on_opportunity`, default on; set False for the legacy always-rest).
+   **every buy is immediately backed by a resting 99.9¢ maker sell**
+   (`recycle_on_opportunity`, default **False** since 2026-09-14). Holding to $1
+   earns 0.1¢ more and risks 100¢: every dollar ever realised came from a 99.9¢
+   fill (9/9 filled, 0.7-234 min), every dollar ever lost came from a position
+   held to settlement on a wrong source. Set it True for the opportunity-gated
+   hold-to-$1 policy, which posts a recycle sell only when a new dead-NO buy is
+   blocked purely by the bankroll caps. An unfilled recycle sell halts the city
+   after `recycle_alarm_min` (240): nobody bids ~$1 for a NO that is not
+   certain, so it is our only independent check on a live position.
    Forecast entries keep their immediate 99.9¢ de-risk exit (see path 2).
 2. **Forecast path (probabilistic, 2026-07-08 — a deliberate mandate widening,
    NO-side only).** Sub-hourly national-met feeds (same/co-located sensors as
@@ -23,6 +28,17 @@ paths, one order pipeline:
    wins the day) → any settled loss pauses the whole forecast path (sticky).
    YES-side / day-max betting remains a **non-goal**.
 
+## 2026-09-20: NOAA DROPS READINGS — the METAR is not the resolver
+A ~5 h worldwide Synoptic ingest outage (02:30–07:30Z, up to 31 of 34 stations)
+never recorded East Asia's afternoon peaks; five markets resolved on NOAA's
+lower high, and a paper NO bought on Singapore's "dead" 31 °C bracket lost
+−$191 (paper booked it +$308). A reading NOAA never ingests is invisible to the
+pairwise cross-check. Hence: `resolver_confirm_dead` is ON (a bracket is dead
+only once NOAA's own table reaches our max), each city settles at its own
+midnight against the resolver's max, and PnL is booked from the market's
+ACTUAL resolution (`reconcile.py`). Full analysis:
+**[docs/noaa_ingest_outage_2026-09-20.md](docs/noaa_ingest_outage_2026-09-20.md)**.
+
 ## 2026-09-12: THE RESOLVER MOVED — WU -> NOAA (read with the STOP section)
 Polymarket re-pointed every daily-temperature market (except Taipei) from
 Weather Underground to **NOAA**, naming
@@ -34,9 +50,9 @@ window, daily max, SPECIs included. Consequences, in full in
 **[docs/resolution_source_migration_2026-09-14.md](docs/resolution_source_migration_2026-09-14.md)**:
 - **Seoul and Shenzhen are no longer divergent.** Both failures were *WU*
   artifacts (WU's RKSI row; WU resolving Shenzhen off HKO Lau Fau Shan). NOAA's
-  `site=rksi` / `site=zgsz` matched our METAR 96/96 and 48/48. Their
-  `resolution_source="resolver"` setting now reads the WRONG table at a
-  26-564 min publish lag — revert it once the new cross-check has soaked.
+  `site=rksi` / `site=zgsz` matched our METAR 96/96 and 48/48, so both
+  are back on `resolution_source="metar"`; `lucknow` is the only
+  resolver-sourced city now (its METAR genuinely diverges).
 - **The cross-check now reads NOAA too** (`CityConfig.resolver_provider`:
   `synoptic` for 34 cities, `twc` for Taipei only). Rows land in
   `resolver_rows.jsonl`; no API key needed; one poll backfills 48 h, and startup
@@ -46,12 +62,14 @@ window, daily max, SPECIs included. Consequences, in full in
   startup, **34/35 cities verified**, only `lucknow` still blocked.
 - **Taipei (RCSS) stays on WU**: Synoptic carries only its SPECIs (6 obs/48 h vs
   our 90), so it cannot migrate.
-- `WUNDERGROUND_EXEMPT_ICAOS` is no longer a special case — every city but
-  Taipei now resolves the way UUWW/LTFM/LLBG already did. The premise behind
-  their `include_speci=False` ("weather.gov is routine-only") is **false** — the
-  NOAA series carries SPECIs — but keeping the flag off is conservative (it can
-  only lower our running max), so it is safe as-is, just no longer true as
-  documented.
+- `WUNDERGROUND_EXEMPT_ICAOS` is no longer a special case for *source* purposes
+  — every city but Taipei now resolves the way UUWW/LTFM/LLBG already did.
+  Their `include_speci=False` **is still correct**: measured 2026-09-14, NOAA
+  records **0 of Moscow's 14 SPECIs**, so counting them would push our running
+  max above the resolver's. Conversely the 32 SPECI-counting cities have **zero
+  orphan SPECIs** — every one is in the resolver's table. `include_speci` is a
+  per-station measurement against the resolver, never an inference from the
+  source; re-measure it when adding a city.
 - `source_confirmed` now accepts either source and is STRICTER for NOAA markets:
   the `site=` in the resolution URL must be our station and only ours.
 

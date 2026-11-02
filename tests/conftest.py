@@ -93,6 +93,8 @@ def build_worker(
     wall_clock=None,
     resolver=None,
     resolver_blocks=None,
+    monotonic=None,
+    reconciler=None,
 ) -> tuple[CityWorker, PaperExecutor, MetarFeed]:
     city_cfg = city_cfg or CityConfig(id=city, metar_icao=icao, tz=tz, market_terms=(city,))
     metar = MetarFeed(icao, fetch_fn=lambda _i: metar_raw, log_path=None)
@@ -104,5 +106,7 @@ def build_worker(
         strategy=strategy, risk=risk, reporter=reporter,
         forecast=forecast, feed_reader=feed_reader, wall_clock=wall_clock,
         resolver=resolver, resolver_blocks=resolver_blocks,
+        reconciler=reconciler,
+        **({"monotonic": monotonic} if monotonic is not None else {}),
     )
     return worker, executor, metar

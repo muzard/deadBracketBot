@@ -20,17 +20,25 @@ NOW = datetime(2026, 6, 3, 16, 0, tzinfo=timezone.utc)
 @pytest.fixture
 def risk_capped():
     """Tight caps so a single bracket exhausts the budget — the setup where a
-    second dead bracket is capital-blocked and recycling is triggered."""
+    second dead bracket is capital-blocked and recycling is triggered.
+
+    Opts INTO the hold-to-$1 policy, which is no longer the default (see
+    ``test_dead_no_rests_a_recycle_sell_by_default``)."""
 
     from dataclasses import replace
     cfg = replace(Config(), max_total_exposure=48.0, max_exposure_per_city=48.0,
-                  max_frac_of_depth=1.0)
+                  max_frac_of_depth=1.0, recycle_on_opportunity=True)
     return RiskManager(cfg), cfg
 
 
-def test_dead_no_held_to_dollar_by_default(config, risk):
-    """Default policy: a lone dead-NO buy is NOT recycled — it is held to $1, so
-    no resting 99.9c sell is posted when there is no capital-blocked opportunity."""
+def test_dead_no_rests_a_recycle_sell_by_default(config, risk):
+    """Default policy since 2026-09-14: every dead-NO buy is immediately backed by
+    a resting 99.9c maker sell.
+
+    Holding to $1 earns 0.1c more per share and risks 100c. Every dollar the
+    project ever REALISED came from a 99.9c fill; every dollar it ever lost came
+    from a position held to settlement in a city whose source was not the
+    resolver's. See STRATEGY.md section 2."""
 
     rep = StubReporter()
     worker, ex, metar = build_worker(
@@ -39,6 +47,21 @@ def test_dead_no_held_to_dollar_by_default(config, risk):
     worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
     pos = ex.positions[("paris", 22)]
     assert pos.shares == 100
+    assert pos.resting_sell == 100  # covered on open, not held to $1
+
+
+def test_dead_no_held_to_dollar_when_opportunity_gated(risk_capped):
+    """The opt-in policy: a lone dead-NO buy is NOT recycled — it is held to $1,
+    so no resting 99.9c sell is posted with no capital-blocked opportunity."""
+
+    risk, config = risk_capped
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=config, risk=risk, reporter=rep, metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    pos = ex.positions[("paris", 22)]
+    assert pos.shares > 0
     assert pos.resting_sell == 0  # held to $1, no recycle sell posted
 
     # A later tick with no new opportunity keeps it held (still no sell).
@@ -622,6 +645,12 @@ class _StubGuard:
     def evaluate(self, now=None):
         return self.verdict
 
+    def confirms_max(self, running_max, now=None):
+        return True  # the resolver's table has reached our max
+
+    def day_maxima(self, day):
+        return (None, None)
+
 
 def test_resolver_divergence_blocks_buys_and_sticks(config, risk, reporter):
     from dead_bracket.resolver_guard import DIVERGENT, Mismatch, Verdict
@@ -729,3 +758,307 @@ def test_strict_mode_waits_for_resolver_to_confirm_the_running_max(config, risk,
     metar2._tracker._running_max = 22
     worker2.process_book(_dead_no_snapshot())
     assert executor2.positions[("paris", 21)].shares > 0
+
+
+# ---------------------------------------------------------------------------
+# False-dead alarm: a 99.9c recycle sell that never fills
+
+
+def _alarm_worker(minutes, clock):
+    """A worker whose recycle alarm fires after ``minutes``, on a fake clock."""
+
+    from dataclasses import replace
+    cfg = replace(Config(), recycle_alarm_min=minutes)
+    risk = RiskManager(cfg)
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=cfg, risk=risk, reporter=rep,
+        metar_raw="LFPB 031530Z 24/10 Q1018", monotonic=clock)
+    metar.poll_once()
+    return worker, ex, metar, risk, rep
+
+
+def test_unfilled_recycle_sell_halts_the_city():
+    """The one independent check on a live position: nobody bids ~$1 for a NO
+    that is not actually certain, so a sell that never fills is evidence our
+    deadness call — and therefore our source — is wrong."""
+
+    t = [0.0]
+    worker, ex, metar, risk, rep = _alarm_worker(90.0, lambda: t[0])
+
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    assert ex.positions[("paris", 22)].resting_sell == 100  # resting, unfilled
+    assert risk.city_halt_reason("paris") is None
+
+    t[0] = 89 * 60                       # just inside the limit
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert risk.city_halt_reason("paris") is None
+
+    t[0] = 91 * 60                       # past it
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert risk.city_halt_reason("paris") == "unfilled recycle sell"
+    assert any("bracket 22" in n and "unfilled" in n for n in rep.progress_lines)
+
+
+def test_recycle_alarm_clock_resets_when_the_sell_fills():
+    """A fill is the good outcome — it must clear the clock, not leave a city
+    one slow fill away from a spurious halt later in the day."""
+
+    t = [0.0]
+    worker, ex, metar, risk, rep = _alarm_worker(90.0, lambda: t[0])
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+
+    t[0] = 60 * 60
+    # A 0.999 bid lifts the resting sell.
+    worker.process_book(make_snapshot("paris", [make_bracket(22, bids=[(0.999, 100)])]))
+    assert ex.positions[("paris", 22)].resting_sell == 0
+    assert any(line.startswith("SOLD") for line in rep.console)
+
+    t[0] = 200 * 60                      # long past the limit, but nothing rests
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert risk.city_halt_reason("paris") is None
+
+
+def test_recycle_alarm_can_be_disabled():
+    t = [0.0]
+    worker, ex, metar, risk, rep = _alarm_worker(0.0, lambda: t[0])
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    t[0] = 10_000 * 60
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert risk.city_halt_reason("paris") is None
+
+
+class _SwitchableResolver:
+    """A resolver stub whose verdict the test flips mid-scenario."""
+
+    def __init__(self):
+        from dead_bracket.resolver_guard import OK, Verdict
+        self.verdict = Verdict(state=OK, reason="ok", pairs=48, span_hours=23.5)
+
+    def evaluate(self, now=None):
+        return self.verdict
+
+    def confirms_max(self, running_max, now=None):
+        return True
+
+    def go_stale(self):
+        from dead_bracket.resolver_guard import UNVERIFIED, Verdict
+        self.verdict = Verdict(state=UNVERIFIED, reason="resolver rows stale (3.2h old)")
+
+
+def test_alarm_still_fires_after_the_resolver_goes_unverified():
+    """Regression for 2026-09-20, Singapore.
+
+    The bot bought 500 NO on a bracket that was not actually dead. Later that
+    day NOAA's rows for the station went stale, the guard turned UNVERIFIED, and
+    process_book started returning before the alarm check — so the one check
+    built for exactly this situation went silent with the position on the book.
+    """
+
+    from dataclasses import replace
+    t = [0.0]
+    cfg = replace(Config(), recycle_alarm_min=90.0)
+    risk = RiskManager(cfg)
+    rep = StubReporter()
+    resolver = _SwitchableResolver()
+    worker, ex, metar = build_worker(
+        config=cfg, risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 24/10 Q1018", monotonic=lambda: t[0])
+    metar.poll_once()
+
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    assert ex.positions[("paris", 22)].resting_sell == 100
+
+    resolver.go_stale()                 # entry gate now closes every tick
+    t[0] = 91 * 60
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+
+    assert risk.city_halt_reason("paris") == "unfilled recycle sell"
+    assert any("bracket 22" in n and "unfilled" in n for n in rep.progress_lines)
+
+
+def test_alarm_reports_even_when_the_city_was_already_halted():
+    """The report is the point: a city already paused for another reason (a
+    stale feed, say) must not swallow the warning about a held position."""
+
+    from dataclasses import replace
+    t = [0.0]
+    cfg = replace(Config(), recycle_alarm_min=90.0)
+    risk = RiskManager(cfg)
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=cfg, risk=risk, reporter=rep,
+        metar_raw="LFPB 031530Z 24/10 Q1018", monotonic=lambda: t[0])
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+
+    risk.halt_city("paris", "stale feed", recoverable=True)
+    t[0] = 91 * 60
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))  # once only
+
+    alarms = [n for n in rep.progress_lines if "unfilled" in n]
+    assert len(alarms) == 1 and "bracket 22" in alarms[0]
+
+
+def test_exits_are_reposted_while_entries_are_gated():
+    """A blocked city must still be able to get OUT: a lost exit is re-posted
+    even when the resolver has closed the entry gate."""
+
+    resolver = _SwitchableResolver()
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 24/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(22, asks=[(0.95, 100)])]))
+    pos = ex.positions[("paris", 22)]
+
+    resolver.go_stale()
+    pos.resting_sell = 0.0              # simulate the resting sell being lost
+    worker.process_book(make_snapshot("paris", [make_bracket(22)]))
+    assert pos.resting_sell == pos.shares
+
+
+# ---------------------------------------------------------------------------
+# Settlement against the resolver's table, per city
+
+
+class _ResolverWithDayMax(_SwitchableResolver):
+    """Stub resolver that also reports (ours, resolver's) maxima for a day."""
+
+    def __init__(self, ours, theirs):
+        super().__init__()
+        self._maxima = (ours, theirs)
+        self.asked = []
+
+    def day_maxima(self, day):
+        self.asked.append(day)
+        return self._maxima
+
+
+def test_false_dead_settles_as_a_loss_against_the_resolvers_table():
+    """Regression for 2026-09-20, Singapore: our METAR peaked at 32, NOAA's
+    table never ingested those readings and topped out at 31, and the market
+    resolved YES on 31. Paper used to settle against OUR max, so the NO on 31 —
+    a real -$191 — was booked as a +$308 win."""
+
+    from datetime import date
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    resolver = _ResolverWithDayMax(ours=32, theirs=31)
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(31, asks=[(0.38, 100)])]))
+    assert ex.positions[("paris", 31)].shares == 100
+
+    day = date(2026, 9, 20)
+    worker.roll_day(ended_day=day)
+
+    assert resolver.asked == [day]                 # the ENDED day, not today
+    assert ex.positions[("paris", 31)].shares == 0
+    assert risk.realized_pnl == pytest.approx(0.0 * 100 - 38.0)   # NO paid $0
+    assert any("FALSE DEAD" in n and "31C" in n for n in rep.progress_lines)
+
+
+def test_dead_path_position_still_wins_when_the_resolver_agrees():
+    from datetime import date
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    resolver = _ResolverWithDayMax(ours=32, theirs=32)
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(31, asks=[(0.95, 100)])]))
+    worker.roll_day(ended_day=date(2026, 9, 20))
+    assert risk.realized_pnl == pytest.approx(100 - 95.0)
+    assert not any("FALSE DEAD" in n for n in rep.progress_lines)
+
+
+def test_settlement_says_so_when_it_cannot_consult_the_resolver():
+    """No resolver rows for the day: settle against our own max, but LOUDLY —
+    a false dead there would not show up as a loss."""
+
+    from datetime import date
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    resolver = _ResolverWithDayMax(ours=None, theirs=None)
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018")
+    metar.poll_once()
+    worker.process_book(make_snapshot("paris", [make_bracket(31, asks=[(0.95, 100)])]))
+    worker.roll_day(ended_day=date(2026, 9, 20))
+    assert any("against OUR max" in n for n in rep.progress_lines)
+
+
+
+class _ConfirmingResolver(_SwitchableResolver):
+    """The resolver's table is behind our max until the test says it caught up."""
+
+    def __init__(self):
+        super().__init__()
+        self.caught_up = False
+
+    def confirms_max(self, running_max, now=None):
+        return self.caught_up
+
+
+def test_confirm_dead_withholds_the_buy_until_the_resolver_reaches_our_max():
+    """Regression for 2026-09-20: Singapore was bought on a 32C reading NOAA's
+    table never ingested. Under confirm-dead the bracket is not dead until the
+    resolver's own table says so — and when it never does, it is never bought."""
+
+    t = [0.0]
+    risk = RiskManager(Config())
+    rep = StubReporter()
+    resolver = _ConfirmingResolver()
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018", monotonic=lambda: t[0])
+    metar.poll_once()
+    assert Config().resolver_confirm_dead is True       # on by default
+
+    snap = make_snapshot("paris", [make_bracket(31, asks=[(0.38, 100)])])
+    worker.process_book(snap)
+    worker.process_book(snap)
+    assert ("paris", 31) not in ex.positions            # withheld
+
+    t[0] = 75.0
+    resolver.caught_up = True                           # NOAA publishes 32
+    worker.process_book(snap)
+    assert ex.positions[("paris", 31)].shares > 0       # now genuinely dead
+
+
+def test_confirm_dead_logs_how_long_the_resolver_took(tmp_path):
+    """The cost of confirm-dead is the resolver's catch-up time, so every wait
+    is recorded — once on entering it and once, with its length, on leaving."""
+
+    import json
+    from dead_bracket.reporter import Reporter
+    t = [0.0]
+    risk = RiskManager(Config())
+    rep = Reporter(str(tmp_path), progress=False, stdout=None)
+    resolver = _ConfirmingResolver()
+    worker, ex, metar = build_worker(
+        config=Config(), risk=risk, reporter=rep, resolver=resolver,
+        metar_raw="LFPB 031530Z 32/10 Q1018", monotonic=lambda: t[0])
+    metar.poll_once()
+    snap = make_snapshot("paris", [make_bracket(31, asks=[(0.38, 100)])])
+    for _ in range(5):                                   # many ticks waiting...
+        worker.process_book(snap)
+    t[0] = 75.0
+    resolver.caught_up = True
+    worker.process_book(snap)
+
+    events = []
+    for p in tmp_path.rglob("events.jsonl"):
+        events += [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    kinds = [e["event"] for e in events]
+    assert kinds.count("resolver_max_unconfirmed") == 1  # ...one event, not five
+    done = [e for e in events if e["event"] == "resolver_max_confirmed"]
+    assert len(done) == 1 and done[0]["waited_sec"] == 75.0
