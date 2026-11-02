@@ -193,7 +193,7 @@ Shenzhen resolves on WU's table for **HKO AWS 45035 (Lau Fau Shan)** — not a
 METAR: TWC resamples HKO sub-hourly data into hourly rows (see
 [docs/wu_lfs_discrepancy_2026-07-03.md](docs/wu_lfs_discrepancy_2026-07-03.md)).
 Three unknowns gate re-enabling the city
-([shenzhen_calibration_requirements.md](shenzhen_calibration_requirements.md)):
+([docs/shenzhen_calibration_requirements.md](docs/shenzhen_calibration_requirements.md)):
 **K1** TWC's sample grid + ingestion latency, **K2** the 0.1 °C → integer
 rounding rule, **K3** whether the daily High counts all ingested row versions
 or only each hour's final value. `--calibrate` (or `LFS_CALIBRATION=1`) starts

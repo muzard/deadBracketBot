@@ -3,7 +3,7 @@
 The Shenzhen market resolves on Weather Underground's table for HKO AWS station
 45035 (Lau Fau Shan) — NOT a METAR: TWC resamples HKO sub-hourly data into
 hourly rows. Three unknowns gate re-enabling the city (see
-``shenzhen_calibration_requirements.md``): **K1** — TWC's sample grid (which HKO
+``docs/shenzhen_calibration_requirements.md``): **K1** — TWC's sample grid (which HKO
 minutes end up in a row) + ingestion latency; **K2** — the 0.1 °C → integer
 rounding rule (incl. x.5); **K3** — whether the daily "High Temp" is the max
 over ALL ingested row versions or only each hour's final value. This module
